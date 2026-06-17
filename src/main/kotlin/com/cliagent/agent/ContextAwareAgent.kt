@@ -15,6 +15,7 @@ import com.cliagent.llm.model.SystemPrompts
 import com.cliagent.llm.token.TokenCounter
 import com.cliagent.memory.LongTermMemory
 import com.cliagent.memory.MemoryStore
+import com.cliagent.memory.UserProfile
 import com.cliagent.memory.WorkingMemory
 
 class ContextAwareAgent(
@@ -27,7 +28,9 @@ class ContextAwareAgent(
     private val tokenCounter: TokenCounter = TokenCounter(),
     private val contextLimit: Int = 128000,
     private val historyCompressor: HistoryCompressor? = null,
-    private val contextManager: ContextManager? = null
+    private val contextManager: ContextManager? = null,
+    private val profileExtractor: ProfileExtractor? = null,
+    private val autoProfileEvery: Int = 0   // 0 = авто-извлечение профиля выключено
 ) : Agent {
 
     private var history = mutableListOf<ChatMessage>()
@@ -35,6 +38,7 @@ class ContextAwareAgent(
     // Memory layers (день 11): working — per-chat, long-term — global
     private var workingMemory: WorkingMemory? = null
     private var longTermMemory: LongTermMemory? = null
+    private var turnCount = 0   // день 12: счётчик ходов для авто-извлечения профиля
 
     private suspend fun ensureLoaded() {
         if (!loaded) {
@@ -109,6 +113,14 @@ class ContextAwareAgent(
                 // Persist facts after strategy update
                 (contextManager?.getStrategy() as? StickyFactsStrategy)?.let {
                     memoryStore.saveFacts(chatId, it.getFacts())
+                }
+
+                // День 12: авто-извлечение профиля каждые N ходов (opt-in)
+                turnCount++
+                if (profileExtractor != null && autoProfileEvery > 0 && turnCount % autoProfileEvery == 0) {
+                    val current = getProfile()
+                    val inferred = profileExtractor.extract(history, current)
+                    setProfile(profileExtractor.mergeProfile(current, inferred))
                 }
 
                 assistantContent
@@ -224,5 +236,13 @@ class ContextAwareAgent(
     suspend fun setLongTermMemory(memory: LongTermMemory) {
         memoryStore.saveLongTermMemory(memory)
         longTermMemory = memory
+    }
+
+    // ── Profile accessors (день 12, для /profile команды) ──
+
+    suspend fun getProfile(): UserProfile? = getLongTermMemory().profile
+
+    suspend fun setProfile(profile: UserProfile?) {
+        setLongTermMemory(getLongTermMemory().copy(profile = profile))
     }
 }

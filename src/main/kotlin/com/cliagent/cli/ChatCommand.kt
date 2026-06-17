@@ -2,6 +2,7 @@ package com.cliagent.cli
 
 import com.cliagent.agent.Agent
 import com.cliagent.agent.ContextAwareAgent
+import com.cliagent.agent.ProfileExtractor
 import com.cliagent.config.ConfigRepository
 import com.cliagent.context.ContextManager
 import com.cliagent.context.HistoryCompressor
@@ -16,6 +17,7 @@ import com.cliagent.llm.pricing.Pricing
 import com.cliagent.memory.JsonChatStore
 import com.cliagent.memory.LongTermMemory
 import com.cliagent.memory.MemoryStore
+import com.cliagent.memory.UserProfile
 import com.cliagent.memory.WorkingMemory
 import com.github.ajalt.clikt.core.CliktCommand
 import com.github.ajalt.clikt.parameters.options.default
@@ -35,6 +37,7 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
     private val compress by option("--compress", help = "Enable auto-compression of history").flag()
     private val keepRecent by option("--keep-recent", help = "Keep last N messages uncompressed").int().default(10)
     private val contextStrategy by option("--context", help = "Context strategy: sliding, facts, summary, branch").default("sliding")
+    private val autoProfile by option("--auto-profile", help = "Auto-extract user profile every N turns via LLM").flag()
 
     override fun run() = runBlocking {
         val config = try {
@@ -73,6 +76,9 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         // Create context strategy
         val contextManager = createStrategy(contextStrategy, client, model, memoryStore, chatId, keepRecent)
 
+        // День 12: авто-извлечение профиля (opt-in)
+        val profileExtractor = if (autoProfile) ProfileExtractor(client, model) else null
+
         val agent = ContextAwareAgent(
             llmClient = client,
             memoryStore = memoryStore,
@@ -80,7 +86,9 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             chatId = chatId,
             reasoningStrategy = reasoningStrategy,
             historyCompressor = historyCompressor,
-            contextManager = contextManager
+            contextManager = contextManager,
+            profileExtractor = profileExtractor,
+            autoProfileEvery = if (autoProfile) 5 else 0
         )
 
         val compressLabel = if (compress) "ON" else "OFF"
@@ -107,6 +115,7 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                 input.startsWith("/strategy") -> handleStrategy(input, agent, client, model, memoryStore, chatId, keepRecent)
                 input.startsWith("/branch") -> handleBranch(input, agent)
                 input.startsWith("/memory") -> handleMemory(input, agent)
+                input.startsWith("/profile") -> handleProfile(input, agent, client, model)
                 input == "/reset" -> {
                     agent.reset()
                     echo("History, summary, facts, branches, working memory cleared.")
@@ -171,6 +180,14 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             |  /memory save long decision <key> <text>  — Add/update decision (empty text removes)
             |  /memory clear working — Clear working memory for this chat
             |  /memory clear long    — Clear ALL long-term memory (global!)
+            |  /profile              — Show user profile
+            |  /profile set style <text>     — Set preferred answer style
+            |  /profile set format <text>    — Set preferred format
+            |  /profile set about <text>     — Set context (who you are, goal)
+            |  /profile add constraint <text>  — Add a constraint (stack/ban/rule)
+            |  /profile remove constraint <text> — Remove a constraint
+            |  /profile extract      — Infer profile from current dialog via LLM
+            |  /profile clear        — Clear the whole profile
             |  /reset               — Clear chat history, summary, facts, branches, working memory
             |  /exit                — Exit the program
             |
@@ -512,6 +529,98 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                 echo("✓ Long-term '$field' ${if (text.isEmpty()) "removed '$key'" else "updated '$key'"}.")
             }
             else -> echo("Unknown layer: ${parts[2]}. Use: working, long")
+        }
+    }
+
+    private suspend fun handleProfile(
+        input: String,
+        agent: ContextAwareAgent,
+        client: com.cliagent.llm.LlmClient,
+        model: String
+    ) {
+        val parts = input.trim().split("\\s+".toRegex())
+        if (parts.size < 2 || parts[1] == "show") {
+            val p = agent.getProfile()
+            if (p == null || p.isEmpty()) {
+                echo("👤 User profile is empty. Use: /profile set style|format|about <text>, /profile add constraint <text>")
+            } else {
+                echo("👤 User profile:")
+                p.style?.let { echo("  Style: $it") }
+                p.format?.let { echo("  Format: $it") }
+                p.about?.let { echo("  About: $it") }
+                if (p.constraints.isNotEmpty()) {
+                    echo("  Constraints:")
+                    p.constraints.forEach { echo("    - $it") }
+                }
+            }
+            return
+        }
+
+        when (parts[1]) {
+            "set" -> {
+                if (parts.size < 4) {
+                    echo("Usage: /profile set <style|format|about> <text>")
+                    return
+                }
+                val field = parts[2]
+                val text = parts.drop(3).joinToString(" ").trim()
+                if (text.isEmpty()) {
+                    echo("Text is required.")
+                    return
+                }
+                val cur = agent.getProfile() ?: UserProfile()
+                val updated = when (field) {
+                    "style" -> cur.copy(style = text)
+                    "format" -> cur.copy(format = text)
+                    "about" -> cur.copy(about = text)
+                    else -> { echo("Unknown field: $field. Use: style, format, about"); return }
+                }
+                agent.setProfile(updated)
+                echo("✓ Profile '$field' updated.")
+            }
+            "add" -> {
+                if (parts.size < 4 || parts[2] != "constraint") {
+                    echo("Usage: /profile add constraint <text>")
+                    return
+                }
+                val text = parts.drop(3).joinToString(" ").trim()
+                val cur = agent.getProfile() ?: UserProfile()
+                agent.setProfile(cur.copy(constraints = cur.constraints + text))
+                echo("✓ Constraint added.")
+            }
+            "remove" -> {
+                if (parts.size < 4 || parts[2] != "constraint") {
+                    echo("Usage: /profile remove constraint <text>")
+                    return
+                }
+                val text = parts.drop(3).joinToString(" ").trim()
+                val cur = agent.getProfile() ?: UserProfile()
+                val filtered = cur.constraints.filterNot { it == text || it.contains(text) }
+                if (filtered.size == cur.constraints.size) {
+                    echo("No matching constraint found.")
+                } else {
+                    agent.setProfile(cur.copy(constraints = filtered))
+                    echo("✓ Constraint removed.")
+                }
+            }
+            "extract" -> {
+                val history = agent.getHistory()
+                if (history.isEmpty()) {
+                    echo("No dialog yet to infer profile from.")
+                    return
+                }
+                echo("🔄 Inferring profile from dialog...")
+                val extractor = ProfileExtractor(client, model)
+                val cur = agent.getProfile()
+                val merged = extractor.extract(history, cur)
+                agent.setProfile(merged)
+                echo("✓ Profile inferred and merged. Use /profile to view.")
+            }
+            "clear" -> {
+                agent.setProfile(null)
+                echo("✓ Profile cleared.")
+            }
+            else -> echo("Unknown /profile command: ${parts[1]}. Use: show, set, add, remove, extract, clear")
         }
     }
 }
