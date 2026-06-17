@@ -14,7 +14,9 @@ import com.cliagent.llm.OpenAiCompatibleClient
 import com.cliagent.llm.model.ReasoningStrategy
 import com.cliagent.llm.pricing.Pricing
 import com.cliagent.memory.JsonChatStore
+import com.cliagent.memory.LongTermMemory
 import com.cliagent.memory.MemoryStore
+import com.cliagent.memory.WorkingMemory
 import com.github.ajalt.clikt.core.CliktCommand
 import com.github.ajalt.clikt.parameters.options.default
 import com.github.ajalt.clikt.parameters.options.flag
@@ -104,9 +106,10 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                 input == "/facts" -> printFacts(agent)
                 input.startsWith("/strategy") -> handleStrategy(input, agent, client, model, memoryStore, chatId, keepRecent)
                 input.startsWith("/branch") -> handleBranch(input, agent)
+                input.startsWith("/memory") -> handleMemory(input, agent)
                 input == "/reset" -> {
                     agent.reset()
-                    echo("History, summary, facts, branches cleared.")
+                    echo("History, summary, facts, branches, working memory cleared.")
                 }
                 else -> {
                     val response = agent.chat(input)
@@ -156,7 +159,19 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             |  /branch create <name> [at <N>] — Create branch from message N
             |  /branch list         — List branches
             |  /branch switch <name> — Switch to branch
-            |  /reset               — Clear chat history and summary
+            |  /memory              — Show memory layers summary
+            |  /memory show short   — Show current dialog (short-term)
+            |  /memory show working — Show working memory (current task)
+            |  /memory show long    — Show long-term memory (knowledge/decisions/profile)
+            |  /memory save working task <text>     — Set current task
+            |  /memory save working plan <text>     — Set plan
+            |  /memory save working note <text>     — Append to scratch notes
+            |  /memory save working decision <text> — Append a task decision
+            |  /memory save long knowledge <key> <text> — Add/update knowledge (empty text removes)
+            |  /memory save long decision <key> <text>  — Add/update decision (empty text removes)
+            |  /memory clear working — Clear working memory for this chat
+            |  /memory clear long    — Clear ALL long-term memory (global!)
+            |  /reset               — Clear chat history, summary, facts, branches, working memory
             |  /exit                — Exit the program
             |
             |Context Strategies:
@@ -354,6 +369,149 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                 }
             }
             else -> echo("Unknown branch command: ${parts[1]}. Use: create, list, switch")
+        }
+    }
+
+    private suspend fun handleMemory(input: String, agent: ContextAwareAgent) {
+        val parts = input.trim().split("\\s+".toRegex())
+        if (parts.size < 2) {
+            // Сводка по всем слоям
+            val history = agent.getHistory()
+            val working = agent.getWorkingMemory()
+            val longTerm = agent.getLongTermMemory()
+            echo("""
+                |🧠 Memory layers:
+                |  [short-term]  ${history.size} messages in current dialog
+                |  [working]     ${if (working == null || working.isEmpty()) "empty" else "task='${working.currentTask ?: "-"}', ${working.taskDecisions.size} decisions"}
+                |  [long-term]   ${longTerm.knowledge.size} knowledge, ${longTerm.decisions.size} decisions${if (longTerm.profile != null) ", profile set" else ""}
+                |
+                |Use: /memory show <short|working|long>, /memory save ..., /memory clear <working|long>
+            """.trimMargin())
+            return
+        }
+
+        when (parts[1]) {
+            "show" -> {
+                if (parts.size < 3) {
+                    echo("Usage: /memory show <short|working|long>")
+                    return
+                }
+                when (parts[2]) {
+                    "short" -> printHistory(agent)
+                    "working" -> {
+                        val w = agent.getWorkingMemory()
+                        if (w == null || w.isEmpty()) {
+                            echo("Working memory is empty.")
+                        } else {
+                            echo("🔧 Working memory:")
+                            w.currentTask?.let { echo("  Task: $it") }
+                            w.plan?.let { echo("  Plan: $it") }
+                            w.scratchNotes?.let { echo("  Notes: $it") }
+                            if (w.taskDecisions.isNotEmpty()) {
+                                echo("  Decisions:")
+                                w.taskDecisions.forEach { echo("    - $it") }
+                            }
+                        }
+                    }
+                    "long" -> {
+                        val lt = agent.getLongTermMemory()
+                        echo("💾 Long-term memory:")
+                        if (lt.knowledge.isNotEmpty()) {
+                            echo("  Knowledge:")
+                            lt.knowledge.forEach { (k, v) -> echo("    - $k: $v") }
+                        }
+                        if (lt.decisions.isNotEmpty()) {
+                            echo("  Decisions:")
+                            lt.decisions.forEach { (k, v) -> echo("    - $k: $v") }
+                        }
+                        val p = lt.profile
+                        if (p != null) {
+                            echo("  Profile:")
+                            p.style?.let { echo("    Style: $it") }
+                            p.format?.let { echo("    Format: $it") }
+                            if (p.constraints.isNotEmpty()) p.constraints.forEach { echo("    Constraint: $it") }
+                        }
+                        if (lt.isEmpty()) echo("  (empty)")
+                    }
+                    else -> echo("Unknown layer: ${parts[2]}. Use: short, working, long")
+                }
+            }
+            "save" -> handleMemorySave(parts, agent)
+            "clear" -> {
+                if (parts.size < 3) {
+                    echo("Usage: /memory clear <working|long>")
+                    return
+                }
+                when (parts[2]) {
+                    "working" -> {
+                        agent.setWorkingMemory(WorkingMemory())
+                        echo("✓ Working memory cleared for this chat.")
+                    }
+                    "long" -> {
+                        echo("⚠️  Clearing ALL long-term memory (global, affects every chat).")
+                        agent.setLongTermMemory(LongTermMemory())
+                        echo("✓ Long-term memory cleared.")
+                    }
+                    else -> echo("Unknown layer: ${parts[2]}. Use: working, long")
+                }
+            }
+            else -> echo("Unknown /memory command: ${parts[1]}. Use: show, save, clear")
+        }
+    }
+
+    private suspend fun handleMemorySave(parts: List<String>, agent: ContextAwareAgent) {
+        // /memory save <working|long> <field> [args...]
+        if (parts.size < 4) {
+            echo("Usage: /memory save working <task|plan|note|decision> <text>")
+            echo("       /memory save long <knowledge|decision> <key> <text>")
+            return
+        }
+        when (parts[2]) {
+            "working" -> {
+                val field = parts[3]
+                val text = parts.drop(4).joinToString(" ").trim()
+                if (text.isEmpty() && field !in listOf("task", "plan")) {
+                    echo("Text is required for '$field'.")
+                    return
+                }
+                val w = agent.getWorkingMemory() ?: WorkingMemory()
+                val updated = when (field) {
+                    "task" -> w.copy(currentTask = text.ifEmpty { null })
+                    "plan" -> w.copy(plan = text.ifEmpty { null })
+                    "note" -> w.copy(scratchNotes = listOfNotNull(w.scratchNotes, text)
+                        .filter { it.isNotBlank() }.joinToString("\n"))
+                    "decision" -> w.copy(taskDecisions = w.taskDecisions + text)
+                    else -> { echo("Unknown working field: $field. Use: task, plan, note, decision"); return }
+                }
+                agent.setWorkingMemory(updated)
+                echo("✓ Working memory '$field' updated.")
+            }
+            "long" -> {
+                val field = parts[3]              // knowledge | decision
+                if (parts.size < 5) {
+                    echo("Usage: /memory save long $field <key> <text>")
+                    return
+                }
+                val key = parts[4]
+                val text = parts.drop(5).joinToString(" ").trim()
+                val lt = agent.getLongTermMemory()
+                val updated = when (field) {
+                    "knowledge" -> {
+                        val map = lt.knowledge.toMutableMap()
+                        if (text.isEmpty()) map.remove(key) else map[key] = text
+                        lt.copy(knowledge = map)
+                    }
+                    "decision" -> {
+                        val map = lt.decisions.toMutableMap()
+                        if (text.isEmpty()) map.remove(key) else map[key] = text
+                        lt.copy(decisions = map)
+                    }
+                    else -> { echo("Unknown long field: $field. Use: knowledge, decision"); return }
+                }
+                agent.setLongTermMemory(updated)
+                echo("✓ Long-term '$field' ${if (text.isEmpty()) "removed '$key'" else "updated '$key'"}.")
+            }
+            else -> echo("Unknown layer: ${parts[2]}. Use: working, long")
         }
     }
 }

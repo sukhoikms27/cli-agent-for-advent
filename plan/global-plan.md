@@ -16,12 +16,12 @@
 | **CLI-фреймворк** | clikt |
 | **HTTP-клиент** | Ktor Client |
 | **Сериализация** | kotlinx.serialization |
-| **База данных** | SQLite (через JDBC) |
+| **Память/персистентность** | JSON-файлы (один на чат + глобальный long-term), атомарная запись |
 | **LLM-провайдер** | z.ai (Zhipu AI) — GLM-5.1 |
 | **API-формат** | OpenAI-совместимый (`/v4/chat/completions`) |
 | **Streaming** | Фаза 2 (сначала без стриминга) |
 | **Стиль CLI** | REPL по умолчанию + CLI-аргументы для подкоманд |
-| **Выполненные задания курса** | Дни 1–10 (API-вызов → формат → рассуждения → температура → модели → агент → контекст → токены → сжатие → 4 стратегии) |
+| **Выполненные задания курса** | Дни 1–11 (API-вызов → формат → рассуждения → температура → модели → агент → контекст → токены → сжатие → 4 стратегии → модель памяти: short/working/long-term layers) |
 
 ---
 
@@ -41,18 +41,18 @@
 │  LLM Layer │    Context   │      Memory + State           │
 │   (llm/)   │  (context/)  │  (memory/ + state/)           │
 │            │              │                               │
-│  Ktor HTTP │  Стратегии   │  SQLite, Profile, Facts,      │
-│  client    │  управления  │  StateMachine, Invariants      │
-│            │  контекстом  │                               │
+│  Ktor HTTP │  Стратегии   │  JSON-файлы, MemoryLayers,    │
+│  client    │  управления  │  Profile, Facts, StateMachine,│
+│            │  контекстом  │  Invariants                   │
 ├────────────┴──────────────┴───────────────────────────────┤
 │                    Infrastructure                          │
-│               (SQLite, Ktor, Config)                      │
+│               (JSON files, Ktor, Config)                  │
 │                  config/ package                           │
 └──────────────────────────────────────────────────────────┘
 ```
 
 **Принцип разделения:** Каждый слой общается только с соседним снизу.
-CLI не знает про LLM — он вызывает Agent. Agent не знает про SQLite —
+CLI не знает про LLM — он вызывает Agent. Agent не знает про JSON-хранилище —
 он вызывает MemoryStore. Это позволяет менять реализации без каскадных правок.
 
 ---
@@ -66,16 +66,13 @@ src/main/kotlin/com/cliagent/
 │
 ├── cli/                              # ── CLI Layer ──
 │   ├── CliAgentCommand.kt            #   Корневая команда (clikt)
-│   ├── ChatCommand.kt                #   REPL-режим чата
-│   ├── ConfigCommand.kt              #   Управление конфигурацией
-│   ├── ContextCommand.kt             #   Управление контекстом (list/switch/clear)
-│   └── MemoryCommand.kt              #   Управление памятью (save/load/search)
+│   └── ChatCommand.kt                #   REPL-режим чата (JLine-free BufferedReader, slash-команды inline)
 │
 ├── agent/                            # ── Agent Layer ──
 │   ├── Agent.kt                      #   Интерфейс агента
-│   ├── SimpleAgent.kt                #   Базовый агент (день 6)
-│   ├── ContextAwareAgent.kt          #   Агент с контекстом (день 7)
-│   └── StatefulAgent.kt              #   Стейтфул-агент (неделя 3)
+│   ├── SimpleAgent.kt                #   Базовый агент (день 6, in-memory)
+│   ├── ContextAwareAgent.kt          #   Агент с контекстом + memory layers (день 7, расширен в день 11)
+│   └── PromptBuilder.kt              #   Сборка слоёного system prompt (день 11)
 │
 ├── llm/                              # ── LLM Layer ──
 │   ├── LlmClient.kt                  #   Интерфейс LLM-клиента (chat + chatStream placeholder)
@@ -106,11 +103,13 @@ src/main/kotlin/com/cliagent/
 │   └── HistoryCompressor.kt          #   Сжатие истории в summary (день 9, инкрементальное)
 │
 ├── memory/                           # ── Memory Layer ──
-│   ├── MemoryStore.kt                #   Интерфейс хранилища (+ branches, summaries, facts)
-│   ├── SqliteMemoryStore.kt          #   SQLite-реализация (с миграциями)
-│   ├── DatabaseMigrations.kt         #   Система миграций БД
-│   ├── Profile.kt                    #   Модель профиля пользователя (неделя 3)
-│   └── Facts.kt                      #   Key-value факты из диалога (день 10)
+│   ├── MemoryStore.kt                #   Интерфейс хранилища (+ branches, summaries, facts, working/long-term)
+│   ├── JsonChatStore.kt              #   JSON file-per-chat реализация (атомарная запись)
+│   ├── JsonLongTermStore.kt          #   Глобальное long-term хранилище (день 11, кросс-чат)
+│   ├── ChatData.kt                   #   Агрегат чата (messages + summary + facts + branches + workingMemory)
+│   ├── MemoryLayer.kt                #   Модель слоёв памяти: MemoryLayer enum + WorkingMemory + LongTermMemory + UserProfile (день 11)
+│   ├── Profile.kt                    #   Модель профиля пользователя (день 12 — пока stub в MemoryLayer.kt)
+│   └── Facts.kt                      #   Key-value факты из диалога (день 10, inline Map в ChatData)
 │
 ├── state/                            # ── State Layer ──
 │   ├── TaskState.kt                  #   Enum состояний задачи
@@ -130,7 +129,7 @@ src/main/kotlin/com/cliagent/
 | `agent/` | Оркестрация пайплайна: perception → memory → reasoning → action | `llm/`, `context/`, `memory/`, `state/` |
 | `llm/` | HTTP-взаимодействие с LLM API, модели запросов/ответов, pricing | `config/` (baseUrl, apiKey) |
 | `context/` | Управление контекстным окном: 4 стратегии, инкрементальное сжатие | `llm/model/` (ChatMessage), `memory/` |
-| `memory/` | Персистентность: история, профиль, факты, ветки, миграции БД | — |
+| `memory/` | Персистентность: история, профиль, факты, ветки, memory layers (JSON-файлы) | — |
 | `state/` | Стейт-машина задач, инварианты | — |
 | `config/` | Загрузка конфигурации из env/файлов | — |
 
@@ -212,13 +211,19 @@ interface MemoryStore {
     suspend fun clearSummary(chatId: String)
 
     // Ветки диалога (Branching strategy)
-    suspend fun createBranch(chatId: String, name: String, leafMessageId: String?): String
-    suspend fun listBranches(chatId: String): List<BranchingStrategy.Branch>
-    suspend fun deleteBranch(branchId: String)
+    suspend fun createBranch(chatId: String, name: String, leafMessageId: String?, fromIndex: Int): BranchData
+    suspend fun listBranches(chatId: String): List<BranchData>
+    suspend fun deleteBranch(chatId: String, branchId: String)
 
-    // Профиль пользователя
-    suspend fun saveProfile(profile: Profile)
-    suspend fun loadProfile(): Profile?
+    // Working memory — per-chat (данные текущей задачи, день 11)
+    suspend fun saveWorkingMemory(chatId: String, memory: WorkingMemory)
+    suspend fun loadWorkingMemory(chatId: String): WorkingMemory?
+    suspend fun clearWorkingMemory(chatId: String)
+
+    // Long-term memory — global (profile, decisions, knowledge; кросс-чат, день 11)
+    suspend fun loadLongTermMemory(): LongTermMemory   // non-null: пустой объект если файла нет
+    suspend fun saveLongTermMemory(memory: LongTermMemory)
+    suspend fun clearLongTermMemory()
 }
 
 data class Chat(
@@ -227,6 +232,54 @@ data class Chat(
     val createdAt: String,
     val updatedAt: String
 )
+```
+
+> **Реализация:** `JsonChatStore` — один JSON-файл на чат в `AppPaths.chatsDir`,
+> атомарная запись (temp + rename). Long-term — отдельный глобальный файл
+> `AppPaths.longTermFile` через `JsonLongTermStore` (форвардится из `JsonChatStore`).
+> Профиль пользователя живёт внутри `LongTermMemory.profile` (день 12), а не отдельной таблицей.
+
+### Memory layers (день 11)
+
+```kotlin
+enum class MemoryLayer { SHORT_TERM, WORKING, LONG_TERM }
+
+@Serializable
+data class WorkingMemory(             // per-chat, данные текущей задачи
+    val currentTask: String? = null,
+    val plan: String? = null,
+    val scratchNotes: String? = null,
+    val taskDecisions: List<String> = emptyList()
+    // день 13: val taskState: TaskState? = null
+)
+
+@Serializable
+data class LongTermMemory(            // global, кросс-чат/кросс-сессия
+    val knowledge: Map<String, String> = emptyMap(),
+    val decisions: Map<String, String> = emptyMap(),
+    val profile: UserProfile? = null   // день 12
+)
+```
+
+| Слой | Что хранит | Хранение | Scope |
+|---|---|---|---|
+| `SHORT_TERM` | текущий диалог | `ChatData.messages` + context-стратегии | per-chat |
+| `WORKING` | данные текущей задачи (task, plan, notes, decisions) | `ChatData.workingMemory` | per-chat, reset при `/reset` |
+| `LONG_TERM` | knowledge, decisions, profile | `AppPaths.longTermFile` (global JSON) | global |
+
+Слои подмешиваются в system prompt через `PromptBuilder` — пустые слои элизируются,
+поэтому при отсутствии памяти поведение дней 1–10 не меняется.
+
+### PromptBuilder (день 11)
+
+```kotlin
+class PromptBuilder(
+    private val baseSystem: ChatMessage,     // SystemPrompts.default или PromptTemplates.buildSystemMessage(strategy)
+    private val longTerm: LongTermMemory?,
+    private val working: WorkingMemory?
+) {
+    fun build(): ChatMessage   // base + [long-term block] + [working block]; пустые слои пропускаются
+}
 ```
 
 ### Agent
@@ -305,7 +358,7 @@ $ ./cli-agent
 |---|---|---|---|
 | 2.1 | `LlmParameters`: temperature, top_p, max_tokens — с CLI-флагами | День 4 | Расширение `ChatRequest`, CLI-опции |
 | 2.2 | Разные стратегии промптинга (step-by-step, expert group) | День 3 | Промпт-шаблоны в `agent/` |
-| 2.3 | SQLite-хранилище истории (`SqliteMemoryStore`) | День 7 | `memory/SqliteMemoryStore.kt` |
+| 2.3 | JSON-хранилище истории (`JsonChatStore`, файл на чат) | День 7 | `memory/JsonChatStore.kt` |
 | 2.4 | Загрузка/восстановление контекста при перезапуске | День 7 | Интеграция в `ContextAwareAgent` |
 | 2.5 | `TokenCounter`: подсчёт токенов для запроса, истории, ответа | День 8 | `llm/token/TokenCounter.kt` |
 | 2.6 | CLI-команды: `/context list`, `/context clear`, `/stats` | — | `cli/ContextCommand.kt` |
@@ -361,15 +414,29 @@ Switched to feature-a
 
 ---
 
-### Фаза 4: Стейтфул-агент (Неделя 3)
+### Фаза 4: Стейтфул-агент (Неделя 3 = Дни 11–13)
 
-| Шаг | Что делаем | Неделя курса | Артефакт |
+| Шаг | Что делаем | День курса | Артефакт |
 |---|---|---|---|
-| 4.1 | `Profile`: модель персонализации (стиль, ограничения, контекст) | Неделя 3 | `memory/Profile.kt` |
-| 4.2 | `TaskStateMachine`: этапы (clarify → plan → execute → validate → done) | Неделя 3 | `state/StateMachine.kt`, `state/TaskState.kt` |
-| 4.3 | `InvariantChecker`: программная проверка ограничений | Неделя 3 | `state/InvariantChecker.kt` |
-| 4.4 | `StatefulAgent`: полная сборка (профиль + стейт + инварианты) | Неделя 3 | `agent/StatefulAgent.kt` |
-| 4.5 | `PromptBuilder`: сборка контекстных слоёв в финальный промпт | Неделя 3 | Интеграция в `StatefulAgent` |
+| 4.1 | **Memory layers**: 3 типа памяти (short/working/long-term), хранятся отдельно, явный выбор что куда | День 11 | `memory/MemoryLayer.kt`, `memory/JsonLongTermStore.kt`, `agent/PromptBuilder.kt`, расширение `ContextAwareAgent` + `MemoryStore` + `ChatData` |
+| 4.2 | **Персонализация**: `Profile` (стиль, формат, ограничения) в `LongTermMemory.profile`, подключение к каждому запросу | День 12 | заполнение `UserProfile`, стартовое интервью / `/profile` |
+| 4.3 | **Task state machine**: этапы (clarify → plan → execute → validate → done), пауза/возобновление без повторных объяснений | День 13 | `state/TaskState.kt`, `state/StateMachine.kt`, `WorkingMemory.taskState`, `agent/StatefulAgent.kt` |
+| 4.4 | **InvariantChecker**: программная проверка ограничений | День 13+ | `state/InvariantChecker.kt` |
+| 4.5 | **StatefulAgent**: полная сборка (профиль + стейт + инварианты) | День 13 | `agent/StatefulAgent.kt` |
+
+**Результат дня 11:** Агент с явной моделью памяти — короткая/рабочая/долговременная
+хранятся раздельно, `/memory` явно сохраняет данные в нужный слой, `PromptBuilder`
+подмешивает слои в system prompt.
+
+```
+$ ./cli-agent chat -c new
+> /memory save long knowledge stack Kotlin
+> /memory save working task "auth service"
+> На каком языке писать и какой следующий шаг?
+Ответ: (учитывает long-term knowledge=Kotlin + working task=auth service)
+> /memory show working
+[Working memory] currentTask: auth service ...
+```
 
 **Результат:** Полный стейтфул-агент с персонализацией, стейт-машиной и инвариантами
 
@@ -461,7 +528,8 @@ $ ./cli-agent
 | `CLI_AGENT_API_KEY` | z.ai API ключ | — (обязательная) |
 | `CLI_AGENT_MODEL` | Имя модели | `glm-5.1` |
 | `CLI_AGENT_BASE_URL` | API base URL | `https://api.z.ai/api/coding/paas/v4` |
-| `CLI_AGENT_DB_PATH` | Путь к SQLite базе | `~/.cli-agent/data.db` |
+| `XDG_DATA_HOME` | Каталог данных (чаты + long-term память) | `~/.local/share` (→ `cli-agent/chats/*.json`, `cli-agent/longterm/memory.json`) |
+| `XDG_CONFIG_HOME` | Каталог конфигурации | `~/.config` |
 
 ---
 
@@ -491,17 +559,17 @@ $ ./cli-agent
 | Компонент | Android | CLI (этот проект) |
 |---|---|---|
 | HTTP-клиент | Retrofit + OkHttp | Ktor CIO |
-| БД | Room (ORM) | JDBC (сырой SQL) |
+| Хранилище | Room (ORM, SQLite) | JSON-файлы (без SQLite) |
 | DI | Hilt | Без DI (ручное создание) |
-| Сериализация БД | Room annotations | JSON-строки в TEXT-полях |
+| Сериализация хранения | Room annotations | kotlinx.serialization JSON (один файл на чат + global long-term) |
 | Обработка ошибок | try/catch | `LlmResult<T>` sealed class |
 | UI | Jetpack Compose | clikt REPL |
 | Модели | Конкретные IDs (glm-5.1, glm-5...) | То же + тир-система (WEAK/MEDIUM/STRONG) |
 | Бенчмарк | Нет | `BenchmarkRunner` |
 | Стриминг | SSE через OkHttp | Phase 2 (интерфейс заложен) |
 | Количество стратегий | 4 (SlidingWindow, StickyFacts, Summary, Branching) | 4 (то же) |
-| Ветвление | Персистентное (Room) | Персистентное (SQLite) |
-| Миграции БД | 7 Room-миграций | `DatabaseMigrations` (JDBC) |
+| Ветвление | Персистентное (Room) | Персистентное (JSON в `ChatData.branches`) |
+| Миграции хранилища | 7 Room-миграций | Без миграций — эволюция схемы через defaults в data class (`ignoreUnknownKeys=true`) |
 
 **Что позаимствовано из Android (принято):**
 - `GenerationPresets` — объединённые пресеты (без GenerationConfig)
@@ -512,7 +580,7 @@ $ ./cli-agent
 - `needsCompression()` + `getDescription()` — в интерфейсе ContextStrategy
 - Персистентное ветвление — таблица dialog_branches
 - `cachedTokens` — учёт кешированных токенов
-- Миграции БД — инкрементальные миграции SQLite
+- Эволюция схемы через defaults — без миграций БД (вместо инкрементальных SQLite-миграций Android)
 - Конкретные z.ai model IDs и тир-система
 
 **Что отвергнуто (не подходит CLI):**
@@ -520,7 +588,7 @@ $ ./cli-agent
 - ~~`AgentFactory`~~ — без DI фабрика = обёртка над конструктором
 - ~~`MessageUsage` встроенный в ChatMessage~~ — ломает API-сериализацию, CLI не отображает per-message токены
 - ~~`ContextStrategyType` @Serializable~~ — CLI получает стратегию из флага, сериализация не нужна
-- ~~`DialogBranch` отдельная доменная модель~~ — с raw JDBC Branch внутри BranchingStrategy достаточен
+- ~~`DialogBranch` отдельная доменная модель~~ — с JSON-хранилищем `BranchData` внутри `BranchingStrategy` достаточен
 
 **Что CLI делает лучше:**
 - `LlmResult<T>` — строгая обработка ошибок

@@ -11,6 +11,7 @@ data class ChatData(
     val summary: String? = null,
     val facts: Map<String, String> = emptyMap(),
     val branches: List<BranchData> = emptyList(),
+    val workingMemory: WorkingMemory? = null,   // день 11: рабочая память (per-chat)
     val createdAt: String,
     val updatedAt: String
 )

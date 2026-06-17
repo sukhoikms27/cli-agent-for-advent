@@ -24,4 +24,14 @@ interface MemoryStore {
     suspend fun createBranch(chatId: String, name: String, leafMessageId: String?, fromIndex: Int): BranchData
     suspend fun listBranches(chatId: String): List<BranchData>
     suspend fun deleteBranch(chatId: String, branchId: String)
+
+    // Working memory — per-chat (данные текущей задачи, день 11)
+    suspend fun saveWorkingMemory(chatId: String, memory: WorkingMemory)
+    suspend fun loadWorkingMemory(chatId: String): WorkingMemory?
+    suspend fun clearWorkingMemory(chatId: String)
+
+    // Long-term memory — global (profile, decisions, knowledge; кросс-чат, день 11)
+    suspend fun loadLongTermMemory(): LongTermMemory   // non-null: пустой объект если файла нет
+    suspend fun saveLongTermMemory(memory: LongTermMemory)
+    suspend fun clearLongTermMemory()
 }
