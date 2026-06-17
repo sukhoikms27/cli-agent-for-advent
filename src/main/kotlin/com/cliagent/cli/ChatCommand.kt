@@ -1,0 +1,359 @@
+package com.cliagent.cli
+
+import com.cliagent.agent.Agent
+import com.cliagent.agent.ContextAwareAgent
+import com.cliagent.config.ConfigRepository
+import com.cliagent.context.ContextManager
+import com.cliagent.context.HistoryCompressor
+import com.cliagent.context.strategy.BranchingStrategy
+import com.cliagent.context.strategy.ContextStrategyType
+import com.cliagent.context.strategy.SlidingWindowStrategy
+import com.cliagent.context.strategy.StickyFactsStrategy
+import com.cliagent.context.strategy.SummaryStrategy
+import com.cliagent.llm.OpenAiCompatibleClient
+import com.cliagent.llm.model.ReasoningStrategy
+import com.cliagent.llm.pricing.Pricing
+import com.cliagent.memory.JsonChatStore
+import com.cliagent.memory.MemoryStore
+import com.github.ajalt.clikt.core.CliktCommand
+import com.github.ajalt.clikt.parameters.options.default
+import com.github.ajalt.clikt.parameters.options.flag
+import com.github.ajalt.clikt.parameters.options.option
+import com.github.ajalt.clikt.parameters.types.double
+import com.github.ajalt.clikt.parameters.types.int
+import kotlinx.coroutines.runBlocking
+import java.io.BufferedReader
+import java.io.InputStreamReader
+
+class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat with LLM") {
+    private val model by option("-m", "--model", help = "Model name").default("glm-5.1")
+    private val temperature by option("-t", "--temperature", help = "Temperature (0.0-2.0)").double().default(0.7)
+    private val strategy by option("-s", "--strategy", help = "Reasoning: direct, step_by_step, meta_prompt, expert_group").default("direct")
+    private val chat by option("-c", "--chat", help = "Chat ID (or 'new')").default("default")
+    private val compress by option("--compress", help = "Enable auto-compression of history").flag()
+    private val keepRecent by option("--keep-recent", help = "Keep last N messages uncompressed").int().default(10)
+    private val contextStrategy by option("--context", help = "Context strategy: sliding, facts, summary, branch").default("sliding")
+
+    override fun run() = runBlocking {
+        val config = try {
+            ConfigRepository().load()
+        } catch (e: IllegalStateException) {
+            echo("Error: ${e.message}", err = true)
+            return@runBlocking
+        }
+
+        val client = OpenAiCompatibleClient(
+            baseUrl = config.baseUrl,
+            apiKey = config.apiKey
+        )
+
+        val memoryStore = JsonChatStore()
+
+        val chatId = when {
+            chat == "new" -> memoryStore.createChat().id
+            chat == "default" -> {
+                val existing = memoryStore.listChats().firstOrNull()
+                existing?.id ?: memoryStore.createChat().id
+            }
+            else -> {
+                if (memoryStore.loadChat(chat) != null) chat
+                else memoryStore.createChat().id
+            }
+        }
+
+        val reasoningStrategy = ReasoningStrategy.entries.find { it.label == strategy }
+        val historyCompressor = if (compress) {
+            HistoryCompressor(client, model, keepRecentCount = keepRecent)
+        } else {
+            null
+        }
+
+        // Create context strategy
+        val contextManager = createStrategy(contextStrategy, client, model, memoryStore, chatId, keepRecent)
+
+        val agent = ContextAwareAgent(
+            llmClient = client,
+            memoryStore = memoryStore,
+            model = model,
+            chatId = chatId,
+            reasoningStrategy = reasoningStrategy,
+            historyCompressor = historyCompressor,
+            contextManager = contextManager
+        )
+
+        val compressLabel = if (compress) "ON" else "OFF"
+        echo("CLI Agent v0.5 | Chat: $chatId | Model: $model | Context: ${contextManager.getStrategy().getName()} | Compress: $compressLabel")
+        echo("Type /help for commands, /exit to quit\n")
+
+        val reader = BufferedReader(InputStreamReader(System.`in`))
+
+        while (true) {
+            echo("> ", trailingNewline = false)
+            val input = reader.readLine() ?: break
+            if (input.isBlank()) continue
+
+            when {
+                input == "/exit" -> break
+                input == "/help" -> printHelp()
+                input == "/history" -> printHistory(agent)
+                input == "/chats" -> printChats(memoryStore)
+                input == "/stats" -> printStats(agent, model)
+                input == "/cost" -> printCost(agent, model)
+                input == "/summary" -> printSummary(agent)
+                input == "/compress" -> manualCompress(agent)
+                input == "/facts" -> printFacts(agent)
+                input.startsWith("/strategy") -> handleStrategy(input, agent, client, model, memoryStore, chatId, keepRecent)
+                input.startsWith("/branch") -> handleBranch(input, agent)
+                input == "/reset" -> {
+                    agent.reset()
+                    echo("History, summary, facts, branches cleared.")
+                }
+                else -> {
+                    val response = agent.chat(input)
+                    echo("\n$response\n")
+                }
+            }
+        }
+    }
+
+    private fun createStrategy(
+        type: String,
+        client: com.cliagent.llm.LlmClient,
+        model: String,
+        memoryStore: MemoryStore,
+        chatId: String,
+        keepRecent: Int
+    ): ContextManager {
+        val strategy = when (type.lowercase()) {
+            "sliding" -> SlidingWindowStrategy(keepRecent)
+            "facts" -> StickyFactsStrategy(client, model, keepRecent)
+            "summary" -> {
+                val compressor = HistoryCompressor(client, model, keepRecentCount = keepRecent)
+                SummaryStrategy(compressor, memoryStore, chatId)
+            }
+            "branch" -> BranchingStrategy(memoryStore, chatId, keepRecent)
+            else -> {
+                println("Unknown strategy '$type', using sliding window")
+                SlidingWindowStrategy(keepRecent)
+            }
+        }
+        return ContextManager(strategy)
+    }
+
+    private fun printHelp() {
+        echo("""
+            |CLI Agent v0.5 — Commands:
+            |
+            |  /help                — Show this help
+            |  /history             — Show chat history
+            |  /chats               — List saved chats
+            |  /stats               — Token statistics for current session
+            |  /cost                — Estimated cost for current session
+            |  /summary             — Show current conversation summary
+            |  /compress            — Manually trigger history compression
+            |  /strategy [name]     — Switch context strategy (sliding, facts, summary, branch)
+            |  /facts               — Show extracted facts (sticky-facts strategy)
+            |  /branch create <name> [at <N>] — Create branch from message N
+            |  /branch list         — List branches
+            |  /branch switch <name> — Switch to branch
+            |  /reset               — Clear chat history and summary
+            |  /exit                — Exit the program
+            |
+            |Context Strategies:
+            |  sliding  — Keep last N messages, discard older (default)
+            |  facts    — Extract key facts via LLM + keep last N messages
+            |  summary  — Auto-summarize old messages via LLM + keep recent
+            |  branch   — Create branches from checkpoints, switch between them
+            |
+            |CLI Flags:
+            |  -m, --model <name>       — Model name (default: glm-5.1)
+            |  -t, --temperature <0-2>  — Sampling temperature (default: 0.7)
+            |  -s, --strategy <type>    — Reasoning strategy (direct, step_by_step, meta_prompt, expert_group)
+            |  -c, --chat <id|new>      — Chat session (default: continue last)
+            |  --compress               — Enable auto-compression of history
+            |  --keep-recent <N>        — Keep last N messages uncompressed (default: 10)
+            |  --context <type>         — Context strategy (sliding, facts, summary, branch)
+        """.trimMargin())
+    }
+
+    private suspend fun printHistory(agent: Agent) {
+        val history = agent.getHistory()
+        if (history.isEmpty()) {
+            echo("No messages yet.")
+            return
+        }
+        history.forEachIndexed { i, msg ->
+            val preview = if (msg.content.length > 100) msg.content.take(100) + "..." else msg.content
+            echo("[${i + 1}] ${msg.role}: $preview")
+        }
+    }
+
+    private suspend fun printChats(memoryStore: MemoryStore) {
+        val chats = memoryStore.listChats()
+        if (chats.isEmpty()) {
+            echo("No saved chats.")
+            return
+        }
+        chats.forEach { chat ->
+            val tags = mutableListOf<String>()
+            if (chat.summary != null) tags.add("summarized")
+            if (chat.facts.isNotEmpty()) tags.add("${chat.facts.size} facts")
+            if (chat.branches.isNotEmpty()) tags.add("${chat.branches.size} branches")
+            val tagStr = if (tags.isNotEmpty()) " [${tags.joinToString(", ")}]" else ""
+            echo("${chat.id}  ${chat.title}  (${chat.messages.size} msgs, updated ${chat.updatedAt.take(19)})$tagStr")
+        }
+    }
+
+    private fun printStats(agent: ContextAwareAgent, model: String) {
+        val stats = agent.getTokenStats()
+        val estimated = agent.getEstimatedHistoryTokens()
+        if (stats != null) {
+            echo("""
+                |📊 Token Statistics (session)
+                |  Requests:      ${stats.requestCount}
+                |  Prompt:        ${stats.totalPromptTokens} tokens
+                |  Completion:    ${stats.totalCompletionTokens} tokens
+                |  Total:         ${stats.totalTokens} tokens
+                |  Cached:        ${stats.totalCachedTokens} tokens
+                |  Last request:  prompt=${stats.lastRequestTokens?.promptTokens ?: "?"} completion=${stats.lastRequestTokens?.completionTokens ?: "?"} total=${stats.lastRequestTokens?.totalTokens ?: "?"}
+                |  History est:   ~$estimated tokens (approx)
+                |  Strategy:      ${agent.getCurrentStrategyName()}
+            """.trimMargin())
+        } else {
+            echo("No token data yet. Send a message first.")
+        }
+    }
+
+    private fun printCost(agent: ContextAwareAgent, model: String) {
+        val stats = agent.getTokenStats()
+        if (stats == null) {
+            echo("No token data yet. Send a message first.")
+            return
+        }
+        val price = Pricing.getPrice(model)
+        if (price != null) {
+            val inputCost = (stats.totalPromptTokens / 1_000_000.0) * price.input
+            val outputCost = (stats.totalCompletionTokens / 1_000_000.0) * price.output
+            val totalCost = inputCost + outputCost
+            echo("""
+                |💰 Estimated Cost (session)
+                |  Model:         $model
+                |  Input:         ${stats.totalPromptTokens} tokens × ${'$'}${String.format("%.2f", price.input)}/1M = ${'$'}${String.format("%.6f", inputCost)}
+                |  Output:        ${stats.totalCompletionTokens} tokens × ${'$'}${String.format("%.2f", price.output)}/1M = ${'$'}${String.format("%.6f", outputCost)}
+                |  Total:         ${'$'}${String.format("%.6f", totalCost)}
+                |  Cached saved:  ${stats.totalCachedTokens} tokens
+            """.trimMargin())
+        } else {
+            echo("No pricing data for model '$model'. Token counts: prompt=${stats.totalPromptTokens} completion=${stats.totalCompletionTokens} total=${stats.totalTokens}")
+        }
+    }
+
+    private suspend fun printSummary(agent: ContextAwareAgent) {
+        val summary = agent.getSummary()
+        if (summary != null) {
+            echo("📝 Conversation Summary:\n$summary")
+        } else {
+            echo("No summary yet. Use --compress flag or /compress command.")
+        }
+    }
+
+    private suspend fun manualCompress(agent: ContextAwareAgent) {
+        val summary = agent.compressNow()
+        if (summary != null) {
+            echo("✓ History compressed. Summary saved.")
+        } else {
+            echo("Compression not available. Start with --compress flag.")
+        }
+    }
+
+    private fun printFacts(agent: ContextAwareAgent) {
+        val cm = agent.getContextManager()
+        val strategy = cm?.getStrategy() as? StickyFactsStrategy
+        if (strategy != null) {
+            val facts = strategy.getFacts()
+            if (facts.isEmpty()) {
+                echo("No facts extracted yet.")
+            } else {
+                echo("📋 Key Facts:")
+                facts.forEach { (key, value) ->
+                    echo("  $key: $value")
+                }
+            }
+        } else {
+            echo("Facts are only available with 'facts' strategy. Use /strategy facts or --context facts")
+        }
+    }
+
+    private suspend fun handleStrategy(
+        input: String,
+        agent: ContextAwareAgent,
+        client: com.cliagent.llm.LlmClient,
+        model: String,
+        memoryStore: MemoryStore,
+        chatId: String,
+        keepRecent: Int
+    ) {
+        val parts = input.trim().split("\\s+".toRegex())
+        if (parts.size < 2) {
+            echo("Current strategy: ${agent.getCurrentStrategyName()}")
+            echo("Available: sliding, facts, summary, branch")
+            return
+        }
+        val name = parts[1].lowercase()
+        val newManager = createStrategy(name, client, model, memoryStore, chatId, keepRecent)
+        val msg = agent.switchStrategy(newManager)
+        echo(msg)
+    }
+
+    private suspend fun handleBranch(input: String, agent: ContextAwareAgent) {
+        val cm = agent.getContextManager()
+        val strategy = cm?.getStrategy() as? BranchingStrategy
+        if (strategy == null) {
+            echo("Branching requires 'branch' strategy. Use /strategy branch or --context branch")
+            return
+        }
+
+        val parts = input.trim().split("\\s+".toRegex())
+        if (parts.size < 2) {
+            echo("Usage: /branch create <name> [at <N>] | /branch list | /branch switch <name>")
+            return
+        }
+
+        when (parts[1]) {
+            "create" -> {
+                if (parts.size < 3) {
+                    echo("Usage: /branch create <name> [at <N>]")
+                    return
+                }
+                val name = parts[2]
+                val fromIndex = if (parts.size >= 5 && parts[3] == "at") {
+                    parts[4].toIntOrNull() ?: (agent.getHistory().size - 1)
+                } else {
+                    agent.getHistory().size - 1
+                }
+                val branchId = strategy.createBranch(name, fromIndex)
+                echo("✓ Created branch '$name' from message #${fromIndex + 1} (id: $branchId)")
+            }
+            "list" -> {
+                val branches = strategy.listBranches()
+                echo("Branches:")
+                branches.forEach { echo("  $it") }
+            }
+            "switch" -> {
+                if (parts.size < 3) {
+                    echo("Usage: /branch switch <name>")
+                    return
+                }
+                val name = parts[2]
+                // Find branch by name
+                val result = strategy.switchBranch(name)
+                if (result.isSuccess) {
+                    echo("✓ Switched to branch '${result.getOrDefault("")}'")
+                } else {
+                    echo("Branch '$name' not found")
+                }
+            }
+            else -> echo("Unknown branch command: ${parts[1]}. Use: create, list, switch")
+        }
+    }
+}

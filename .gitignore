@@ -1,0 +1,27 @@
+# Build outputs
+build/
+out/
+.gradle/
+
+# IDE
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Runtime data
+*.db
+*.sqlite
+
+# Environment / secrets
+.env
+.env.local
+local.properties
+
+# Kotlin
+*.kotlin_module
