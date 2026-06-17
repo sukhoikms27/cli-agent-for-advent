@@ -12,7 +12,8 @@ import java.time.Instant
 import java.util.UUID
 
 class JsonChatStore(
-    private val chatsDir: Path = AppPaths.chatsDir
+    private val chatsDir: Path = AppPaths.chatsDir,
+    private val longTermStore: JsonLongTermStore = JsonLongTermStore()
 ) : MemoryStore {
 
     private val json = Json {
@@ -177,6 +178,42 @@ class JsonChatStore(
             atomicWrite(chatFile(chatId), json.encodeToString(ChatData.serializer(), updated))
         }
     }
+
+    // Working memory — per-chat (день 11)
+    override suspend fun saveWorkingMemory(chatId: String, memory: WorkingMemory) {
+        ensureDir()
+        withContext(Dispatchers.IO) {
+            val chatData = loadChatInternal(chatId) ?: return@withContext
+            val updated = chatData.copy(
+                workingMemory = memory,
+                updatedAt = Instant.now().toString()
+            )
+            atomicWrite(chatFile(chatId), json.encodeToString(ChatData.serializer(), updated))
+        }
+    }
+
+    override suspend fun loadWorkingMemory(chatId: String): WorkingMemory? {
+        return loadChat(chatId)?.workingMemory
+    }
+
+    override suspend fun clearWorkingMemory(chatId: String) {
+        ensureDir()
+        withContext(Dispatchers.IO) {
+            val chatData = loadChatInternal(chatId) ?: return@withContext
+            val updated = chatData.copy(
+                workingMemory = null,
+                updatedAt = Instant.now().toString()
+            )
+            atomicWrite(chatFile(chatId), json.encodeToString(ChatData.serializer(), updated))
+        }
+    }
+
+    // Long-term memory — global (день 11), форвард в JsonLongTermStore
+    override suspend fun loadLongTermMemory(): LongTermMemory = longTermStore.load()
+
+    override suspend fun saveLongTermMemory(memory: LongTermMemory) = longTermStore.save(memory)
+
+    override suspend fun clearLongTermMemory() = longTermStore.clear()
 
     private fun loadChatInternal(chatId: String): ChatData? {
         val file = chatFile(chatId)

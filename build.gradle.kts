@@ -30,10 +30,21 @@ dependencies {
 
     // clikt — CLI framework
     implementation("com.github.ajalt.clikt:clikt:4.4.0")
+
+    // Testing (день 11)
+    testImplementation(platform("org.junit:junit-bom:5.12.2"))
+    testImplementation("org.junit.jupiter:junit-jupiter")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+    testImplementation("io.mockk:mockk:1.13.16")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:$kotlinxCoroutinesVersion")
 }
 
 kotlin {
     jvmToolchain(17)
+}
+
+tasks.withType<Test> {
+    useJUnitPlatform()
 }
 
 application {

@@ -13,7 +13,9 @@ import com.cliagent.llm.model.PromptTemplates
 import com.cliagent.llm.model.ReasoningStrategy
 import com.cliagent.llm.model.SystemPrompts
 import com.cliagent.llm.token.TokenCounter
+import com.cliagent.memory.LongTermMemory
 import com.cliagent.memory.MemoryStore
+import com.cliagent.memory.WorkingMemory
 
 class ContextAwareAgent(
     private val llmClient: LlmClient,
@@ -30,11 +32,17 @@ class ContextAwareAgent(
 
     private var history = mutableListOf<ChatMessage>()
     private var loaded = false
+    // Memory layers (день 11): working — per-chat, long-term — global
+    private var workingMemory: WorkingMemory? = null
+    private var longTermMemory: LongTermMemory? = null
 
     private suspend fun ensureLoaded() {
         if (!loaded) {
             history = memoryStore.loadHistory(chatId).toMutableList()
             loaded = true
+            // Load memory layers
+            workingMemory = memoryStore.loadWorkingMemory(chatId)
+            longTermMemory = memoryStore.loadLongTermMemory()
             // Load strategy-specific state
             (contextManager?.getStrategy() as? StickyFactsStrategy)?.let {
                 it.setFacts(memoryStore.loadFacts(chatId))
@@ -110,11 +118,13 @@ class ContextAwareAgent(
     }
 
     private suspend fun buildMessagesToSend(userMsg: ChatMessage): List<ChatMessage> {
-        val system = if (reasoningStrategy != null) {
+        val baseSystem = if (reasoningStrategy != null) {
             PromptTemplates.buildSystemMessage(reasoningStrategy)
         } else {
             systemPrompt
         }
+        // Слоёный system prompt: base + [long-term] + [working]; пустые слои элизируются
+        val system = PromptBuilder(baseSystem, longTermMemory, workingMemory).build()
 
         // If contextManager is set, delegate to strategy
         if (contextManager != null) {
@@ -154,6 +164,9 @@ class ContextAwareAgent(
         memoryStore.clearHistory(chatId)
         memoryStore.clearSummary(chatId)
         memoryStore.saveFacts(chatId, emptyMap())
+        memoryStore.clearWorkingMemory(chatId)
+        workingMemory = null
+        // long-term НЕ чистим — он global/кросс-сессионный
         tokenCounter.reset(chatId)
         contextManager?.reset()
         loaded = true
@@ -193,5 +206,23 @@ class ContextAwareAgent(
             it.loadBranches()
         }
         return "Switched to $msg"
+    }
+
+    // ── Memory layer accessors (день 11, для /memory команды) ──
+
+    suspend fun getWorkingMemory(): WorkingMemory? =
+        workingMemory ?: memoryStore.loadWorkingMemory(chatId)
+
+    suspend fun getLongTermMemory(): LongTermMemory =
+        longTermMemory ?: memoryStore.loadLongTermMemory()
+
+    suspend fun setWorkingMemory(memory: WorkingMemory) {
+        memoryStore.saveWorkingMemory(chatId, memory)
+        workingMemory = memory
+    }
+
+    suspend fun setLongTermMemory(memory: LongTermMemory) {
+        memoryStore.saveLongTermMemory(memory)
+        longTermMemory = memory
     }
 }
