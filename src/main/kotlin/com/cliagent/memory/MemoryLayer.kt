@@ -29,17 +29,20 @@ data class WorkingMemory(
 }
 
 /**
- * Профиль пользователя — stub под Day 12 (персонализация).
- * Живёт внутри [LongTermMemory.profile], подключается к каждому запросу.
+ * Профиль пользователя — персонализация (день 12).
+ * Живёт внутри [LongTermMemory.profile], рендерится в system prompt каждого запроса
+ * через [com.cliagent.agent.PromptBuilder]. Три группы данных (лекция недели 3):
+ * стиль, ограничения (constraints), контекст (about — кто пользователь, цель).
  */
 @Serializable
 data class UserProfile(
     val style: String? = null,
     val format: String? = null,
+    val about: String? = null,        // контекст: кто пользователь, цель
     val constraints: List<String> = emptyList()
 ) {
     fun isEmpty(): Boolean =
-        style == null && format == null && constraints.isEmpty()
+        style == null && format == null && about == null && constraints.isEmpty()
 }
 
 /**

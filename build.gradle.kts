@@ -31,6 +31,12 @@ dependencies {
     // clikt — CLI framework
     implementation("com.github.ajalt.clikt:clikt:4.4.0")
 
+    // mordant — terminal output (цвета, таблицы, спиннеры); объявляем явно (транзитивно через clikt 2.5.0)
+    implementation("com.github.ajalt.mordant:mordant:2.5.0")
+
+    // JLine3 — REPL input (история, completion, редактирование строк, сигналы)
+    implementation("org.jline:jline:3.29.0")
+
     // Testing (день 11)
     testImplementation(platform("org.junit:junit-bom:5.12.2"))
     testImplementation("org.junit.jupiter:junit-jupiter")

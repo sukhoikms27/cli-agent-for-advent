@@ -69,6 +69,7 @@ internal fun UserProfile.renderBlock(): String {
     lines.add("User profile:")
     style?.let { lines.add("  Style: $it") }
     format?.let { lines.add("  Format: $it") }
+    about?.let { lines.add("  About: $it") }
     if (constraints.isNotEmpty()) {
         lines.add("  Constraints:")
         constraints.forEach { lines.add("    - $it") }

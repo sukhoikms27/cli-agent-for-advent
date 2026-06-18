@@ -62,4 +62,11 @@ class PromptBuilderTest {
         assertTrue(built.content.contains("concise"))
         assertTrue(built.content.contains("no RxJava"))
     }
+
+    @Test
+    fun `profile about field renders — day 12`() {
+        val lt = LongTermMemory(profile = UserProfile(about = "backend dev, Ktor"))
+        val built = PromptBuilder(base, lt, null).build()
+        assertTrue(built.content.contains("About: backend dev, Ktor"))
+    }
 }
