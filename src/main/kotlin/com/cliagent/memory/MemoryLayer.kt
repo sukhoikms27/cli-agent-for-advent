@@ -1,5 +1,6 @@
 package com.cliagent.memory
 
+import com.cliagent.state.TaskState
 import kotlinx.serialization.Serializable
 
 /**
@@ -15,17 +16,20 @@ enum class MemoryLayer { SHORT_TERM, WORKING, LONG_TERM }
  * Рабочая память — per-chat, данные текущей задачи.
  * Хранится в [ChatData.workingMemory], сбрасывается при /reset.
  *
- * Точка расширения Day 13: `val taskState: TaskState? = null` (добавить с default).
+ * [taskState] — состояние задачи как конечный автомат (день 13): этап/шаг/ожидаемое действие.
+ * Живёт здесь (per-chat), персистится и очищается вместе с рабочей памятью.
  */
 @Serializable
 data class WorkingMemory(
     val currentTask: String? = null,
     val plan: String? = null,
     val scratchNotes: String? = null,
-    val taskDecisions: List<String> = emptyList()
+    val taskDecisions: List<String> = emptyList(),
+    val taskState: TaskState? = null   // день 13: состояние задачи (FSM)
 ) {
     fun isEmpty(): Boolean =
-        currentTask == null && plan == null && scratchNotes == null && taskDecisions.isEmpty()
+        currentTask == null && plan == null && scratchNotes == null && taskDecisions.isEmpty() &&
+            taskState == null
 }
 
 /**

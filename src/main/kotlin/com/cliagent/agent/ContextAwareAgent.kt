@@ -11,12 +11,15 @@ import com.cliagent.llm.model.ChatMessage
 import com.cliagent.llm.model.ChatRequest
 import com.cliagent.llm.model.PromptTemplates
 import com.cliagent.llm.model.ReasoningStrategy
+import com.cliagent.llm.model.StagePromptTemplates
 import com.cliagent.llm.model.SystemPrompts
 import com.cliagent.llm.token.TokenCounter
 import com.cliagent.memory.LongTermMemory
 import com.cliagent.memory.MemoryStore
 import com.cliagent.memory.UserProfile
 import com.cliagent.memory.WorkingMemory
+import com.cliagent.state.TaskState
+import com.cliagent.state.TaskStateMachine
 
 class ContextAwareAgent(
     private val llmClient: LlmClient,
@@ -130,10 +133,13 @@ class ContextAwareAgent(
     }
 
     private suspend fun buildMessagesToSend(userMsg: ChatMessage): List<ChatMessage> {
-        val baseSystem = if (reasoningStrategy != null) {
-            PromptTemplates.buildSystemMessage(reasoningStrategy)
-        } else {
-            systemPrompt
+        // Precedence (доработка Day 13): активная задача → stage-промпт (поведение per stage);
+        // иначе reasoningStrategy → иначе статический systemPrompt (поведение Day 1-13).
+        val taskState = getTaskState()
+        val baseSystem = when {
+            taskState != null -> StagePromptTemplates.buildSystemMessage(taskState.stage)
+            reasoningStrategy != null -> PromptTemplates.buildSystemMessage(reasoningStrategy)
+            else -> systemPrompt
         }
         // Слоёный system prompt: base + [long-term] + [working]; пустые слои элизируются
         val system = PromptBuilder(baseSystem, longTermMemory, workingMemory).build()
@@ -244,5 +250,31 @@ class ContextAwareAgent(
 
     suspend fun setProfile(profile: UserProfile?) {
         setLongTermMemory(getLongTermMemory().copy(profile = profile))
+    }
+
+    // ── Task state accessors (день 13, для /task команды) ──
+
+    suspend fun getTaskState(): TaskState? = getWorkingMemory()?.taskState
+
+    suspend fun setTaskState(state: TaskState?) {
+        val w = getWorkingMemory() ?: WorkingMemory()
+        setWorkingMemory(w.copy(taskState = state))
+    }
+
+    /** Канонический переход вперёд ([TaskStateMachine.next]); null если некуда/нет задачи. */
+    suspend fun advanceTaskState(note: String? = null): TaskState? {
+        val cur = getTaskState() ?: return null
+        val nextStage = TaskStateMachine.next(cur.stage) ?: return null
+        val updated = TaskStateMachine.transition(cur, nextStage, note)
+        setTaskState(updated)
+        return updated
+    }
+
+    /** Откат на одну стадию назад по history; null если история пуста/нет задачи. */
+    suspend fun revertTaskState(): TaskState? {
+        val cur = getTaskState() ?: return null
+        val reverted = TaskStateMachine.back(cur) ?: return null
+        setTaskState(reverted)
+        return reverted
     }
 }

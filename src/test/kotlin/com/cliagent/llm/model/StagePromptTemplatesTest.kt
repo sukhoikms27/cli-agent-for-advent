@@ -1,0 +1,47 @@
+package com.cliagent.llm.model
+
+import com.cliagent.state.TaskStage
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Test
+
+class StagePromptTemplatesTest {
+
+    @Test
+    fun `buildSystemMessage returns non-empty system message for every stage`() {
+        TaskStage.entries.forEach { stage ->
+            val msg = StagePromptTemplates.buildSystemMessage(stage)
+            assertEquals("system", msg.role)
+            assertTrue(msg.content.isNotBlank(), "content blank for $stage")
+        }
+    }
+
+    @Test
+    fun `stage prompts are distinct per stage`() {
+        val contents = TaskStage.entries.associateWith { StagePromptTemplates.buildSystemMessage(it).content }
+        // все 5 — попарно различны
+        val distinct = contents.values.toSet()
+        assertEquals(TaskStage.entries.size, distinct.size)
+    }
+
+    @Test
+    fun `clarify prompt asks questions and forbids code`() {
+        val content = StagePromptTemplates.buildSystemMessage(TaskStage.CLARIFY).content.lowercase()
+        assertTrue(content.contains("question") || content.contains("clarif"))
+        assertTrue(content.contains("do not") && content.contains("code"))
+    }
+
+    @Test
+    fun `execution prompt asks to implement`() {
+        val content = StagePromptTemplates.buildSystemMessage(TaskStage.EXECUTION).content.lowercase()
+        assertTrue(content.contains("implement") || content.contains("code"))
+        assertFalse(content.contains("clarify"))
+    }
+
+    @Test
+    fun `validation prompt asks for a verdict`() {
+        val content = StagePromptTemplates.buildSystemMessage(TaskStage.VALIDATION).content.lowercase()
+        assertTrue(content.contains("verdict") || content.contains("pass") || content.contains("rework"))
+    }
+}
