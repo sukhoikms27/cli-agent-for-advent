@@ -14,13 +14,16 @@
 | **Язык** | Kotlin |
 | **Билд-система** | Gradle + Kotlin DSL (`build.gradle.kts`) |
 | **CLI-фреймворк** | clikt |
+| **REPL engine** | JLine3 (LineReader: история, tab-completion, редактирование, Ctrl+C/D) |
+| **Terminal output** | mordant (ANSI-цвета, таблицы, спиннеры; auto-detect + `--no-color`) |
 | **HTTP-клиент** | Ktor Client |
 | **Сериализация** | kotlinx.serialization |
 | **Память/персистентность** | JSON-файлы (один на чат + глобальный long-term), атомарная запись |
 | **LLM-провайдер** | z.ai (Zhipu AI) — GLM-5.1 |
 | **API-формат** | OpenAI-совместимый (`/v4/chat/completions`) |
-| **Streaming** | Фаза 2 (сначала без стриминга) |
+| **Streaming** | Фаза 2 (SSE через Ktor, инкрементальный рендер через mordant live-line) |
 | **Стиль CLI** | REPL по умолчанию + CLI-аргументы для подкоманд |
+| **TUI-стратегия** | JLine3 + mordant (внедрено); kotter (декларативный live-TUI) — отложен до потребности в live-панелях todo/tool-use |
 | **Выполненные задания курса** | Дни 1–11 (API-вызов → формат → рассуждения → температура → модели → агент → контекст → токены → сжатие → 4 стратегии → модель памяти: short/working/long-term layers) |
 
 ---
@@ -30,7 +33,7 @@
 ```
 ┌──────────────────────────────────────────────────────────┐
 │                       CLI Layer                           │
-│                   (clikt: REPL + команды)                 │
+│            (clikt + JLine3 REPL + mordant output)         │
 │                    cli/ package                           │
 ├──────────────────────────────────────────────────────────┤
 │                      Agent Layer                          │
@@ -66,7 +69,9 @@ src/main/kotlin/com/cliagent/
 │
 ├── cli/                              # ── CLI Layer ──
 │   ├── CliAgentCommand.kt            #   Корневая команда (clikt)
-│   └── ChatCommand.kt                #   REPL-режим чата (JLine-free BufferedReader, slash-команды inline)
+│   ├── ChatCommand.kt                #   REPL-режим чата (slash-команды, диспетч)
+│   ├── ReplEngine.kt                 #   JLine3 REPL-цикл + completion + история (TUI)
+│   └── AppTerminal.kt                #   mordant Terminal-обёртка (цвета/таблицы/спиннеры)
 │
 ├── agent/                            # ── Agent Layer ──
 │   ├── Agent.kt                      #   Интерфейс агента
@@ -126,7 +131,7 @@ src/main/kotlin/com/cliagent/
 
 | Пакет | Ответственность | Зависит от |
 |---|---|---|
-| `cli/` | Парсинг аргументов, REPL-цикл, вывод пользователю | `agent/`, `config/` |
+| `cli/` | Парсинг аргументов, JLine3 REPL-цикл, mordant-вывод пользователю | `agent/`, `config/` |
 | `agent/` | Оркестрация пайплайна: perception → memory → reasoning → action | `llm/`, `context/`, `memory/`, `state/` |
 | `llm/` | HTTP-взаимодействие с LLM API, модели запросов/ответов, pricing | `config/` (baseUrl, apiKey) |
 | `context/` | Управление контекстным окном: 4 стратегии, инкрементальное сжатие | `llm/model/` (ChatMessage), `memory/` |

@@ -25,9 +25,8 @@ import com.github.ajalt.clikt.parameters.options.flag
 import com.github.ajalt.clikt.parameters.options.option
 import com.github.ajalt.clikt.parameters.types.double
 import com.github.ajalt.clikt.parameters.types.int
+import com.github.ajalt.mordant.table.table
 import kotlinx.coroutines.runBlocking
-import java.io.BufferedReader
-import java.io.InputStreamReader
 
 class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat with LLM") {
     private val model by option("-m", "--model", help = "Model name").default("glm-5.1")
@@ -38,12 +37,15 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
     private val keepRecent by option("--keep-recent", help = "Keep last N messages uncompressed").int().default(10)
     private val contextStrategy by option("--context", help = "Context strategy: sliding, facts, summary, branch").default("sliding")
     private val autoProfile by option("--auto-profile", help = "Auto-extract user profile every N turns via LLM").flag()
+    private val noColor by option("--no-color", help = "Disable colored output").flag()
 
     override fun run() = runBlocking {
+        if (noColor) AppTerminal.disableColor()
+
         val config = try {
             ConfigRepository().load()
         } catch (e: IllegalStateException) {
-            echo("Error: ${e.message}", err = true)
+            AppTerminal.err(e.message ?: "config error")
             return@runBlocking
         }
 
@@ -92,14 +94,13 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         )
 
         val compressLabel = if (compress) "ON" else "OFF"
-        echo("CLI Agent v0.5 | Chat: $chatId | Model: $model | Context: ${contextManager.getStrategy().getName()} | Compress: $compressLabel")
-        echo("Type /help for commands, /exit to quit\n")
+        AppTerminal.println("CLI Agent v0.5 | Chat: $chatId | Model: $model | Context: ${contextManager.getStrategy().getName()} | Compress: $compressLabel")
+        AppTerminal.println("Type /help for commands, /exit to quit")
 
-        val reader = BufferedReader(InputStreamReader(System.`in`))
+        val repl = ReplEngine()
 
         while (true) {
-            echo("> ", trailingNewline = false)
-            val input = reader.readLine() ?: break
+            val input = repl.readLine() ?: break   // null = Ctrl+D
             if (input.isBlank()) continue
 
             when {
@@ -118,11 +119,13 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                 input.startsWith("/profile") -> handleProfile(input, agent, client, model)
                 input == "/reset" -> {
                     agent.reset()
-                    echo("History, summary, facts, branches, working memory cleared.")
+                    AppTerminal.ok("History, summary, facts, branches, working memory cleared.")
                 }
                 else -> {
-                    val response = agent.chat(input)
-                    echo("\n$response\n")
+                    val response = AppTerminal.withSpinner("Thinking…") { agent.chat(input) }
+                    AppTerminal.println()
+                    AppTerminal.markdown(response)
+                    AppTerminal.println()
                 }
             }
         }
@@ -145,7 +148,7 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             }
             "branch" -> BranchingStrategy(memoryStore, chatId, keepRecent)
             else -> {
-                println("Unknown strategy '$type', using sliding window")
+                AppTerminal.println("Unknown strategy '$type', using sliding window")
                 SlidingWindowStrategy(keepRecent)
             }
         }
@@ -153,7 +156,7 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
     }
 
     private fun printHelp() {
-        echo("""
+        AppTerminal.println("""
             |CLI Agent v0.5 — Commands:
             |
             |  /help                — Show this help
@@ -205,25 +208,27 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             |  --compress               — Enable auto-compression of history
             |  --keep-recent <N>        — Keep last N messages uncompressed (default: 10)
             |  --context <type>         — Context strategy (sliding, facts, summary, branch)
+            |  --auto-profile           — Auto-extract user profile every 5 turns via LLM
+            |  --no-color               — Disable colored output
         """.trimMargin())
     }
 
     private suspend fun printHistory(agent: Agent) {
         val history = agent.getHistory()
         if (history.isEmpty()) {
-            echo("No messages yet.")
+            AppTerminal.println("No messages yet.")
             return
         }
         history.forEachIndexed { i, msg ->
             val preview = if (msg.content.length > 100) msg.content.take(100) + "..." else msg.content
-            echo("[${i + 1}] ${msg.role}: $preview")
+            AppTerminal.println("[${i + 1}] ${msg.role}: $preview")
         }
     }
 
     private suspend fun printChats(memoryStore: MemoryStore) {
         val chats = memoryStore.listChats()
         if (chats.isEmpty()) {
-            echo("No saved chats.")
+            AppTerminal.println("No saved chats.")
             return
         }
         chats.forEach { chat ->
@@ -232,69 +237,78 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             if (chat.facts.isNotEmpty()) tags.add("${chat.facts.size} facts")
             if (chat.branches.isNotEmpty()) tags.add("${chat.branches.size} branches")
             val tagStr = if (tags.isNotEmpty()) " [${tags.joinToString(", ")}]" else ""
-            echo("${chat.id}  ${chat.title}  (${chat.messages.size} msgs, updated ${chat.updatedAt.take(19)})$tagStr")
+            AppTerminal.println("${chat.id}  ${chat.title}  (${chat.messages.size} msgs, updated ${chat.updatedAt.take(19)})$tagStr")
         }
     }
 
     private fun printStats(agent: ContextAwareAgent, model: String) {
         val stats = agent.getTokenStats()
         val estimated = agent.getEstimatedHistoryTokens()
-        if (stats != null) {
-            echo("""
-                |📊 Token Statistics (session)
-                |  Requests:      ${stats.requestCount}
-                |  Prompt:        ${stats.totalPromptTokens} tokens
-                |  Completion:    ${stats.totalCompletionTokens} tokens
-                |  Total:         ${stats.totalTokens} tokens
-                |  Cached:        ${stats.totalCachedTokens} tokens
-                |  Last request:  prompt=${stats.lastRequestTokens?.promptTokens ?: "?"} completion=${stats.lastRequestTokens?.completionTokens ?: "?"} total=${stats.lastRequestTokens?.totalTokens ?: "?"}
-                |  History est:   ~$estimated tokens (approx)
-                |  Strategy:      ${agent.getCurrentStrategyName()}
-            """.trimMargin())
-        } else {
-            echo("No token data yet. Send a message first.")
+        if (stats == null) {
+            AppTerminal.println("No token data yet. Send a message first.")
+            return
         }
+        val last = stats.lastRequestTokens
+        val table = table {
+            captionTop("📊 Token Statistics (session)")
+            header { style(bold = true); row("Metric", "Value") }
+            body {
+                row("Requests", "${stats.requestCount}")
+                row("Prompt", "${stats.totalPromptTokens} tokens")
+                row("Completion", "${stats.totalCompletionTokens} tokens")
+                row("Total", "${stats.totalTokens} tokens")
+                row("Cached", "${stats.totalCachedTokens} tokens")
+                row("Last request", "prompt=${last?.promptTokens ?: "?"} completion=${last?.completionTokens ?: "?"} total=${last?.totalTokens ?: "?"}")
+                row("History est", "~$estimated tokens (approx)")
+                row("Strategy", agent.getCurrentStrategyName())
+            }
+        }
+        AppTerminal.println(table)
     }
 
     private fun printCost(agent: ContextAwareAgent, model: String) {
         val stats = agent.getTokenStats()
         if (stats == null) {
-            echo("No token data yet. Send a message first.")
+            AppTerminal.println("No token data yet. Send a message first.")
             return
         }
         val price = Pricing.getPrice(model)
-        if (price != null) {
-            val inputCost = (stats.totalPromptTokens / 1_000_000.0) * price.input
-            val outputCost = (stats.totalCompletionTokens / 1_000_000.0) * price.output
-            val totalCost = inputCost + outputCost
-            echo("""
-                |💰 Estimated Cost (session)
-                |  Model:         $model
-                |  Input:         ${stats.totalPromptTokens} tokens × ${'$'}${String.format("%.2f", price.input)}/1M = ${'$'}${String.format("%.6f", inputCost)}
-                |  Output:        ${stats.totalCompletionTokens} tokens × ${'$'}${String.format("%.2f", price.output)}/1M = ${'$'}${String.format("%.6f", outputCost)}
-                |  Total:         ${'$'}${String.format("%.6f", totalCost)}
-                |  Cached saved:  ${stats.totalCachedTokens} tokens
-            """.trimMargin())
-        } else {
-            echo("No pricing data for model '$model'. Token counts: prompt=${stats.totalPromptTokens} completion=${stats.totalCompletionTokens} total=${stats.totalTokens}")
+        if (price == null) {
+            AppTerminal.println("No pricing data for model '$model'. Token counts: prompt=${stats.totalPromptTokens} completion=${stats.totalCompletionTokens} total=${stats.totalTokens}")
+            return
         }
+        val inputCost = (stats.totalPromptTokens / 1_000_000.0) * price.input
+        val outputCost = (stats.totalCompletionTokens / 1_000_000.0) * price.output
+        val totalCost = inputCost + outputCost
+        val table = table {
+            captionTop("💰 Estimated Cost (session)")
+            header { style(bold = true); row("Item", "Detail") }
+            body {
+                row("Model", model)
+                row("Input", "${stats.totalPromptTokens} tokens × \$${String.format("%.2f", price.input)}/1M = \$${String.format("%.6f", inputCost)}")
+                row("Output", "${stats.totalCompletionTokens} tokens × \$${String.format("%.2f", price.output)}/1M = \$${String.format("%.6f", outputCost)}")
+                row("Total", "\$${String.format("%.6f", totalCost)}")
+                row("Cached saved", "${stats.totalCachedTokens} tokens")
+            }
+        }
+        AppTerminal.println(table)
     }
 
     private suspend fun printSummary(agent: ContextAwareAgent) {
         val summary = agent.getSummary()
         if (summary != null) {
-            echo("📝 Conversation Summary:\n$summary")
+            AppTerminal.println("📝 Conversation Summary:\n$summary")
         } else {
-            echo("No summary yet. Use --compress flag or /compress command.")
+            AppTerminal.println("No summary yet. Use --compress flag or /compress command.")
         }
     }
 
     private suspend fun manualCompress(agent: ContextAwareAgent) {
         val summary = agent.compressNow()
         if (summary != null) {
-            echo("✓ History compressed. Summary saved.")
+            AppTerminal.ok("History compressed. Summary saved.")
         } else {
-            echo("Compression not available. Start with --compress flag.")
+            AppTerminal.println("Compression not available. Start with --compress flag.")
         }
     }
 
@@ -304,15 +318,15 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         if (strategy != null) {
             val facts = strategy.getFacts()
             if (facts.isEmpty()) {
-                echo("No facts extracted yet.")
+                AppTerminal.println("No facts extracted yet.")
             } else {
-                echo("📋 Key Facts:")
+                AppTerminal.println("📋 Key Facts:")
                 facts.forEach { (key, value) ->
-                    echo("  $key: $value")
+                    AppTerminal.println("  $key: $value")
                 }
             }
         } else {
-            echo("Facts are only available with 'facts' strategy. Use /strategy facts or --context facts")
+            AppTerminal.println("Facts are only available with 'facts' strategy. Use /strategy facts or --context facts")
         }
     }
 
@@ -327,34 +341,34 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
     ) {
         val parts = input.trim().split("\\s+".toRegex())
         if (parts.size < 2) {
-            echo("Current strategy: ${agent.getCurrentStrategyName()}")
-            echo("Available: sliding, facts, summary, branch")
+            AppTerminal.println("Current strategy: ${agent.getCurrentStrategyName()}")
+            AppTerminal.println("Available: sliding, facts, summary, branch")
             return
         }
         val name = parts[1].lowercase()
         val newManager = createStrategy(name, client, model, memoryStore, chatId, keepRecent)
         val msg = agent.switchStrategy(newManager)
-        echo(msg)
+        AppTerminal.println(msg)
     }
 
     private suspend fun handleBranch(input: String, agent: ContextAwareAgent) {
         val cm = agent.getContextManager()
         val strategy = cm?.getStrategy() as? BranchingStrategy
         if (strategy == null) {
-            echo("Branching requires 'branch' strategy. Use /strategy branch or --context branch")
+            AppTerminal.println("Branching requires 'branch' strategy. Use /strategy branch or --context branch")
             return
         }
 
         val parts = input.trim().split("\\s+".toRegex())
         if (parts.size < 2) {
-            echo("Usage: /branch create <name> [at <N>] | /branch list | /branch switch <name>")
+            AppTerminal.println("Usage: /branch create <name> [at <N>] | /branch list | /branch switch <name>")
             return
         }
 
         when (parts[1]) {
             "create" -> {
                 if (parts.size < 3) {
-                    echo("Usage: /branch create <name> [at <N>]")
+                    AppTerminal.println("Usage: /branch create <name> [at <N>]")
                     return
                 }
                 val name = parts[2]
@@ -364,28 +378,28 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                     agent.getHistory().size - 1
                 }
                 val branchId = strategy.createBranch(name, fromIndex)
-                echo("✓ Created branch '$name' from message #${fromIndex + 1} (id: $branchId)")
+                AppTerminal.ok("Created branch '$name' from message #${fromIndex + 1} (id: $branchId)")
             }
             "list" -> {
                 val branches = strategy.listBranches()
-                echo("Branches:")
-                branches.forEach { echo("  $it") }
+                AppTerminal.println("Branches:")
+                branches.forEach { AppTerminal.println("  $it") }
             }
             "switch" -> {
                 if (parts.size < 3) {
-                    echo("Usage: /branch switch <name>")
+                    AppTerminal.println("Usage: /branch switch <name>")
                     return
                 }
                 val name = parts[2]
                 // Find branch by name
                 val result = strategy.switchBranch(name)
                 if (result.isSuccess) {
-                    echo("✓ Switched to branch '${result.getOrDefault("")}'")
+                    AppTerminal.ok("Switched to branch '${result.getOrDefault("")}'")
                 } else {
-                    echo("Branch '$name' not found")
+                    AppTerminal.println("Branch '$name' not found")
                 }
             }
-            else -> echo("Unknown branch command: ${parts[1]}. Use: create, list, switch")
+            else -> AppTerminal.println("Unknown branch command: ${parts[1]}. Use: create, list, switch")
         }
     }
 
@@ -396,7 +410,7 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             val history = agent.getHistory()
             val working = agent.getWorkingMemory()
             val longTerm = agent.getLongTermMemory()
-            echo("""
+            AppTerminal.println("""
                 |🧠 Memory layers:
                 |  [short-term]  ${history.size} messages in current dialog
                 |  [working]     ${if (working == null || working.isEmpty()) "empty" else "task='${working.currentTask ?: "-"}', ${working.taskDecisions.size} decisions"}
@@ -410,7 +424,7 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         when (parts[1]) {
             "show" -> {
                 if (parts.size < 3) {
-                    echo("Usage: /memory show <short|working|long>")
+                    AppTerminal.println("Usage: /memory show <short|working|long>")
                     return
                 }
                 when (parts[2]) {
@@ -418,69 +432,69 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                     "working" -> {
                         val w = agent.getWorkingMemory()
                         if (w == null || w.isEmpty()) {
-                            echo("Working memory is empty.")
+                            AppTerminal.println("Working memory is empty.")
                         } else {
-                            echo("🔧 Working memory:")
-                            w.currentTask?.let { echo("  Task: $it") }
-                            w.plan?.let { echo("  Plan: $it") }
-                            w.scratchNotes?.let { echo("  Notes: $it") }
+                            AppTerminal.println("🔧 Working memory:")
+                            w.currentTask?.let { AppTerminal.println("  Task: $it") }
+                            w.plan?.let { AppTerminal.println("  Plan: $it") }
+                            w.scratchNotes?.let { AppTerminal.println("  Notes: $it") }
                             if (w.taskDecisions.isNotEmpty()) {
-                                echo("  Decisions:")
-                                w.taskDecisions.forEach { echo("    - $it") }
+                                AppTerminal.println("  Decisions:")
+                                w.taskDecisions.forEach { AppTerminal.println("    - $it") }
                             }
                         }
                     }
                     "long" -> {
                         val lt = agent.getLongTermMemory()
-                        echo("💾 Long-term memory:")
+                        AppTerminal.println("💾 Long-term memory:")
                         if (lt.knowledge.isNotEmpty()) {
-                            echo("  Knowledge:")
-                            lt.knowledge.forEach { (k, v) -> echo("    - $k: $v") }
+                            AppTerminal.println("  Knowledge:")
+                            lt.knowledge.forEach { (k, v) -> AppTerminal.println("    - $k: $v") }
                         }
                         if (lt.decisions.isNotEmpty()) {
-                            echo("  Decisions:")
-                            lt.decisions.forEach { (k, v) -> echo("    - $k: $v") }
+                            AppTerminal.println("  Decisions:")
+                            lt.decisions.forEach { (k, v) -> AppTerminal.println("    - $k: $v") }
                         }
                         val p = lt.profile
                         if (p != null) {
-                            echo("  Profile:")
-                            p.style?.let { echo("    Style: $it") }
-                            p.format?.let { echo("    Format: $it") }
-                            if (p.constraints.isNotEmpty()) p.constraints.forEach { echo("    Constraint: $it") }
+                            AppTerminal.println("  Profile:")
+                            p.style?.let { AppTerminal.println("    Style: $it") }
+                            p.format?.let { AppTerminal.println("    Format: $it") }
+                            if (p.constraints.isNotEmpty()) p.constraints.forEach { AppTerminal.println("    Constraint: $it") }
                         }
-                        if (lt.isEmpty()) echo("  (empty)")
+                        if (lt.isEmpty()) AppTerminal.println("  (empty)")
                     }
-                    else -> echo("Unknown layer: ${parts[2]}. Use: short, working, long")
+                    else -> AppTerminal.println("Unknown layer: ${parts[2]}. Use: short, working, long")
                 }
             }
             "save" -> handleMemorySave(parts, agent)
             "clear" -> {
                 if (parts.size < 3) {
-                    echo("Usage: /memory clear <working|long>")
+                    AppTerminal.println("Usage: /memory clear <working|long>")
                     return
                 }
                 when (parts[2]) {
                     "working" -> {
                         agent.setWorkingMemory(WorkingMemory())
-                        echo("✓ Working memory cleared for this chat.")
+                        AppTerminal.ok("Working memory cleared for this chat.")
                     }
                     "long" -> {
-                        echo("⚠️  Clearing ALL long-term memory (global, affects every chat).")
+                        AppTerminal.warn("Clearing ALL long-term memory (global, affects every chat).")
                         agent.setLongTermMemory(LongTermMemory())
-                        echo("✓ Long-term memory cleared.")
+                        AppTerminal.ok("Long-term memory cleared.")
                     }
-                    else -> echo("Unknown layer: ${parts[2]}. Use: working, long")
+                    else -> AppTerminal.println("Unknown layer: ${parts[2]}. Use: working, long")
                 }
             }
-            else -> echo("Unknown /memory command: ${parts[1]}. Use: show, save, clear")
+            else -> AppTerminal.println("Unknown /memory command: ${parts[1]}. Use: show, save, clear")
         }
     }
 
     private suspend fun handleMemorySave(parts: List<String>, agent: ContextAwareAgent) {
         // /memory save <working|long> <field> [args...]
         if (parts.size < 4) {
-            echo("Usage: /memory save working <task|plan|note|decision> <text>")
-            echo("       /memory save long <knowledge|decision> <key> <text>")
+            AppTerminal.println("Usage: /memory save working <task|plan|note|decision> <text>")
+            AppTerminal.println("       /memory save long <knowledge|decision> <key> <text>")
             return
         }
         when (parts[2]) {
@@ -488,7 +502,7 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                 val field = parts[3]
                 val text = parts.drop(4).joinToString(" ").trim()
                 if (text.isEmpty() && field !in listOf("task", "plan")) {
-                    echo("Text is required for '$field'.")
+                    AppTerminal.println("Text is required for '$field'.")
                     return
                 }
                 val w = agent.getWorkingMemory() ?: WorkingMemory()
@@ -498,15 +512,15 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                     "note" -> w.copy(scratchNotes = listOfNotNull(w.scratchNotes, text)
                         .filter { it.isNotBlank() }.joinToString("\n"))
                     "decision" -> w.copy(taskDecisions = w.taskDecisions + text)
-                    else -> { echo("Unknown working field: $field. Use: task, plan, note, decision"); return }
+                    else -> { AppTerminal.println("Unknown working field: $field. Use: task, plan, note, decision"); return }
                 }
                 agent.setWorkingMemory(updated)
-                echo("✓ Working memory '$field' updated.")
+                AppTerminal.ok("Working memory '$field' updated.")
             }
             "long" -> {
                 val field = parts[3]              // knowledge | decision
                 if (parts.size < 5) {
-                    echo("Usage: /memory save long $field <key> <text>")
+                    AppTerminal.println("Usage: /memory save long $field <key> <text>")
                     return
                 }
                 val key = parts[4]
@@ -523,12 +537,12 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                         if (text.isEmpty()) map.remove(key) else map[key] = text
                         lt.copy(decisions = map)
                     }
-                    else -> { echo("Unknown long field: $field. Use: knowledge, decision"); return }
+                    else -> { AppTerminal.println("Unknown long field: $field. Use: knowledge, decision"); return }
                 }
                 agent.setLongTermMemory(updated)
-                echo("✓ Long-term '$field' ${if (text.isEmpty()) "removed '$key'" else "updated '$key'"}.")
+                AppTerminal.ok("Long-term '$field' ${if (text.isEmpty()) "removed '$key'" else "updated '$key'"}.")
             }
-            else -> echo("Unknown layer: ${parts[2]}. Use: working, long")
+            else -> AppTerminal.println("Unknown layer: ${parts[2]}. Use: working, long")
         }
     }
 
@@ -542,15 +556,15 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         if (parts.size < 2 || parts[1] == "show") {
             val p = agent.getProfile()
             if (p == null || p.isEmpty()) {
-                echo("👤 User profile is empty. Use: /profile set style|format|about <text>, /profile add constraint <text>")
+                AppTerminal.println("👤 User profile is empty. Use: /profile set style|format|about <text>, /profile add constraint <text>")
             } else {
-                echo("👤 User profile:")
-                p.style?.let { echo("  Style: $it") }
-                p.format?.let { echo("  Format: $it") }
-                p.about?.let { echo("  About: $it") }
+                AppTerminal.println("👤 User profile:")
+                p.style?.let { AppTerminal.println("  Style: $it") }
+                p.format?.let { AppTerminal.println("  Format: $it") }
+                p.about?.let { AppTerminal.println("  About: $it") }
                 if (p.constraints.isNotEmpty()) {
-                    echo("  Constraints:")
-                    p.constraints.forEach { echo("    - $it") }
+                    AppTerminal.println("  Constraints:")
+                    p.constraints.forEach { AppTerminal.println("    - $it") }
                 }
             }
             return
@@ -559,13 +573,13 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         when (parts[1]) {
             "set" -> {
                 if (parts.size < 4) {
-                    echo("Usage: /profile set <style|format|about> <text>")
+                    AppTerminal.println("Usage: /profile set <style|format|about> <text>")
                     return
                 }
                 val field = parts[2]
                 val text = parts.drop(3).joinToString(" ").trim()
                 if (text.isEmpty()) {
-                    echo("Text is required.")
+                    AppTerminal.println("Text is required.")
                     return
                 }
                 val cur = agent.getProfile() ?: UserProfile()
@@ -573,54 +587,54 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                     "style" -> cur.copy(style = text)
                     "format" -> cur.copy(format = text)
                     "about" -> cur.copy(about = text)
-                    else -> { echo("Unknown field: $field. Use: style, format, about"); return }
+                    else -> { AppTerminal.println("Unknown field: $field. Use: style, format, about"); return }
                 }
                 agent.setProfile(updated)
-                echo("✓ Profile '$field' updated.")
+                AppTerminal.ok("Profile '$field' updated.")
             }
             "add" -> {
                 if (parts.size < 4 || parts[2] != "constraint") {
-                    echo("Usage: /profile add constraint <text>")
+                    AppTerminal.println("Usage: /profile add constraint <text>")
                     return
                 }
                 val text = parts.drop(3).joinToString(" ").trim()
                 val cur = agent.getProfile() ?: UserProfile()
                 agent.setProfile(cur.copy(constraints = cur.constraints + text))
-                echo("✓ Constraint added.")
+                AppTerminal.ok("Constraint added.")
             }
             "remove" -> {
                 if (parts.size < 4 || parts[2] != "constraint") {
-                    echo("Usage: /profile remove constraint <text>")
+                    AppTerminal.println("Usage: /profile remove constraint <text>")
                     return
                 }
                 val text = parts.drop(3).joinToString(" ").trim()
                 val cur = agent.getProfile() ?: UserProfile()
                 val filtered = cur.constraints.filterNot { it == text || it.contains(text) }
                 if (filtered.size == cur.constraints.size) {
-                    echo("No matching constraint found.")
+                    AppTerminal.println("No matching constraint found.")
                 } else {
                     agent.setProfile(cur.copy(constraints = filtered))
-                    echo("✓ Constraint removed.")
+                    AppTerminal.ok("Constraint removed.")
                 }
             }
             "extract" -> {
                 val history = agent.getHistory()
                 if (history.isEmpty()) {
-                    echo("No dialog yet to infer profile from.")
+                    AppTerminal.println("No dialog yet to infer profile from.")
                     return
                 }
-                echo("🔄 Inferring profile from dialog...")
+                AppTerminal.println("🔄 Inferring profile from dialog...")
                 val extractor = ProfileExtractor(client, model)
                 val cur = agent.getProfile()
-                val merged = extractor.extract(history, cur)
+                val merged = AppTerminal.withSpinner("Inferring profile…") { extractor.extract(history, cur) }
                 agent.setProfile(merged)
-                echo("✓ Profile inferred and merged. Use /profile to view.")
+                AppTerminal.ok("Profile inferred and merged. Use /profile to view.")
             }
             "clear" -> {
                 agent.setProfile(null)
-                echo("✓ Profile cleared.")
+                AppTerminal.ok("Profile cleared.")
             }
-            else -> echo("Unknown /profile command: ${parts[1]}. Use: show, set, add, remove, extract, clear")
+            else -> AppTerminal.println("Unknown /profile command: ${parts[1]}. Use: show, set, add, remove, extract, clear")
         }
     }
 }

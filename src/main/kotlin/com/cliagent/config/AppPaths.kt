@@ -10,4 +10,7 @@ object AppPaths {
     /** Глобальная долговременная память (кросс-чат/кросс-сессия, день 11). */
     val longTermDir: Path get() = dataDir.resolve("longterm")
     val longTermFile: Path get() = longTermDir.resolve("memory.json")
+
+    /** Персистентная история JLine3 REPL (между сессиями, TUI). */
+    val replHistoryFile: Path get() = dataDir.resolve("repl-history")
 }
