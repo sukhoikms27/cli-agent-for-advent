@@ -18,6 +18,7 @@ import com.cliagent.memory.LongTermMemory
 import com.cliagent.memory.MemoryStore
 import com.cliagent.memory.UserProfile
 import com.cliagent.memory.WorkingMemory
+import com.cliagent.state.invariant.Invariant
 import com.cliagent.state.TaskState
 import com.cliagent.state.TaskStateMachine
 
@@ -250,6 +251,30 @@ class ContextAwareAgent(
 
     suspend fun setProfile(profile: UserProfile?) {
         setLongTermMemory(getLongTermMemory().copy(profile = profile))
+    }
+
+    // ── Project invariants accessors (день 14, для /invariants команды) ──
+
+    suspend fun getInvariants(): List<Invariant> = getLongTermMemory().invariants
+
+    suspend fun setInvariants(invariants: List<Invariant>) {
+        setLongTermMemory(getLongTermMemory().copy(invariants = invariants))
+    }
+
+    /** Добавить инвариант (если id уже есть — обновить rule/category, не дублировать). */
+    suspend fun addInvariant(invariant: Invariant) {
+        val current = getInvariants()
+        val updated = (current.filterNot { it.id == invariant.id } + invariant)
+            .sortedBy { it.category.name }   // стабильный порядок для отображения
+        setInvariants(updated)
+    }
+
+    /** Удалить инвариант по id; true если был удалён. */
+    suspend fun removeInvariant(id: String): Boolean {
+        val current = getInvariants()
+        if (current.none { it.id == id }) return false
+        setInvariants(current.filterNot { it.id == id })
+        return true
     }
 
     // ── Task state accessors (день 13, для /task команды) ──

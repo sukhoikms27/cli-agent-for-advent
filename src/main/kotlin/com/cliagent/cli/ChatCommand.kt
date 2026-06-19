@@ -2,6 +2,7 @@ package com.cliagent.cli
 
 import com.cliagent.agent.Agent
 import com.cliagent.agent.ContextAwareAgent
+import com.cliagent.agent.InvariantGuard
 import com.cliagent.agent.ProfileExtractor
 import com.cliagent.agent.stage.TaskOrchestrator
 import com.cliagent.config.ConfigRepository
@@ -23,6 +24,9 @@ import com.cliagent.memory.WorkingMemory
 import com.cliagent.state.TaskStage
 import com.cliagent.state.TaskState
 import com.cliagent.state.TaskStateMachine
+import com.cliagent.state.invariant.Invariant
+import com.cliagent.state.invariant.InvariantCategory
+import com.cliagent.state.invariant.LlmInvariantChecker
 import com.github.ajalt.clikt.core.CliktCommand
 import com.github.ajalt.clikt.parameters.options.default
 import com.github.ajalt.clikt.parameters.options.flag
@@ -41,6 +45,11 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
     private val keepRecent by option("--keep-recent", help = "Keep last N messages uncompressed").int().default(10)
     private val contextStrategy by option("--context", help = "Context strategy: sliding, facts, summary, branch").default("sliding")
     private val autoProfile by option("--auto-profile", help = "Auto-extract user profile every N turns via LLM").flag()
+    private val invariantsEnabled by option(
+        "--invariants/--no-invariants",
+        envvar = "CLI_AGENT_INVARIANTS",
+        help = "Enforce project invariants: refuse violating requests, retry violating responses"
+    ).flag()
     private val noColor by option("--no-color", help = "Disable colored output").flag()
 
     override fun run() = runBlocking {
@@ -102,8 +111,18 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         // пункт плана внутри execution. Свободный текст при активной задаче = подтверждение/уточнение.
         val orchestrator = TaskOrchestrator(agent, client, model)
 
+        // День 14 (инварианты): decorator поверх агента для свободного чата (opt-in `--invariants`).
+        // Запрос-нарушитель → отказ без LLM; ответ-нарушитель → retry-loop. Slash-команды и
+        // orchestrator работают с базой (agent) напрямую — им нужны ContextAwareAgent-аксессоры.
+        val chatAgent: Agent = if (invariantsEnabled) {
+            InvariantGuard(agent, LlmInvariantChecker(client, model)) { agent.getInvariants() }
+        } else {
+            agent
+        }
+
+        val invariantsLabel = if (invariantsEnabled) "ON" else "OFF"
         val compressLabel = if (compress) "ON" else "OFF"
-        AppTerminal.println("CLI Agent v0.7 | Chat: $chatId | Model: $model | Context: ${contextManager.getStrategy().getName()} | Compress: $compressLabel")
+        AppTerminal.println("CLI Agent v0.7 | Chat: $chatId | Model: $model | Context: ${contextManager.getStrategy().getName()} | Compress: $compressLabel | Invariants: $invariantsLabel")
         AppTerminal.println("Type /help for commands, /exit to quit")
 
         val repl = ReplEngine()
@@ -126,6 +145,7 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                 input.startsWith("/branch") -> handleBranch(input, agent)
                 input.startsWith("/memory") -> handleMemory(input, agent)
                 input.startsWith("/profile") -> handleProfile(input, agent, client, model)
+                input.startsWith("/invariants") -> handleInvariants(input, agent)
                 input.startsWith("/task") -> handleTask(input, agent, orchestrator)
                 input == "/reset" -> {
                     agent.reset()
@@ -142,7 +162,9 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                         AppTerminal.markdown(taskResponse)
                         AppTerminal.println()
                     } else {
-                        val response = AppTerminal.withSpinner("Thinking…") { agent.chat(input) }
+                        // День 14: при --invariants свободный чат идёт через InvariantGuard
+                        // (отказ запроса-нарушителя + retry ответа-нарушителя).
+                        val response = AppTerminal.withSpinner("Thinking…") { chatAgent.chat(input) }
                         AppTerminal.println()
                         AppTerminal.markdown(response)
                         AppTerminal.println()
@@ -212,6 +234,12 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             |  /profile remove constraint <text> — Remove a constraint
             |  /profile extract      — Infer profile from current dialog via LLM
             |  /profile clear        — Clear the whole profile
+            |  /invariants                — Show project invariants (hard rules the agent must not violate)
+            |  /invariants add <cat> <id> <text> — Add invariant (cat: STACK/BAN/ARCH/BUSINESS)
+            |  /invariants remove <id>    — Remove invariant by id
+            |  /invariants clear          — Clear all invariants
+            |  Note: --invariants enables runtime enforcement (request refusal + response retry).
+            |        Without it, invariants are listed in the prompt but not enforced in code.
             |  /task                 — Show task state (stage/step/expected action/artifacts)
             |  /task start <text>    — Start a task: auto-selects first stage (clarify/planning),
             |                          generates its artifact via LLM, then asks to confirm advancing
@@ -672,6 +700,59 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                 AppTerminal.ok("Profile cleared.")
             }
             else -> AppTerminal.println("Unknown /profile command: ${parts[1]}. Use: show, set, add, remove, extract, clear")
+        }
+    }
+
+    // ── /invariants: жёсткие правила проекта (день 14, третий столп недели 3) ──
+
+    private suspend fun handleInvariants(input: String, agent: ContextAwareAgent) {
+        val parts = input.trim().split("\\s+".toRegex())
+        if (parts.size < 2 || parts[1] == "show") {
+            // /invariants  |  /invariants show
+            val list = agent.getInvariants()
+            if (list.isEmpty()) {
+                AppTerminal.println("🔒 No project invariants. Use: /invariants add <category> <id> <rule>")
+            } else {
+                AppTerminal.println("🔒 Project invariants:")
+                list.forEach {
+                    AppTerminal.println("  [${it.category.name.lowercase()}] ${it.id}: ${it.rule}")
+                }
+            }
+            return
+        }
+
+        when (parts[1]) {
+            "add" -> {
+                // /invariants add <STACK|BAN|ARCH|BUSINESS> <id> <rule text...>
+                if (parts.size < 5) {
+                    AppTerminal.println("Usage: /invariants add <STACK|BAN|ARCH|BUSINESS> <id> <rule text>")
+                    return
+                }
+                val category = try {
+                    InvariantCategory.valueOf(parts[2].uppercase())
+                } catch (e: IllegalArgumentException) {
+                    AppTerminal.println("Unknown category: ${parts[2]}. Use: STACK, BAN, ARCH, BUSINESS")
+                    return
+                }
+                val id = parts[3]
+                val rule = parts.drop(4).joinToString(" ").trim()
+                agent.addInvariant(Invariant(id = id, rule = rule, category = category))
+                AppTerminal.ok("Invariant added: [${category.name.lowercase()}] $id")
+            }
+            "remove" -> {
+                if (parts.size < 3) {
+                    AppTerminal.println("Usage: /invariants remove <id>")
+                    return
+                }
+                val removed = agent.removeInvariant(parts[2])
+                if (removed) AppTerminal.ok("Removed invariant: ${parts[2]}")
+                else AppTerminal.warn("Invariant not found: ${parts[2]}")
+            }
+            "clear" -> {
+                agent.setInvariants(emptyList())
+                AppTerminal.ok("All project invariants cleared.")
+            }
+            else -> AppTerminal.println("Unknown /invariants command: ${parts[1]}. Use: show, add, remove, clear")
         }
     }
 

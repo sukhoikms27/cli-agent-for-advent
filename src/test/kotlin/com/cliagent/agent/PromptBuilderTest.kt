@@ -6,6 +6,8 @@ import com.cliagent.memory.UserProfile
 import com.cliagent.memory.WorkingMemory
 import com.cliagent.state.TaskStage
 import com.cliagent.state.TaskState
+import com.cliagent.state.invariant.Invariant
+import com.cliagent.state.invariant.InvariantCategory
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -115,5 +117,43 @@ class PromptBuilderTest {
         val built = PromptBuilder(base, null, working).build()
         assertTrue(built.content.contains("Implementation: Reducer + ViewModel готовы"))
         assertTrue(built.content.contains("Verdict: тесты зелёные"))
+    }
+
+    @Test
+    fun `invariants render as project invariants block — day 14`() {
+        val lt = LongTermMemory(
+            invariants = listOf(
+                Invariant("no-compose", "UI только View-based, запрещён Compose", InvariantCategory.BAN)
+            )
+        )
+        val built = PromptBuilder(base, lt, null).build()
+        assertTrue(built.content.contains("[Project invariants"))
+        assertTrue(built.content.contains("MUST NOT"))
+        assertTrue(built.content.contains("[no-compose] UI только View-based, запрещён Compose"))
+        assertTrue(built.content.contains("(ban)"))
+    }
+
+    @Test
+    fun `empty invariants do not render the block — day 14 zero regression`() {
+        val lt = LongTermMemory()   // нет инвариантов
+        val built = PromptBuilder(base, lt, null).build()
+        assertFalse(built.content.contains("[Project invariants"))
+    }
+
+    @Test
+    fun `null longTerm does not render invariants block`() {
+        val built = PromptBuilder(base, null, null).build()
+        assertFalse(built.content.contains("[Project invariants"))
+    }
+
+    @Test
+    fun `invariants block comes after working block — day 14 ordering`() {
+        val lt = LongTermMemory(invariants = listOf(Invariant("x", "rule")))
+        val working = WorkingMemory(currentTask = "task")
+        val built = PromptBuilder(base, lt, working).build()
+        val workIdx = built.content.indexOf("[Working memory")
+        val invIdx = built.content.indexOf("[Project invariants")
+        assertTrue(workIdx > 0)
+        assertTrue(invIdx > workIdx)   // инварианты последними (recency)
     }
 }

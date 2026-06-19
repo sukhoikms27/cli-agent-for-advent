@@ -2,6 +2,8 @@ package com.cliagent.memory
 
 import com.cliagent.state.TaskStage
 import com.cliagent.state.TaskState
+import com.cliagent.state.invariant.Invariant
+import com.cliagent.state.invariant.InvariantCategory
 import kotlinx.serialization.json.Json
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNull
@@ -149,5 +151,40 @@ class ChatDataSchemaEvolutionTest {
         val decoded = json.decodeFromString<TaskState>(encoded)
         assertEquals("stack=Kotlin, ops=+-*", decoded.requirements)
         assertEquals(true, decoded.awaitingAdvance)
+    }
+
+    @Test
+    fun `pre-Day-14 LongTermMemory JSON without invariants loads with empty list`() {
+        // LongTermMemory, записанный до дня 14 (нет поля invariants)
+        val legacyJson = """
+            {
+              "knowledge": {"stack": "Kotlin"},
+              "decisions": {"arch": "MVI"},
+              "profile": null
+            }
+        """.trimIndent()
+        val ltm = json.decodeFromString<LongTermMemory>(legacyJson)
+        assertEquals("Kotlin", ltm.knowledge["stack"])
+        assertEquals(emptyList<Invariant>(), ltm.invariants)   // новое поле отсутствует → default
+    }
+
+    @Test
+    fun `LongTermMemory with invariants round-trips`() {
+        val ltm = LongTermMemory(
+            invariants = listOf(
+                Invariant("no-compose", "UI только View-based", InvariantCategory.BAN)
+            )
+        )
+        val encoded = json.encodeToString(LongTermMemory.serializer(), ltm)
+        val decoded = json.decodeFromString<LongTermMemory>(encoded)
+        assertEquals(1, decoded.invariants.size)
+        assertEquals("no-compose", decoded.invariants.first().id)
+        assertEquals(InvariantCategory.BAN, decoded.invariants.first().category)
+    }
+
+    @Test
+    fun `LongTermMemory with invariant is not empty even without profile`() {
+        val ltm = LongTermMemory(invariants = listOf(Invariant("x", "rule")))
+        assertEquals(false, ltm.isEmpty())
     }
 }
