@@ -46,10 +46,10 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
     private val contextStrategy by option("--context", help = "Context strategy: sliding, facts, summary, branch").default("sliding")
     private val autoProfile by option("--auto-profile", help = "Auto-extract user profile every N turns via LLM").flag()
     private val invariantsEnabled by option(
-        "--invariants/--no-invariants",
+        "--invariants",
         envvar = "CLI_AGENT_INVARIANTS",
         help = "Enforce project invariants: refuse violating requests, retry violating responses"
-    ).flag()
+    ).flag("--no-invariants")
     private val noColor by option("--no-color", help = "Disable colored output").flag()
 
     override fun run() = runBlocking {
