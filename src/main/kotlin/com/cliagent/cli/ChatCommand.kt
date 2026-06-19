@@ -3,6 +3,7 @@ package com.cliagent.cli
 import com.cliagent.agent.Agent
 import com.cliagent.agent.ContextAwareAgent
 import com.cliagent.agent.ProfileExtractor
+import com.cliagent.agent.stage.TaskOrchestrator
 import com.cliagent.config.ConfigRepository
 import com.cliagent.context.ContextManager
 import com.cliagent.context.HistoryCompressor
@@ -96,6 +97,11 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             autoProfileEvery = if (autoProfile) 5 else 0
         )
 
+        // День 13 (авто-поток стадий): оркестратор автоматизирует /task start → артефакт стадии →
+        // подтверждение перехода. Один StageAgent на каждую стадию FSM + StepAgent на каждый
+        // пункт плана внутри execution. Свободный текст при активной задаче = подтверждение/уточнение.
+        val orchestrator = TaskOrchestrator(agent, client, model)
+
         val compressLabel = if (compress) "ON" else "OFF"
         AppTerminal.println("CLI Agent v0.7 | Chat: $chatId | Model: $model | Context: ${contextManager.getStrategy().getName()} | Compress: $compressLabel")
         AppTerminal.println("Type /help for commands, /exit to quit")
@@ -120,16 +126,27 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                 input.startsWith("/branch") -> handleBranch(input, agent)
                 input.startsWith("/memory") -> handleMemory(input, agent)
                 input.startsWith("/profile") -> handleProfile(input, agent, client, model)
-                input.startsWith("/task") -> handleTask(input, agent)
+                input.startsWith("/task") -> handleTask(input, agent, orchestrator)
                 input == "/reset" -> {
                     agent.reset()
                     AppTerminal.ok("History, summary, facts, branches, working memory cleared.")
                 }
                 else -> {
-                    val response = AppTerminal.withSpinner("Thinking…") { agent.chat(input) }
-                    AppTerminal.println()
-                    AppTerminal.markdown(response)
-                    AppTerminal.println()
+                    // День 13 (авто-поток): при активной задаче свободный текст = подтверждение
+                    // перехода («да») или уточнение артефакта текущей стадии. Иначе — обычный чат.
+                    val taskResponse = AppTerminal.withSpinner("Thinking…") {
+                        orchestrator.handleUserInput(input)
+                    }
+                    if (taskResponse != null) {
+                        AppTerminal.println()
+                        AppTerminal.markdown(taskResponse)
+                        AppTerminal.println()
+                    } else {
+                        val response = AppTerminal.withSpinner("Thinking…") { agent.chat(input) }
+                        AppTerminal.println()
+                        AppTerminal.markdown(response)
+                        AppTerminal.println()
+                    }
                 }
             }
         }
@@ -195,9 +212,10 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             |  /profile remove constraint <text> — Remove a constraint
             |  /profile extract      — Infer profile from current dialog via LLM
             |  /profile clear        — Clear the whole profile
-            |  /task                 — Show task state (stage/step/expected action)
-            |  /task start <text>    — Start a task (stage: planning)
-            |  /task next            — Advance to next stage (clarify→planning→execution→validation→done)
+            |  /task                 — Show task state (stage/step/expected action/artifacts)
+            |  /task start <text>    — Start a task: auto-selects first stage (clarify/planning),
+            |                          generates its artifact via LLM, then asks to confirm advancing
+            |  /task next            — Advance to next stage (manual escape hatch)
             |  /task set <stage>     — Force-set stage (clarify, planning, execution, validation, done)
             |  /task step <text>     — Set current step
             |  /task expect <text>   — Set expected action
@@ -207,8 +225,9 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             |  /task back            — Revert one stage (by history)
             |  /task done            — Mark task done (advance from validation or force)
             |  /task reset           — Clear task state (FSM only; working memory kept)
-            |  Note: /task next requires the stage artifact (plan/impl/verdict);
-            |        use /task set <stage> to force a transition (escape hatch).
+            |  Note: after /task start the agent drives the flow — just type «да» to advance,
+            |        or any other text to refine the current artifact. One stage = one agent;
+            |        each plan step runs its own step-agent. /task next & /task set are escape hatches.
             |  /reset               — Clear chat history, summary, facts, branches, working memory
             |  /exit                — Exit the program
             |
@@ -658,7 +677,7 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
 
     // ── /task: состояние задачи как конечный автомат (день 13) ──
 
-    private suspend fun handleTask(input: String, agent: ContextAwareAgent) {
+    private suspend fun handleTask(input: String, agent: ContextAwareAgent, orchestrator: TaskOrchestrator) {
         val parts = input.trim().split("\\s+".toRegex())
         if (parts.size < 2 || parts[1] == "show") {
             val ts = agent.getTaskState()
@@ -667,7 +686,11 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             } else {
                 AppTerminal.println("📋 Task state:")
                 AppTerminal.println("  Stage: ${ts.stage.name.lowercase()}")
+                if (ts.awaitingAdvance) {
+                    AppTerminal.println("  ⏳ Awaiting confirmation to advance (answer «да» or type feedback)")
+                }
                 ts.currentStep?.let { AppTerminal.println("  Current step: $it") }
+                ts.requirements?.let { AppTerminal.println("  Requirements: $it") }
                 ts.expectedAction?.let { AppTerminal.println("  Expected action: $it") }
                 ts.approvedPlan?.let { AppTerminal.println("  Approved plan: $it") }
                 ts.implementation?.let { AppTerminal.println("  Implementation: $it") }
@@ -689,9 +712,15 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                     AppTerminal.println("Usage: /task start <description>")
                     return
                 }
+                // День 13 (авто-поток): оркестратор сам выбирает стартовую стадию
+                // (CLARIFY/PLANNING через EntryStageClassifier) и генерирует артефакт через LLM.
+                // Запасной ручной путь — /task set <stage>.
                 val w = agent.getWorkingMemory() ?: WorkingMemory()
-                agent.setWorkingMemory(w.copy(currentTask = desc, taskState = TaskState(stage = TaskStage.PLANNING, currentStep = desc)))
-                AppTerminal.ok("Task started: $desc (stage: planning)")
+                agent.setWorkingMemory(w.copy(currentTask = desc))
+                val display = AppTerminal.withSpinner("Thinking…") { orchestrator.startTask(desc) }
+                AppTerminal.println()
+                AppTerminal.markdown(display)
+                AppTerminal.println()
             }
             "next" -> {
                 val cur = agent.getTaskState()

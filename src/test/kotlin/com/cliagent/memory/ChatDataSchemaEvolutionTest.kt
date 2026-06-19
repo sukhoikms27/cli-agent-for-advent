@@ -117,4 +117,37 @@ class ChatDataSchemaEvolutionTest {
         assertEquals("тесты зелёные", decoded.verdict)
         assertEquals(TaskStage.VALIDATION, decoded.stage)
     }
+
+    @Test
+    fun `pre-auto-flow TaskState JSON without awaitingAdvance and requirements loads with defaults`() {
+        // TaskState, записанный до авто-потока (нет полей awaitingAdvance/requirements)
+        val legacyJson = """
+            {
+              "stage": "PLANNING",
+              "currentStep": "wire",
+              "approvedPlan": "1) ...",
+              "implementation": null,
+              "verdict": null,
+              "stageHistory": []
+            }
+        """.trimIndent()
+
+        val ts = json.decodeFromString<TaskState>(legacyJson)
+        assertEquals(TaskStage.PLANNING, ts.stage)
+        assertEquals(false, ts.awaitingAdvance)   // новое поле отсутствует → default
+        assertNull(ts.requirements)               // новое поле отсутствует → null
+    }
+
+    @Test
+    fun `TaskState with awaitingAdvance and requirements round-trips`() {
+        val ts = TaskState(
+            stage = TaskStage.CLARIFY,
+            requirements = "stack=Kotlin, ops=+-*",
+            awaitingAdvance = true
+        )
+        val encoded = json.encodeToString(TaskState.serializer(), ts)
+        val decoded = json.decodeFromString<TaskState>(encoded)
+        assertEquals("stack=Kotlin, ops=+-*", decoded.requirements)
+        assertEquals(true, decoded.awaitingAdvance)
+    }
 }
