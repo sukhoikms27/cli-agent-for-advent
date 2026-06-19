@@ -17,7 +17,7 @@ import com.cliagent.memory.WorkingMemory
  *
  * Точки расширения:
  *  - Day 12: [LongTermMemory.profile] рендерится автоматически (см. [UserProfile.renderBlock]).
- *  - Day 13: [WorkingMemory] получит поле `taskState`, рендерится в [WorkingMemory.renderBlock].
+ *  - Day 13: [WorkingMemory.taskState] рендерится в [WorkingMemory.renderBlock] (блок Task state).
  */
 class PromptBuilder(
     private val baseSystem: ChatMessage,
@@ -59,6 +59,15 @@ internal fun WorkingMemory.renderBlock(): String {
     if (taskDecisions.isNotEmpty()) {
         lines.add("Decisions:")
         taskDecisions.forEach { lines.add("  - $it") }
+    }
+    taskState?.let { ts ->
+        lines.add("Task state:")
+        lines.add("  Stage: ${ts.stage.name.lowercase()}")
+        ts.currentStep?.let { lines.add("  Current step: $it") }
+        ts.expectedAction?.let { lines.add("  Expected action: $it") }
+        ts.approvedPlan?.let { lines.add("  Approved plan: $it") }
+        ts.implementation?.let { lines.add("  Implementation: $it") }
+        ts.verdict?.let { lines.add("  Verdict: $it") }
     }
     return lines.joinToString("\n")
 }

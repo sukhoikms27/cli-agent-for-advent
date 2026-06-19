@@ -4,6 +4,8 @@ import com.cliagent.llm.model.ChatMessage
 import com.cliagent.memory.LongTermMemory
 import com.cliagent.memory.UserProfile
 import com.cliagent.memory.WorkingMemory
+import com.cliagent.state.TaskStage
+import com.cliagent.state.TaskState
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -68,5 +70,50 @@ class PromptBuilderTest {
         val lt = LongTermMemory(profile = UserProfile(about = "backend dev, Ktor"))
         val built = PromptBuilder(base, lt, null).build()
         assertTrue(built.content.contains("About: backend dev, Ktor"))
+    }
+
+    @Test
+    fun `task state renders inside working block — day 13`() {
+        val working = WorkingMemory(
+            taskState = TaskState(
+                stage = TaskStage.EXECUTION,
+                currentStep = "wire accessors",
+                expectedAction = "tests pass"
+            )
+        )
+        val built = PromptBuilder(base, null, working).build()
+        assertTrue(built.content.contains("Task state:"))
+        assertTrue(built.content.contains("Stage: execution"))
+        assertTrue(built.content.contains("Current step: wire accessors"))
+        assertTrue(built.content.contains("Expected action: tests pass"))
+    }
+
+    @Test
+    fun `task state approved plan renders when set — day 13`() {
+        val working = WorkingMemory(taskState = TaskState(stage = TaskStage.PLANNING, approvedPlan = "1) model 2) CLI"))
+        val built = PromptBuilder(base, null, working).build()
+        assertTrue(built.content.contains("Approved plan: 1) model 2) CLI"))
+    }
+
+    @Test
+    fun `null task state does not render task block — day 13`() {
+        val working = WorkingMemory(currentTask = "auth service")   // taskState == null
+        val built = PromptBuilder(base, null, working).build()
+        assertTrue(built.content.contains("auth service"))
+        assertFalse(built.content.contains("Task state:"))
+    }
+
+    @Test
+    fun `task state implementation and verdict render — доработка day 13`() {
+        val working = WorkingMemory(
+            taskState = TaskState(
+                stage = TaskStage.VALIDATION,
+                implementation = "Reducer + ViewModel готовы",
+                verdict = "тесты зелёные"
+            )
+        )
+        val built = PromptBuilder(base, null, working).build()
+        assertTrue(built.content.contains("Implementation: Reducer + ViewModel готовы"))
+        assertTrue(built.content.contains("Verdict: тесты зелёные"))
     }
 }

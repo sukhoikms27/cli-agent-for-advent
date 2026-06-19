@@ -3,6 +3,7 @@ package com.cliagent.cli
 import com.cliagent.agent.Agent
 import com.cliagent.agent.ContextAwareAgent
 import com.cliagent.agent.ProfileExtractor
+import com.cliagent.agent.stage.TaskOrchestrator
 import com.cliagent.config.ConfigRepository
 import com.cliagent.context.ContextManager
 import com.cliagent.context.HistoryCompressor
@@ -19,6 +20,9 @@ import com.cliagent.memory.LongTermMemory
 import com.cliagent.memory.MemoryStore
 import com.cliagent.memory.UserProfile
 import com.cliagent.memory.WorkingMemory
+import com.cliagent.state.TaskStage
+import com.cliagent.state.TaskState
+import com.cliagent.state.TaskStateMachine
 import com.github.ajalt.clikt.core.CliktCommand
 import com.github.ajalt.clikt.parameters.options.default
 import com.github.ajalt.clikt.parameters.options.flag
@@ -93,8 +97,13 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             autoProfileEvery = if (autoProfile) 5 else 0
         )
 
+        // День 13 (авто-поток стадий): оркестратор автоматизирует /task start → артефакт стадии →
+        // подтверждение перехода. Один StageAgent на каждую стадию FSM + StepAgent на каждый
+        // пункт плана внутри execution. Свободный текст при активной задаче = подтверждение/уточнение.
+        val orchestrator = TaskOrchestrator(agent, client, model)
+
         val compressLabel = if (compress) "ON" else "OFF"
-        AppTerminal.println("CLI Agent v0.5 | Chat: $chatId | Model: $model | Context: ${contextManager.getStrategy().getName()} | Compress: $compressLabel")
+        AppTerminal.println("CLI Agent v0.7 | Chat: $chatId | Model: $model | Context: ${contextManager.getStrategy().getName()} | Compress: $compressLabel")
         AppTerminal.println("Type /help for commands, /exit to quit")
 
         val repl = ReplEngine()
@@ -117,15 +126,27 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                 input.startsWith("/branch") -> handleBranch(input, agent)
                 input.startsWith("/memory") -> handleMemory(input, agent)
                 input.startsWith("/profile") -> handleProfile(input, agent, client, model)
+                input.startsWith("/task") -> handleTask(input, agent, orchestrator)
                 input == "/reset" -> {
                     agent.reset()
                     AppTerminal.ok("History, summary, facts, branches, working memory cleared.")
                 }
                 else -> {
-                    val response = AppTerminal.withSpinner("Thinking…") { agent.chat(input) }
-                    AppTerminal.println()
-                    AppTerminal.markdown(response)
-                    AppTerminal.println()
+                    // День 13 (авто-поток): при активной задаче свободный текст = подтверждение
+                    // перехода («да») или уточнение артефакта текущей стадии. Иначе — обычный чат.
+                    val taskResponse = AppTerminal.withSpinner("Thinking…") {
+                        orchestrator.handleUserInput(input)
+                    }
+                    if (taskResponse != null) {
+                        AppTerminal.println()
+                        AppTerminal.markdown(taskResponse)
+                        AppTerminal.println()
+                    } else {
+                        val response = AppTerminal.withSpinner("Thinking…") { agent.chat(input) }
+                        AppTerminal.println()
+                        AppTerminal.markdown(response)
+                        AppTerminal.println()
+                    }
                 }
             }
         }
@@ -157,7 +178,7 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
 
     private fun printHelp() {
         AppTerminal.println("""
-            |CLI Agent v0.5 — Commands:
+            |CLI Agent v0.7 — Commands:
             |
             |  /help                — Show this help
             |  /history             — Show chat history
@@ -191,6 +212,22 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             |  /profile remove constraint <text> — Remove a constraint
             |  /profile extract      — Infer profile from current dialog via LLM
             |  /profile clear        — Clear the whole profile
+            |  /task                 — Show task state (stage/step/expected action/artifacts)
+            |  /task start <text>    — Start a task: auto-selects first stage (clarify/planning),
+            |                          generates its artifact via LLM, then asks to confirm advancing
+            |  /task next            — Advance to next stage (manual escape hatch)
+            |  /task set <stage>     — Force-set stage (clarify, planning, execution, validation, done)
+            |  /task step <text>     — Set current step
+            |  /task expect <text>   — Set expected action
+            |  /task plan <text>     — Set approved plan (planning artifact)
+            |  /task impl <text>     — Set implementation (execution artifact)
+            |  /task verdict <text>  — Set verdict (validation artifact)
+            |  /task back            — Revert one stage (by history)
+            |  /task done            — Mark task done (advance from validation or force)
+            |  /task reset           — Clear task state (FSM only; working memory kept)
+            |  Note: after /task start the agent drives the flow — just type «да» to advance,
+            |        or any other text to refine the current artifact. One stage = one agent;
+            |        each plan step runs its own step-agent. /task next & /task set are escape hatches.
             |  /reset               — Clear chat history, summary, facts, branches, working memory
             |  /exit                — Exit the program
             |
@@ -636,5 +673,210 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             }
             else -> AppTerminal.println("Unknown /profile command: ${parts[1]}. Use: show, set, add, remove, extract, clear")
         }
+    }
+
+    // ── /task: состояние задачи как конечный автомат (день 13) ──
+
+    private suspend fun handleTask(input: String, agent: ContextAwareAgent, orchestrator: TaskOrchestrator) {
+        val parts = input.trim().split("\\s+".toRegex())
+        if (parts.size < 2 || parts[1] == "show") {
+            val ts = agent.getTaskState()
+            if (ts == null) {
+                AppTerminal.println("📋 No active task. Use: /task start <description>")
+            } else {
+                AppTerminal.println("📋 Task state:")
+                AppTerminal.println("  Stage: ${ts.stage.name.lowercase()}")
+                if (ts.awaitingAdvance) {
+                    AppTerminal.println("  ⏳ Awaiting confirmation to advance (answer «да» or type feedback)")
+                }
+                ts.currentStep?.let { AppTerminal.println("  Current step: $it") }
+                ts.requirements?.let { AppTerminal.println("  Requirements: $it") }
+                ts.expectedAction?.let { AppTerminal.println("  Expected action: $it") }
+                ts.approvedPlan?.let { AppTerminal.println("  Approved plan: $it") }
+                ts.implementation?.let { AppTerminal.println("  Implementation: $it") }
+                ts.verdict?.let { AppTerminal.println("  Verdict: $it") }
+                if (ts.stageHistory.isNotEmpty()) {
+                    AppTerminal.println("  History:")
+                    ts.stageHistory.forEach {
+                        AppTerminal.println("    - ${it.from.name.lowercase()}→${it.to.name.lowercase()}${it.note?.let { n -> " ($n)" } ?: ""}")
+                    }
+                }
+            }
+            return
+        }
+
+        when (parts[1]) {
+            "start" -> {
+                val desc = parts.drop(2).joinToString(" ").trim()
+                if (desc.isEmpty()) {
+                    AppTerminal.println("Usage: /task start <description>")
+                    return
+                }
+                // День 13 (авто-поток): оркестратор сам выбирает стартовую стадию
+                // (CLARIFY/PLANNING через EntryStageClassifier) и генерирует артефакт через LLM.
+                // Запасной ручной путь — /task set <stage>.
+                val w = agent.getWorkingMemory() ?: WorkingMemory()
+                agent.setWorkingMemory(w.copy(currentTask = desc))
+                val display = AppTerminal.withSpinner("Thinking…") { orchestrator.startTask(desc) }
+                AppTerminal.println()
+                AppTerminal.markdown(display)
+                AppTerminal.println()
+            }
+            "next" -> {
+                val cur = agent.getTaskState()
+                if (cur == null) {
+                    AppTerminal.println("No active task. Use: /task start <description>")
+                    return
+                }
+                // Artifact-gate (доработка Day 13, Вариант 2): переход вперёд только когда
+                // артефакт стадии готов. Escape hatch — /task set <stage> (force).
+                if (!TaskStateMachine.canAdvance(cur)) {
+                    AppTerminal.warn("Stage ${cur.stage.name.lowercase()} not ready: missing artifact. ${gateHint(cur.stage)}")
+                    return
+                }
+                val updated = agent.advanceTaskState()
+                if (updated == null) {
+                    AppTerminal.warn("No next stage from ${cur.stage.name.lowercase()} (already done?).")
+                } else {
+                    AppTerminal.ok("Advanced to stage: ${updated.stage.name.lowercase()}")
+                }
+            }
+            "set" -> {
+                if (parts.size < 3) {
+                    AppTerminal.println("Usage: /task set <clarify|planning|execution|validation|done>")
+                    return
+                }
+                val cur = agent.getTaskState()
+                if (cur == null) {
+                    AppTerminal.println("No active task. Use: /task start <description>")
+                    return
+                }
+                val stage = try {
+                    TaskStage.valueOf(parts[2].uppercase())
+                } catch (e: IllegalArgumentException) {
+                    AppTerminal.println("Unknown stage: ${parts[2]}. Use: clarify, planning, execution, validation, done")
+                    return
+                }
+                if (!TaskStateMachine.isAllowed(cur.stage, stage)) {
+                    AppTerminal.warn("Illegal transition ${cur.stage.name.lowercase()}→${stage.name.lowercase()}; forcing anyway.")
+                }
+                agent.setTaskState(TaskStateMachine.forceSet(cur, stage))
+                AppTerminal.ok("Stage set to: ${stage.name.lowercase()}")
+            }
+            "step" -> {
+                val text = parts.drop(2).joinToString(" ").trim()
+                if (text.isEmpty()) {
+                    AppTerminal.println("Usage: /task step <text>")
+                    return
+                }
+                val cur = agent.getTaskState()
+                if (cur == null) {
+                    AppTerminal.println("No active task. Use: /task start <description>")
+                    return
+                }
+                agent.setTaskState(cur.copy(currentStep = text))
+                AppTerminal.ok("Current step updated.")
+            }
+            "expect" -> {
+                val text = parts.drop(2).joinToString(" ").trim()
+                if (text.isEmpty()) {
+                    AppTerminal.println("Usage: /task expect <text>")
+                    return
+                }
+                val cur = agent.getTaskState()
+                if (cur == null) {
+                    AppTerminal.println("No active task. Use: /task start <description>")
+                    return
+                }
+                agent.setTaskState(cur.copy(expectedAction = text))
+                AppTerminal.ok("Expected action updated.")
+            }
+            "plan" -> {
+                val text = parts.drop(2).joinToString(" ").trim()
+                if (text.isEmpty()) {
+                    AppTerminal.println("Usage: /task plan <text>")
+                    return
+                }
+                val cur = agent.getTaskState()
+                if (cur == null) {
+                    AppTerminal.println("No active task. Use: /task start <description>")
+                    return
+                }
+                agent.setTaskState(cur.copy(approvedPlan = text))
+                AppTerminal.ok("Approved plan updated.")
+            }
+            "impl" -> {
+                val text = parts.drop(2).joinToString(" ").trim()
+                if (text.isEmpty()) {
+                    AppTerminal.println("Usage: /task impl <text>")
+                    return
+                }
+                val cur = agent.getTaskState()
+                if (cur == null) {
+                    AppTerminal.println("No active task. Use: /task start <description>")
+                    return
+                }
+                agent.setTaskState(cur.copy(implementation = text))
+                AppTerminal.ok("Implementation updated.")
+            }
+            "verdict" -> {
+                val text = parts.drop(2).joinToString(" ").trim()
+                if (text.isEmpty()) {
+                    AppTerminal.println("Usage: /task verdict <text>")
+                    return
+                }
+                val cur = agent.getTaskState()
+                if (cur == null) {
+                    AppTerminal.println("No active task. Use: /task start <description>")
+                    return
+                }
+                agent.setTaskState(cur.copy(verdict = text))
+                AppTerminal.ok("Verdict updated.")
+            }
+            "back" -> {
+                if (agent.getTaskState() == null) {
+                    AppTerminal.println("No active task. Use: /task start <description>")
+                    return
+                }
+                val reverted = agent.revertTaskState()
+                if (reverted == null) {
+                    AppTerminal.warn("No stage history to revert.")
+                } else {
+                    AppTerminal.ok("Reverted to stage: ${reverted.stage.name.lowercase()}")
+                }
+            }
+            "done" -> {
+                val cur = agent.getTaskState()
+                if (cur == null) {
+                    AppTerminal.println("No active task. Use: /task start <description>")
+                    return
+                }
+                if (cur.stage == TaskStage.VALIDATION) {
+                    // Уважаем artifact-gate: из validation → done только при готовом verdict.
+                    if (!TaskStateMachine.canAdvance(cur)) {
+                        AppTerminal.warn("Stage validation not ready: missing artifact. ${gateHint(cur.stage)}")
+                        return
+                    }
+                    val updated = agent.advanceTaskState()
+                    AppTerminal.ok("Task done. (stage: ${updated?.stage?.name?.lowercase() ?: "done"})")
+                } else {
+                    agent.setTaskState(TaskStateMachine.forceSet(cur, TaskStage.DONE))
+                    AppTerminal.ok("Task done. (forced from ${cur.stage.name.lowercase()})")
+                }
+            }
+            "reset" -> {
+                agent.setTaskState(null)
+                AppTerminal.ok("Task state cleared (working memory task/plan kept).")
+            }
+            else -> AppTerminal.println("Unknown /task command: ${parts[1]}. Use: show, start, next, set, step, expect, plan, impl, verdict, back, done, reset")
+        }
+    }
+
+    /** Подсказка, какой артефакт нужен для перехода со стадии (для hard-block warn). */
+    private fun gateHint(stage: TaskStage): String = when (stage) {
+        TaskStage.PLANNING -> "Set approved plan: /task plan <text>"
+        TaskStage.EXECUTION -> "Set implementation: /task impl <text>"
+        TaskStage.VALIDATION -> "Set verdict: /task verdict <text>"
+        else -> "Use /task set <stage> to force a transition."
     }
 }
