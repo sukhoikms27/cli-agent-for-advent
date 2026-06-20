@@ -153,4 +153,36 @@ class TaskStateMachineTest {
         assertFalse(TaskStateMachine.canAdvance(TaskState(stage = TaskStage.PLANNING, approvedPlan = "   ")))
         assertFalse(TaskStateMachine.canAdvance(TaskState(stage = TaskStage.EXECUTION, implementation = "")))
     }
+
+    // ── allowedTargets (день 15) ──
+
+    @Test
+    fun `allowedTargets includes self`() {
+        TaskStage.entries.forEach { stage ->
+            assertTrue(TaskStateMachine.allowedTargets(stage).contains(stage),
+                "allowedTargets($stage) should include self")
+        }
+    }
+
+    @Test
+    fun `allowedTargets for canonical forward stages`() {
+        assertEquals(setOf(TaskStage.CLARIFY, TaskStage.PLANNING),
+            TaskStateMachine.allowedTargets(TaskStage.CLARIFY))
+        assertEquals(setOf(TaskStage.PLANNING, TaskStage.EXECUTION),
+            TaskStateMachine.allowedTargets(TaskStage.PLANNING))
+        assertEquals(setOf(TaskStage.EXECUTION, TaskStage.VALIDATION, TaskStage.PLANNING),
+            TaskStateMachine.allowedTargets(TaskStage.EXECUTION))
+        assertEquals(setOf(TaskStage.VALIDATION, TaskStage.DONE, TaskStage.EXECUTION),
+            TaskStateMachine.allowedTargets(TaskStage.VALIDATION))
+        assertEquals(setOf(TaskStage.DONE, TaskStage.PLANNING),
+            TaskStateMachine.allowedTargets(TaskStage.DONE))
+    }
+
+    @Test
+    fun `allowedTargets excludes forbidden jumps`() {
+        // planning → done запрещён (нельзя перепрыгнуть валидацию)
+        assertFalse(TaskStateMachine.allowedTargets(TaskStage.PLANNING).contains(TaskStage.DONE))
+        // clarify → execution запрещён (нельзя перепрыгнуть planning)
+        assertFalse(TaskStateMachine.allowedTargets(TaskStage.CLARIFY).contains(TaskStage.EXECUTION))
+    }
 }

@@ -12,6 +12,7 @@ import com.cliagent.memory.MemoryStore
 import com.cliagent.memory.WorkingMemory
 import com.cliagent.state.TaskStage
 import com.cliagent.state.TaskState
+import com.cliagent.state.TransitionOutcome
 import io.mockk.coEvery
 import io.mockk.mockk
 import io.mockk.slot
@@ -108,9 +109,13 @@ class ContextAwareAgentTaskStateTest {
             store, "m", "chat-1"
         )
 
-        agent.setTaskState(TaskState(stage = TaskStage.PLANNING))
+        // День 15: advanceTaskState делегирует в TransitionGuard → каждый forward-canonical
+        // требует артефакт соответствующей стадии (canAdvance).
+        agent.setTaskState(TaskState(stage = TaskStage.PLANNING, approvedPlan = "plan"))
         assertEquals(TaskStage.EXECUTION, agent.advanceTaskState()?.stage)
+        agent.setTaskState(agent.getTaskState()!!.copy(implementation = "impl"))
         assertEquals(TaskStage.VALIDATION, agent.advanceTaskState()?.stage)
+        agent.setTaskState(agent.getTaskState()!!.copy(verdict = "pass"))
         assertEquals(TaskStage.DONE, agent.advanceTaskState()?.stage)
         assertNull(agent.advanceTaskState())   // DONE → нет следующей
     }
@@ -123,8 +128,10 @@ class ContextAwareAgentTaskStateTest {
             store, "m", "chat-1"
         )
 
-        agent.setTaskState(TaskState(stage = TaskStage.PLANNING))
+        // День 15: forward-переходы через guard требуют артефакты.
+        agent.setTaskState(TaskState(stage = TaskStage.PLANNING, approvedPlan = "plan"))
         agent.advanceTaskState()  // → execution
+        agent.setTaskState(agent.getTaskState()!!.copy(implementation = "impl"))
         agent.advanceTaskState()  // → validation
         assertEquals(TaskStage.VALIDATION, agent.getTaskState()?.stage)
 
@@ -156,5 +163,76 @@ class ContextAwareAgentTaskStateTest {
         assertTrue(systemContent.contains("Task state:"))
         assertTrue(systemContent.contains("Stage: execution"))
         assertTrue(systemContent.contains("Current step: wire"))
+    }
+
+    // ── attemptTransition (день 15) ──
+
+    @Test
+    fun `attemptTransition returns null when no active task`() = runTest {
+        val agent = ContextAwareAgent(
+            mockk { coEvery { chat(any()) } returns LlmResult.Success(fakeResponse()) },
+            storeMock(), "m", "chat-1"
+        )
+        assertNull(agent.attemptTransition(TaskStage.EXECUTION))
+    }
+
+    @Test
+    fun `attemptTransition allowed persists new state`() = runTest {
+        val agent = ContextAwareAgent(
+            mockk { coEvery { chat(any()) } returns LlmResult.Success(fakeResponse()) },
+            storeMock(), "m", "chat-1"
+        )
+        agent.setTaskState(TaskState(stage = TaskStage.PLANNING, approvedPlan = "plan"))
+        val outcome = agent.attemptTransition(TaskStage.EXECUTION)
+        assertTrue(outcome is TransitionOutcome.Allowed)
+        assertEquals(TaskStage.EXECUTION, agent.getTaskState()?.stage)
+    }
+
+    @Test
+    fun `attemptTransition illegal does not change state`() = runTest {
+        val agent = ContextAwareAgent(
+            mockk { coEvery { chat(any()) } returns LlmResult.Success(fakeResponse()) },
+            storeMock(), "m", "chat-1"
+        )
+        agent.setTaskState(TaskState(stage = TaskStage.PLANNING, approvedPlan = "plan"))
+        val outcome = agent.attemptTransition(TaskStage.DONE)
+        assertTrue(outcome is TransitionOutcome.Illegal)
+        assertEquals(TaskStage.PLANNING, agent.getTaskState()?.stage)  // не изменилось
+    }
+
+    @Test
+    fun `attemptTransition artifact missing does not change state`() = runTest {
+        val agent = ContextAwareAgent(
+            mockk { coEvery { chat(any()) } returns LlmResult.Success(fakeResponse()) },
+            storeMock(), "m", "chat-1"
+        )
+        agent.setTaskState(TaskState(stage = TaskStage.PLANNING))  // нет плана
+        val outcome = agent.attemptTransition(TaskStage.EXECUTION)
+        assertTrue(outcome is TransitionOutcome.ArtifactMissing)
+        assertEquals(TaskStage.PLANNING, agent.getTaskState()?.stage)
+    }
+
+    @Test
+    fun `attemptTransition force bypasses gate and persists`() = runTest {
+        val agent = ContextAwareAgent(
+            mockk { coEvery { chat(any()) } returns LlmResult.Success(fakeResponse()) },
+            storeMock(), "m", "chat-1"
+        )
+        agent.setTaskState(TaskState(stage = TaskStage.PLANNING))
+        val outcome = agent.attemptTransition(TaskStage.DONE, force = true)
+        assertTrue(outcome is TransitionOutcome.Allowed)
+        assertEquals(TaskStage.DONE, agent.getTaskState()?.stage)
+    }
+
+    @Test
+    fun `advanceTaskState returns null on artifact missing via guard`() = runTest {
+        // обратная совместимость: advanceTaskState делегирует в attemptTransition
+        val agent = ContextAwareAgent(
+            mockk { coEvery { chat(any()) } returns LlmResult.Success(fakeResponse()) },
+            storeMock(), "m", "chat-1"
+        )
+        agent.setTaskState(TaskState(stage = TaskStage.PLANNING))  // нет плана
+        assertNull(agent.advanceTaskState())  // ArtifactMissing → null
+        assertEquals(TaskStage.PLANNING, agent.getTaskState()?.stage)
     }
 }

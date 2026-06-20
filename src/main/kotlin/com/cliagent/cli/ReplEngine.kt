@@ -51,7 +51,7 @@ class ReplEngine {
         val top = StringsCompleter(
             "/exit", "/help", "/history", "/chats", "/stats", "/cost",
             "/summary", "/compress", "/facts", "/reset",
-            "/strategy", "/branch", "/memory", "/profile", "/invariants", "/task"
+            "/strategy", "/branch", "/memory", "/profile", "/invariants", "/task", "/mode"
         )
         val strategy = ArgumentCompleter(
             StringsCompleter("/strategy"),
@@ -74,13 +74,17 @@ class ReplEngine {
         val task = ArgumentCompleter(
             StringsCompleter("/task"),
             StringsCompleter("show", "start", "next", "set", "step", "expect", "plan", "impl", "verdict", "back", "done", "reset"),
-            StringsCompleter("clarify", "planning", "execution", "validation", "done")
+            StringsCompleter("clarify", "planning", "execution", "validation", "done", "--force", "-f")
         )
         val invariants = ArgumentCompleter(
             StringsCompleter("/invariants"),
             StringsCompleter("show", "add", "remove", "clear"),
             StringsCompleter("STACK", "BAN", "ARCH", "BUSINESS")
         )
-        return AggregateCompleter(top, strategy, branch, memory, profile, task, invariants)
+        val mode = ArgumentCompleter(
+            StringsCompleter("/mode"),
+            StringsCompleter("manual", "plan", "auto", "show")
+        )
+        return AggregateCompleter(top, strategy, branch, memory, profile, task, invariants, mode)
     }
 }

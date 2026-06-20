@@ -21,6 +21,9 @@ import com.cliagent.memory.WorkingMemory
 import com.cliagent.state.invariant.Invariant
 import com.cliagent.state.TaskState
 import com.cliagent.state.TaskStateMachine
+import com.cliagent.state.TaskStage
+import com.cliagent.state.TransitionGuard
+import com.cliagent.state.TransitionOutcome
 
 class ContextAwareAgent(
     private val llmClient: LlmClient,
@@ -286,13 +289,45 @@ class ContextAwareAgent(
         setWorkingMemory(w.copy(taskState = state))
     }
 
-    /** Канонический переход вперёд ([TaskStateMachine.next]); null если некуда/нет задачи. */
+    /**
+     * Канонический переход вперёд ([TaskStateMachine.next]); null если некуда/нет задачи.
+     *
+     * День 15: делегирует в [attemptTransition] (единый путь через guard). `next(stage)` всегда
+     * возвращает легальный forward-canonical переход, поэтому outcome = Allowed или ArtifactMissing
+     * (Illegal невозможен). При ArtifactMissing — поведение как раньше: состояние не меняется,
+     * возвращается null (канонический advance «не состоялся»). Для машиночитаемой причины блокировки
+     * используй [attemptTransition] напрямую.
+     */
     suspend fun advanceTaskState(note: String? = null): TaskState? {
         val cur = getTaskState() ?: return null
         val nextStage = TaskStateMachine.next(cur.stage) ?: return null
-        val updated = TaskStateMachine.transition(cur, nextStage, note)
-        setTaskState(updated)
-        return updated
+        val outcome = attemptTransition(nextStage)
+        return when (outcome) {
+            is TransitionOutcome.Allowed -> outcome.newState
+            is TransitionOutcome.ArtifactMissing,
+            is TransitionOutcome.Illegal,
+            null -> null
+        }
+    }
+
+    /**
+     * Контролируемый переход через [TransitionGuard] (день 15).
+     *
+     * Единая точка перехода для CLI/оркестратора: проверяет легальность + артефакт, возвращает
+     * типобезопасный [TransitionOutcome]. При [TransitionOutcome.Allowed] — персистит новое состояние.
+     * При Illegal/ArtifactMissing — состояние НЕ меняется, потребитель сам решает реакцию.
+     *
+     * @param to    целевая стадия
+     * @param force осознанный escape (note="forced" в history); обходит все правила
+     * @return outcome перехода; null если нет активной задачи (taskState == null)
+     */
+    suspend fun attemptTransition(to: TaskStage, force: Boolean = false): TransitionOutcome? {
+        val cur = getTaskState() ?: return null
+        val outcome = TransitionGuard.attempt(cur, to, force)
+        if (outcome is TransitionOutcome.Allowed) {
+            setTaskState(outcome.newState)
+        }
+        return outcome
     }
 
     /** Откат на одну стадию назад по history; null если история пуста/нет задачи. */

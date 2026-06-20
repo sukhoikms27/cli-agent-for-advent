@@ -34,6 +34,18 @@ object TaskStateMachine {
     fun isAllowed(from: TaskStage, to: TaskStage): Boolean =
         from == to || ALLOWED.contains(from to to)
 
+    /**
+     * Множество стадий, в которые можно легально перейти из [from] (день 15).
+     *
+     * Включает саму [from] (self-transition) и все стадии из [ALLOWED], где [from] — источник.
+     * Используется в [TransitionOutcome.Illegal] для человекочитаемой подсказки
+     * «можно перейти только в: …». DONE → {DONE, PLANNING} (новая задача); иные — по ALLOWED.
+     *
+     * Чистая функция над [ALLOWED] + [TaskStage.entries]; не мутирует состояние.
+     */
+    fun allowedTargets(from: TaskStage): Set<TaskStage> =
+        TaskStage.entries.filterTo(mutableSetOf()) { isAllowed(from, it) }
+
     /** Канонический следующий этап вперёд. `DONE` → null (некуда). */
     fun next(from: TaskStage): TaskStage? = when (from) {
         TaskStage.CLARIFY -> TaskStage.PLANNING

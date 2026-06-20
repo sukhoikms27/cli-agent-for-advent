@@ -3,6 +3,7 @@ package com.cliagent.agent.stage
 import com.cliagent.agent.ContextAwareAgent
 import com.cliagent.llm.LlmClient
 import com.cliagent.memory.UserProfile
+import com.cliagent.state.InteractionMode
 import com.cliagent.state.TaskStage
 import com.cliagent.state.TaskState
 import com.cliagent.state.TaskStateMachine
@@ -40,7 +41,13 @@ class TaskOrchestrator(
     llmClient: LlmClient,
     model: String,
     private val classifier: EntryStageClassifier = EntryStageClassifier(llmClient, model),
-    agents: Map<TaskStage, StageAgent> = defaultAgents()
+    agents: Map<TaskStage, StageAgent> = defaultAgents(),
+    /**
+     * День 15 (gap №6): провайдер LLM-чата для stage-вызовов. Default — agent.chat (текущее
+     * поведение). Wiring (ChatCommand) подставляет StatefulAgent.chat → инварианты покрывают
+     * stage-flow, а не только свободный чат.
+     */
+    private val chat: suspend (String) -> String = { userMsg -> agent.chat(userMsg) }
 ) {
     private val agents: Map<TaskStage, StageAgent> = agents
 
@@ -66,21 +73,28 @@ class TaskOrchestrator(
     /**
      * Единая диспетчеризация свободного текста при активной задаче.
      *
+     * День 15 (п.3): учитывает [mode]. В AUTO при `awaitingAdvance=true` — авто-advance без ожидания
+     * «да» (даже для произвольного текста). В PLAN/MANUAL — подтверждение или уточнение.
+     *
      * @return markdown-текст; null — нет активной задачи (caller должен уйти в обычный чат)
      */
-    suspend fun handleUserInput(text: String): String? {
+    suspend fun handleUserInput(
+        text: String,
+        mode: InteractionMode = InteractionMode.PLAN
+    ): String? {
         val state = agent.getTaskState() ?: return null
         val desc = state.currentStep ?: ""
 
         return if (state.awaitingAdvance) {
-            if (isYes(text)) {
-                advanceAndRunNext(state, desc)
+            // День 15 (AUTO): не ждём подтверждения — авто-advance (если артефакт готов; guard проверит).
+            if (mode == InteractionMode.AUTO || isYes(text)) {
+                advanceAndRunNext(state, desc, mode)
             } else {
                 // Любой иной текст (включая «нет») → уточнение артефакта текущей стадии
                 runStageAndDisplay(state.stage, desc, feedback = text)
             }
         } else {
-            // awaitingAdvance=false → clarify ждёт ответы пользователя
+            // awaitingAdvance=false → clarify ждёт ответы пользователя (все режимы)
             runStageAndDisplay(state.stage, desc, feedback = text)
         }
     }
@@ -94,8 +108,16 @@ class TaskOrchestrator(
     /**
      * Переход на следующую стадию + запуск её агента.
      * DONE — терминальная: завершаем.
+     *
+     * День 15: в AUTO после готовности артефакта — авто-advance к следующей стадии (рекурсивно),
+     * пока не достигнем DONE или блокировки. Глубина ограничена числом стадий (макс 5: clarify→
+     * planning→execution→validation→done) — бесконечного цикла нет.
      */
-    private suspend fun advanceAndRunNext(state: TaskState, desc: String): String {
+    private suspend fun advanceAndRunNext(
+        state: TaskState,
+        desc: String,
+        mode: InteractionMode = InteractionMode.PLAN
+    ): String {
         if (state.stage == TaskStage.DONE) {
             return "🏁 Задача уже завершена. Начни новую через `/task start <описание>`."
         }
@@ -106,7 +128,17 @@ class TaskOrchestrator(
                 "Уточни артефакт текстом или задай его через `/task`."
         }
         val next = agent.advanceTaskState() ?: return "✓ Уже на финальной стадии."
-        return runStageAndDisplay(next.stage, desc, feedback = null)
+        val display = runStageAndDisplay(next.stage, desc, feedback = null)
+
+        // День 15 (AUTO): после генерации артефакта — авто-advance к следующей стадии без запроса.
+        val updated = agent.getTaskState()
+        if (mode == InteractionMode.AUTO && updated != null &&
+            updated.awaitingAdvance && updated.stage != TaskStage.DONE
+        ) {
+            // авто-advance через ту же логику (guard внутри); рекурсия ограничена числом стадий.
+            return display + "\n\n___\n\n" + advanceAndRunNext(updated, desc, mode)
+        }
+        return display
     }
 
     /**
@@ -133,7 +165,7 @@ class TaskOrchestrator(
         val agentImpl = agents[stage]
             ?: return "⚠️ Нет агента для стадии $stage. Используй `/task next`."
 
-        val result = agentImpl.run(ctx) { userMsg -> agent.chat(userMsg) }
+        val result = agentImpl.run(ctx) { userMsg -> chat(userMsg) }
 
         // Сохраняем артефакт в соответствующее поле + awaitingAdvance
         val updated = storeArtifact(current, stage, result.artifact)
