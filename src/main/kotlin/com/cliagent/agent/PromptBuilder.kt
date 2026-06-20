@@ -28,12 +28,13 @@ class PromptBuilder(
         val parts = mutableListOf(baseSystem.content)
         longTerm?.takeIf { !it.isEmpty() }?.let { parts.add(it.renderBlock()) }
         working?.takeIf { !it.isEmpty() }?.let { parts.add(it.renderBlock()) }
-        // Все слои пусты → parts == [baseSystem.content] → контент неизменен
+        longTerm?.renderInvariantsBlock()?.let { parts.add(it) }   // день 14: блок инвариантов
+        // Все слои пусты  parts == [baseSystem.content]  контент неизменен
         return baseSystem.copy(content = parts.joinToString("\n\n"))
     }
 }
 
-/** Секция долговременной памяти: knowledge, decisions, profile. */
+/** Секция долговременной памяти: knowledge, decisions, profile, invariants. */
 internal fun LongTermMemory.renderBlock(): String {
     val lines = mutableListOf<String>()
     lines.add("[Long-term memory]")
@@ -48,6 +49,25 @@ internal fun LongTermMemory.renderBlock(): String {
     profile?.takeIf { !it.isEmpty() }?.let { lines.add(it.renderBlock()) }
     return lines.joinToString("\n")
 }
+
+/**
+ * Секция инвариантов проекта (день 14): жёсткие правила, которые ассистент не имеет права
+ * нарушать (defense-in-depth слой 1 — в промпте; слой 2 — программная проверка через
+ * [com.cliagent.agent.InvariantGuard]). Рендерится отдельно от секции long-term memory, чтобы
+ * акцентировать внимание модели (заголовок «MUST NOT violate»).
+ *
+ * Порядок блоков в system prompt: base → long-term → working → project invariants
+ * (инварианты последними — recency для модели).
+ */
+internal fun LongTermMemory.renderInvariantsBlock(): String? =
+    invariants.takeIf { it.isNotEmpty() }?.let { list ->
+        buildString {
+            append("[Project invariants — you MUST NOT propose solutions that violate these]")
+            list.forEach { iv ->
+                append("\n  - [${iv.id}] ${iv.rule}  (${iv.category.name.lowercase()})")
+            }
+        }
+    }
 
 /** Секция рабочей памяти: данные текущей задачи. */
 internal fun WorkingMemory.renderBlock(): String {

@@ -1,6 +1,7 @@
 package com.cliagent.memory
 
 import com.cliagent.state.TaskState
+import com.cliagent.state.invariant.Invariant
 import kotlinx.serialization.Serializable
 
 /**
@@ -50,17 +51,20 @@ data class UserProfile(
 }
 
 /**
- * Долговременная память — global, кросс-чат/кросс-сессия.
+ * Долговременная память - global, кросс-чат/кросс-сессия.
  * Хранится в отдельном файле [com.cliagent.config.AppPaths.longTermFile].
  *
- * [profile] заполняется в Day 12; [knowledge]/[decisions] — с дня 11.
+ * [profile] заполняется в Day 12; [knowledge]/[decisions] - с дня 11; [invariants] - с дня 14
+ * (жёсткие правила проекта, отдельные от диалога и от профиля; переживают restart).
  */
 @Serializable
 data class LongTermMemory(
     val knowledge: Map<String, String> = emptyMap(),
     val decisions: Map<String, String> = emptyMap(),
-    val profile: UserProfile? = null
+    val profile: UserProfile? = null,
+    val invariants: List<Invariant> = emptyList()   // день 14: инварианты проекта (hard rules)
 ) {
     fun isEmpty(): Boolean =
-        knowledge.isEmpty() && decisions.isEmpty() && (profile == null || profile.isEmpty())
+        knowledge.isEmpty() && decisions.isEmpty() &&
+            (profile == null || profile.isEmpty()) && invariants.isEmpty()
 }
