@@ -4,12 +4,13 @@ import com.cliagent.agent.ContextAwareAgent
 import com.cliagent.llm.LlmClient
 import com.cliagent.memory.UserProfile
 import com.cliagent.state.InteractionMode
+import com.cliagent.state.TaskKind
 import com.cliagent.state.TaskStage
 import com.cliagent.state.TaskState
 import com.cliagent.state.TaskStateMachine
 
 /**
- * Координатор автоматического стадийного потока (доработка Day 13).
+ * Координатор стадийного потока (доработка Day 13 + день 15).
  *
  * Реализует request #1: `/task start` → агент сам выбирает первую стадию ([EntryStageClassifier]),
  * генерирует её артефакт через соответствующий [StageAgent] (LLM-вызовы делегируются в
@@ -21,19 +22,24 @@ import com.cliagent.state.TaskStateMachine
  *
  * Ручные `/task next|set|...` остаются как escape hatch — оркестратор их не дублирует.
  *
+ * **День 15 (фикс #3/#4): mode-aware drive-модель.** В AUTO оркестратор сам прогоняет все готовые
+ * стадии до DONE в одном ходе ([drive] рекурсивно чейнится), выдавая по каждой стадии заголовок +
+ * артефакт + `⏭ → <next>` ([StageAnnouncer]) — без запроса подтверждения. В PLAN — одна стадия за
+ * ход с предложением перехода. Фикс #1: на старте классифицируется [TaskKind] ([TaskKindClassifier])
+ * и хранится в [TaskState.taskKind] → EXECUTION пишет код только для программных задач.
+ *
  * Поток:
  * ```
- * /task start <desc>  → startTask(desc)
- *   classifier → CLARIFY | PLANNING
- *   runStage → артефакт + awaitingAdvance
- *   display + "Перейти к <next>? (да — продолжить, иначе — уточнить)"
+ * /task start <desc>  → startTask(desc, mode)
+ *   classifier → CLARIFY | PLANNING; taskKindClassifier → TaskKind?
+ *   drive(startStage) → артефакт (+ clarify[CLEAR]→planning) + AUTO-чейн до DONE
  *
- * свободный текст при активной задаче → handleUserInput(text)
+ * свободный текст при активной задаче → handleUserInput(text, mode)
  *   awaitingAdvance=true:
- *     isYes(text) → advanceTaskState + runStage(следующая) + артефакт
- *     иначе       → перегенерация артефакта текущей стадии с feedback=text
+ *     AUTO | isYes → advanceAndDrive → drive(следующая) (+ AUTO-чейн)
+ *     иначе        → drive(текущая, feedback) — уточнение артефакта
  *   awaitingAdvance=false (clarify ждёт ответы):
- *     → ClarifyStageAgent.run(feedback=text) → loop пока [CLEAR]
+ *     → drive(текущая, feedback) → loop пока [CLEAR]; в AUTO — чейн дальше
  * ```
  */
 class TaskOrchestrator(
@@ -41,6 +47,8 @@ class TaskOrchestrator(
     llmClient: LlmClient,
     model: String,
     private val classifier: EntryStageClassifier = EntryStageClassifier(llmClient, model),
+    private val taskKindClassifier: TaskKindClassifier = TaskKindClassifier(llmClient, model),
+    private val confirmationClassifier: ConfirmationClassifier = ConfirmationClassifier(llmClient, model),
     agents: Map<TaskStage, StageAgent> = defaultAgents(),
     /**
      * День 15 (gap №6): провайдер LLM-чата для stage-вызовов. Default — agent.chat (текущее
@@ -52,22 +60,29 @@ class TaskOrchestrator(
     private val agents: Map<TaskStage, StageAgent> = agents
 
     /**
-     * Старт задачи: классификатор → стартовая стадия → генерация артефакта.
-     * Особый случай: старт на CLARIFY с немедленным `[CLEAR]` (требования уже ясны из описания)
-     * → авто-advance на PLANNING и запуск planning-агента в том же ходе.
+     * Старт задачи: классификатор entry-стадии + тип задачи → стартовое состояние → drive.
+     * Особый случай: старт на CLARIFY с немедленным `[CLEAR]` — обрабатывается в [drive]
+     * (clarify→planning в одном ходе, далее в AUTO — чейн до DONE).
      *
      * @return markdown-текст для показа пользователю
      */
-    suspend fun startTask(taskDescription: String): String {
+    suspend fun startTask(
+        taskDescription: String,
+        mode: InteractionMode = InteractionMode.PLAN,
+        onEmit: suspend (String) -> Unit = {},
+        onStageStart: (TaskStage) -> Unit = {}
+    ): String {
         val startStage = classifier.classify(taskDescription)
+        val kind = taskKindClassifier.classify(taskDescription)
         agent.setTaskState(
             TaskState(
                 stage = startStage,
                 currentStep = taskDescription,
-                awaitingAdvance = false
+                awaitingAdvance = false,
+                taskKind = kind
             )
         )
-        return runStageAndDisplay(startStage, taskDescription, feedback = null)
+        return drive(startStage, taskDescription, feedback = null, mode = mode, onEmit = onEmit, onStageStart = onStageStart)
     }
 
     /**
@@ -80,43 +95,116 @@ class TaskOrchestrator(
      */
     suspend fun handleUserInput(
         text: String,
-        mode: InteractionMode = InteractionMode.PLAN
+        mode: InteractionMode = InteractionMode.PLAN,
+        onEmit: suspend (String) -> Unit = {},
+        onStageStart: (TaskStage) -> Unit = {}
     ): String? {
         val state = agent.getTaskState() ?: return null
         val desc = state.currentStep ?: ""
 
         return if (state.awaitingAdvance) {
             // День 15 (AUTO): не ждём подтверждения — авто-advance (если артефакт готов; guard проверит).
-            if (mode == InteractionMode.AUTO || isYes(text)) {
-                advanceAndRunNext(state, desc, mode)
+            // День 15 (доп. п.2 — гибрид): в PLAN/MANUAL подтверждение = быстрый путь [isYes]
+            // (детерминированно, без LLM) либо LLM-интерпретация [ConfirmationClassifier] для
+            // естественных фраз. Safe-bias: только CONFIRM продвигает; REFINE/AMBIGUOUS → feedback.
+            if (mode == InteractionMode.AUTO || isYes(text) ||
+                confirmationClassifier.classify(text) == ConfirmationIntent.CONFIRM
+            ) {
+                advanceAndDrive(state, desc, mode, onEmit, onStageStart)
             } else {
-                // Любой иной текст (включая «нет») → уточнение артефакта текущей стадии
-                runStageAndDisplay(state.stage, desc, feedback = text)
+                // Любой иной текст (включая «нет», уточнения, оговорки) → доработка артефакта
+                drive(state.stage, desc, feedback = text, mode = mode, onEmit = onEmit, onStageStart = onStageStart)
             }
         } else {
-            // awaitingAdvance=false → clarify ждёт ответы пользователя (все режимы)
-            runStageAndDisplay(state.stage, desc, feedback = text)
+            // awaitingAdvance=false → clarify ждёт ответы пользователя (все режимы);
+            // в AUTO после [CLEAR] drive сам чейнится дальше.
+            drive(state.stage, desc, feedback = text, mode = mode, onEmit = onEmit, onStageStart = onStageStart)
         }
     }
 
-    /** Признаки подтверждения (да/yes/y/продолжай/далее/ок/готово). */
+    /**
+     * Быстрый путь подтверждения (день 15, доп. п.2 — гибрид): точное совпадение с очевидными
+     * короткими подтверждениями, детерминированно и без LLM-вызова. Естественные фразы и оговорки,
+     * не попавшие сюда, разбираются [ConfirmationClassifier]. Точное совпадение намеренно —
+     * «да, но…» не матчится и уходит в LLM/feedback (safe-bias).
+     */
     private fun isYes(text: String): Boolean {
         val t = text.trim().lowercase()
-        return t in setOf("да", "yes", "y", "ок", "ok", "продолжай", "далее", "дальше", "готово", "подтверждаю")
+        return t in setOf(
+            "да", "yes", "y", "ок", "ok", "окей", "угу", "ага", "давай", "поехали", "го", "go",
+            "продолжай", "далее", "дальше", "готово", "подтверждаю", "хорошо", "отлично", "супер",
+            "конечно", "верно"
+        )
     }
 
     /**
-     * Переход на следующую стадию + запуск её агента.
-     * DONE — терминальная: завершаем.
+     * Единый драйв стадии (фикс #3/#4 + progressive emission).
      *
-     * День 15: в AUTO после готовности артефакта — авто-advance к следующей стадии (рекурсивно),
-     * пока не достигнем DONE или блокировки. Глубина ограничена числом стадий (макс 5: clarify→
-     * planning→execution→validation→done) — бесконечного цикла нет.
+     * 1. `onStageStart(stage)` — клиент ставит лейбл спиннера.
+     * 2. Прогоняет [StageAgent] текущей стадии ([runOneStage]).
+     * 3. Особый случай CLARIFY[CLEAR] → авто-advance на PLANNING + прогон planning в том же ходе.
+     * 4. Формирует [StageAnnouncer.stageBlock] и **эміттит его сразу** через [onEmit] (progressive),
+     *    параллельно копит в возврат.
+     * 5. **AUTO-чейнинг**: если артефакт готов и стадия не терминальна — advance + рекурсивный
+     *    [drive] следующей стадии. Рекурсия ограничена числом стадий (≤5) — бесконечного цикла нет.
      */
-    private suspend fun advanceAndRunNext(
+    private suspend fun drive(
+        stage: TaskStage,
+        taskDescription: String,
+        feedback: String?,
+        mode: InteractionMode,
+        onEmit: suspend (String) -> Unit,
+        onStageStart: (TaskStage) -> Unit
+    ): String {
+        onStageStart(stage)
+        val result = runOneStage(stage, taskDescription, feedback)
+
+        var display = result.display
+        var curStage = stage
+        var ready = result.readyToAdvance
+
+        // Особый случай: CLARIFY дал [CLEAR] → авто-advance на PLANNING и прогон planning в том же ходе.
+        if (stage == TaskStage.CLARIFY && ready) {
+            val planned = agent.advanceTaskState()   // CLARIFY → PLANNING
+            if (planned != null) {
+                onStageStart(TaskStage.PLANNING)
+                val planResult = runOneStage(TaskStage.PLANNING, taskDescription, feedback = null)
+                display = display + SEP + planResult.display
+                curStage = TaskStage.PLANNING
+                ready = planResult.readyToAdvance
+            }
+        }
+
+        // DONE — терминальная: readyToAdvance=false по семантике, но для UI трактуем как готовую.
+        val effectiveReady = ready || curStage == TaskStage.DONE
+        val nextStage = TaskStateMachine.next(curStage)
+        val block = StageAnnouncer.stageBlock(curStage, display, effectiveReady, nextStage, mode)
+
+        // Progressive: блок стадии готов — эміттим сразу, до старта следующей.
+        onEmit(block)
+        var acc = block
+
+        // AUTO-чейнинг: готовый артефакт + не терминальная → advance + drive следующей.
+        if (mode == InteractionMode.AUTO && effectiveReady && curStage != TaskStage.DONE && nextStage != null) {
+            val advanced = agent.advanceTaskState()
+            if (advanced != null) {
+                acc += SEP + drive(advanced.stage, taskDescription, feedback = null, mode = mode,
+                    onEmit = onEmit, onStageStart = onStageStart)
+            }
+        }
+        return acc
+    }
+
+    /**
+     * Переход на следующую стадию + drive её агента (FIX #3: используется и в AUTO-чейне, и в
+     * подтверждённом advance). Guards: DONE → «уже завершена»; неготовый артефакт → блокировка.
+     */
+    private suspend fun advanceAndDrive(
         state: TaskState,
         desc: String,
-        mode: InteractionMode = InteractionMode.PLAN
+        mode: InteractionMode,
+        onEmit: suspend (String) -> Unit,
+        onStageStart: (TaskStage) -> Unit
     ): String {
         if (state.stage == TaskStage.DONE) {
             return "🏁 Задача уже завершена. Начни новую через `/task start <описание>`."
@@ -128,28 +216,19 @@ class TaskOrchestrator(
                 "Уточни артефакт текстом или задай его через `/task`."
         }
         val next = agent.advanceTaskState() ?: return "✓ Уже на финальной стадии."
-        val display = runStageAndDisplay(next.stage, desc, feedback = null)
-
-        // День 15 (AUTO): после генерации артефакта — авто-advance к следующей стадии без запроса.
-        val updated = agent.getTaskState()
-        if (mode == InteractionMode.AUTO && updated != null &&
-            updated.awaitingAdvance && updated.stage != TaskStage.DONE
-        ) {
-            // авто-advance через ту же логику (guard внутри); рекурсия ограничена числом стадий.
-            return display + "\n\n___\n\n" + advanceAndRunNext(updated, desc, mode)
-        }
-        return display
+        return drive(next.stage, desc, feedback = null, mode = mode, onEmit = onEmit, onStageStart = onStageStart)
     }
 
     /**
-     * Запускает [StageAgent] для стадии, сохраняет артефакт в нужное поле [TaskState],
-     * выставляет [TaskState.awaitingAdvance], возвращает markdown-дисплей.
+     * Прогон одного [StageAgent]: строит [StageContext] из текущего [TaskState] (включая [TaskKind]),
+     * вызывает агент, кладёт артефакт в нужное поле, выставляет [TaskState.awaitingAdvance],
+     * персистит. Без форматирования и без чейнинга — чистый исполнитель одной стадии.
      */
-    private suspend fun runStageAndDisplay(
+    private suspend fun runOneStage(
         stage: TaskStage,
         taskDescription: String,
         feedback: String?
-    ): String {
+    ): StageResult {
         val current = agent.getTaskState()!!
         val profile = agent.getProfile()
         val ctx = StageContext(
@@ -159,11 +238,16 @@ class TaskOrchestrator(
             implementation = current.implementation,
             verdict = current.verdict,
             profile = profile,
-            feedback = feedback
+            feedback = feedback,
+            taskKind = current.taskKind
         )
 
         val agentImpl = agents[stage]
-            ?: return "⚠️ Нет агента для стадии $stage. Используй `/task next`."
+            ?: return StageResult(
+                artifact = null,
+                display = "⚠️ Нет агента для стадии $stage. Используй `/task next`.",
+                readyToAdvance = false
+            )
 
         val result = agentImpl.run(ctx) { userMsg -> chat(userMsg) }
 
@@ -171,25 +255,7 @@ class TaskOrchestrator(
         val updated = storeArtifact(current, stage, result.artifact)
             .copy(awaitingAdvance = result.readyToAdvance)
         agent.setTaskState(updated)
-
-        // Особый случай: CLARIFY дал [CLEAR] → авто-advance на PLANNING и запуск в том же ходе
-        if (stage == TaskStage.CLARIFY && result.readyToAdvance && updated.stage != TaskStage.PLANNING) {
-            val planned = agent.advanceTaskState()   // CLARIFY → PLANNING
-            if (planned != null) {
-                return result.display + "\n\n---\n\n" +
-                    runStageAndDisplay(TaskStage.PLANNING, taskDescription, feedback = null)
-            }
-        }
-
-        val prompt = if (result.readyToAdvance && stage != TaskStage.DONE) {
-            val nextStage = TaskStateMachine.next(stage)
-            if (nextStage != null) {
-                "\n\n___\n\n✅ Перейти к стадии **${nextStage.name}**? " +
-                    "Ответь **да** — продолжить, либо напиши уточнение для доработки."
-            } else null
-        } else null
-
-        return result.display + (prompt ?: "")
+        return result
     }
 
     /** Кладёт артефакт стадии в соответствующее поле TaskState. */
@@ -213,6 +279,9 @@ class TaskOrchestrator(
     }
 
     companion object {
+        /** Разделитель между стадиями в AUTO-чейне (и в clarify→planning склейке). */
+        private const val SEP = "\n\n---\n\n"
+
         /** Реестр стадийных агентов по умолчанию (один агент на каждую стадию FSM). */
         fun defaultAgents(): Map<TaskStage, StageAgent> = mapOf(
             TaskStage.CLARIFY to ClarifyStageAgent(),

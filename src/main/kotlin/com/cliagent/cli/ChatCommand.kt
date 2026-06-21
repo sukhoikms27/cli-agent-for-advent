@@ -133,7 +133,14 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         // инварианты (если включены) покрывают и stage-поток, а не только свободный чат.
         val checker = if (invariantsEnabled) LlmInvariantChecker(client, model) else null
         val statefulAgent = StatefulAgent(agent, checker) { agent.getInvariants() }
-        val orchestrator = TaskOrchestrator(agent, client, model, chat = { msg -> statefulAgent.chat(msg) })
+        // День 15 (progressive): спиннер на уровне одного stage-LLM-вызова. Каждый chat()-вызоз
+        // оркестратора крутит спиннер с лейблом текущей стадии (spinnerLabel читает
+        // currentSpinnerStage, который ставится через onStageStart); finally чистит кадр до
+        // печати блока → гарблинга нет. Блоки стадий печатаются progressive через onEmit.
+        val orchestrator = TaskOrchestrator(
+            agent, client, model,
+            chat = { msg -> AppTerminal.withSpinner({ spinnerLabel() }) { statefulAgent.chat(msg) } }
+        )
 
         // День 15 (п.1): авто-определение «простой вопрос vs задача» при отсутствии активной задачи
         // и режиме ≠ MANUAL. QUESTION → обычный чат; TASK → автостарт FSM без /task start.
@@ -173,54 +180,84 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                     AppTerminal.ok("History, summary, facts, branches, working memory cleared.")
                 }
                 else -> {
-                    val taskState = agent.getTaskState()
-                    val mode = agent.getWorkingMemory()?.interactionMode ?: InteractionMode.PLAN
-                    // День 15 (п.4): кэш стадии для динамического лейбла спиннера (getTaskState — suspend,
-                    // а render-лямбда non-suspend; обновляем перед каждым withSpinner). null → «Thinking…».
-                    currentSpinnerStage = taskState?.stage
-
-                    // День 15 (п.1): при отсутствии активной задачи и режиме ≠ MANUAL — авто-определение
-                    // интента. QUESTION → обычный чат; TASK → автостарт жизненного цикла FSM.
-                    if (taskState == null && mode != InteractionMode.MANUAL) {
-                        val intent = AppTerminal.withSpinner({ spinnerLabel() }) {
-                            intentClassifier.classify(input)
-                        }
-                        if (intent == UserIntent.TASK) {
-                            val w = agent.getWorkingMemory() ?: WorkingMemory()
-                            agent.setWorkingMemory(w.copy(currentTask = input))
-                            val display = AppTerminal.withSpinner({ spinnerLabel() }) {
-                                orchestrator.startTask(input)
-                            }
-                            currentSpinnerStage = agent.getTaskState()?.stage
+                    // День 15 (progressive): каждый блок стадии печатается сразу через onEmit
+                    // по мере готовности; onStageStart ставит лейбл спиннера per-stage.
+                    dispatchFreeText(
+                        input, agent, statefulAgent, orchestrator, intentClassifier,
+                        onEmit = { block ->
                             AppTerminal.println()
-                            renderStageDisplay(agent, display, mode)
+                            AppTerminal.markdown(block)
                             AppTerminal.println()
-                            return@runBlocking
-                        }
-                        // QUESTION → обычный чат ниже
-                    }
-
-                    // День 13 (авто-поток): при активной задаче свободный текст = подтверждение
-                    // перехода («да») или уточнение артефакта текущей стадии. Иначе — обычный чат.
-                    // День 15 (п.3): режим передаётся — AUTO авто-advance без подтверждения.
-                    val taskResponse = AppTerminal.withSpinner({ spinnerLabel() }) {
-                        orchestrator.handleUserInput(input, mode)
-                    }
-                    currentSpinnerStage = agent.getTaskState()?.stage
-                    if (taskResponse != null) {
-                        AppTerminal.println()
-                        renderStageDisplay(agent, taskResponse, mode)
-                        AppTerminal.println()
-                    } else {
-                        // День 14/15: свободный чат через StatefulAgent (инварианты opt-in --invariants).
-                        val response = AppTerminal.withSpinner({ spinnerLabel() }) { statefulAgent.chat(input) }
-                        AppTerminal.println()
-                        AppTerminal.markdown(response)
-                        AppTerminal.println()
-                    }
+                        },
+                        onStageStart = { stage -> currentSpinnerStage = stage }
+                    )
                 }
             }
         }
+    }
+
+    /**
+     * Диспетчеризация свободного текста (не slash-команды) — единый тестируемый шов stage-потока
+     * (день 15). Извлечён из `else`-ветки REPL, чтобы покрыть юнит-тестами логику без мока
+     * терминала: DONE-reset → авто-определение интента → автостарт FSM → stage-поток / обычный чат.
+     *
+     * I/O (печать, спиннер) остаются здесь, но они test-safe: mordant non-TTY no-op (см.
+     * MarkdownRenderTest), `withSpinner` под `runTest` не виснет. Возврат — markdown-строка для
+     * печати; null — ничего не выводить.
+     */
+    internal suspend fun dispatchFreeText(
+        input: String,
+        agent: ContextAwareAgent,
+        statefulAgent: StatefulAgent,
+        orchestrator: TaskOrchestrator,
+        intentClassifier: IntentClassifier,
+        onEmit: suspend (String) -> Unit = {},
+        onStageStart: (TaskStage) -> Unit = {}
+    ): String? {
+        var taskState = agent.getTaskState()
+        val mode = agent.getWorkingMemory()?.interactionMode ?: InteractionMode.PLAN
+
+        // День 15 (follow-up): завершённая задача (DONE) в режиме ≠ MANUAL — сбросить FSM,
+        // чтобы новое сообщение прошло обычную классификацию интента (новая задача vs вопрос),
+        // а не ушло как feedback в DoneStageAgent. MANUAL не трогаем — там FSM через /task.
+        if (taskState != null && taskState.stage == TaskStage.DONE &&
+            mode != InteractionMode.MANUAL
+        ) {
+            agent.setTaskState(null)
+            taskState = null
+        }
+
+        // День 15 (progressive): сброс лейбла спиннера → «Thinking…» для classify/chat-ветки;
+        // stage-флоу выставит свою стадию через onStageStart.
+        currentSpinnerStage = null
+
+        // День 15 (п.1): при отсутствии активной задачи и режиме ≠ MANUAL — авто-определение
+        // интента. QUESTION → обычный чат; TASK → автостарт жизненного цикла FSM.
+        if (taskState == null && mode != InteractionMode.MANUAL) {
+            val intent = AppTerminal.withSpinner({ spinnerLabel() }) {
+                intentClassifier.classify(input)
+            }
+            if (intent == UserIntent.TASK) {
+                val w = agent.getWorkingMemory() ?: WorkingMemory()
+                agent.setWorkingMemory(w.copy(currentTask = input))
+                // Спиннер — в chat-делегате оркестратора (per LLM-вызов); блоки печатаются
+                // progressive через onEmit. Возврат = сцепленная строка (caller в проде игнорирует).
+                return orchestrator.startTask(input, mode, onEmit = onEmit, onStageStart = onStageStart)
+            }
+            // QUESTION → обычный чат ниже
+        }
+
+        // День 13 (авто-поток): при активной задаче свободный текст = подтверждение
+        // перехода («да») или уточнение артефакта текущей стадии. Иначе — обычный чат.
+        // День 15 (п.3): режим передаётся — AUTO авто-advance без подтверждения.
+        val taskResponse = orchestrator.handleUserInput(input, mode, onEmit = onEmit, onStageStart = onStageStart)
+        currentSpinnerStage = agent.getTaskState()?.stage
+        if (taskResponse != null) return taskResponse
+
+        // День 14/15: свободный чат через StatefulAgent (инварианты opt-in --invariants).
+        val response = AppTerminal.withSpinner({ spinnerLabel() }) { statefulAgent.chat(input) }
+        onEmit(response)
+        return response
     }
 
     private fun createStrategy(
@@ -839,33 +876,6 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         }
     }
 
-    /**
-     * День 15 (п.2): рендер ответа stage-потока через [StageAnnouncer] — структурные уведомления
-     * о стадии/артефакте/переходе. Читает текущее [TaskState] для метаданных (стадия, readyToAdvance
-     * через awaitingAdvance, следующая стадия). В PLAN — предложение перехода; в AUTO — уведомление.
-     */
-    private suspend fun renderStageDisplay(
-        agent: ContextAwareAgent,
-        display: String,
-        mode: InteractionMode
-    ) {
-        val ts = agent.getTaskState()
-        if (ts == null) {
-            // нет активной задачи — обычный markdown (не должно случаться в stage-потоке, но безопасно)
-            AppTerminal.markdown(display)
-            return
-        }
-        val nextStage = TaskStateMachine.next(ts.stage)
-        val block = StageAnnouncer.stageBlock(
-            stage = ts.stage,
-            display = display,
-            readyToAdvance = ts.awaitingAdvance || ts.stage == TaskStage.DONE,
-            nextStage = nextStage,
-            mode = mode
-        )
-        AppTerminal.markdown(block)
-    }
-
     private suspend fun handleTask(input: String, agent: ContextAwareAgent, orchestrator: TaskOrchestrator) {
         val parts = input.trim().split("\\s+".toRegex())
         if (parts.size < 2 || parts[1] == "show") {
@@ -906,11 +916,17 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                 // Запасной ручной путь — /task set <stage>.
                 val w = agent.getWorkingMemory() ?: WorkingMemory()
                 agent.setWorkingMemory(w.copy(currentTask = desc))
-                val display = AppTerminal.withSpinner("Thinking…") { orchestrator.startTask(desc) }
-                AppTerminal.println()
-                renderStageDisplay(agent, display,
-                    w.interactionMode)
-                AppTerminal.println()
+                // День 15 (progressive): блоки стадий печатаются по мере готовности через onEmit.
+                currentSpinnerStage = null
+                orchestrator.startTask(
+                    desc, w.interactionMode,
+                    onEmit = { block ->
+                        AppTerminal.println()
+                        AppTerminal.markdown(block)
+                        AppTerminal.println()
+                    },
+                    onStageStart = { stage -> currentSpinnerStage = stage }
+                )
             }
             "next" -> {
                 val cur = agent.getTaskState()

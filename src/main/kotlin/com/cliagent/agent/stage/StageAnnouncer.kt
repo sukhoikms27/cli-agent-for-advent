@@ -1,6 +1,5 @@
-package com.cliagent.cli
+package com.cliagent.agent.stage
 
-import com.cliagent.agent.stage.StageResult
 import com.cliagent.state.InteractionMode
 import com.cliagent.state.TaskStage
 
@@ -13,6 +12,9 @@ import com.cliagent.state.TaskStage
  *
  * Не заменяет [StageResult.display] (содержимое артефакта — план/реализация/вердикт), а добавляет
  * структурные префиксы-уведомления ВОКРУГ него. Обычный чат (не stage-поток) не затрагивается.
+ *
+ * Живёт в `agent.stage` (не `cli`), т.к. используется [TaskOrchestrator]'ом для построения display
+ * строки стадийного потока — в т.ч. AUTO-чейна с промежуточными результатами (фикс #3/#4).
  *
  * Источник метаданных — [StageResult] (artifact, readyToAdvance) + [TaskStage]. Человекочитаемые
  * имена стадий отражают семантику [com.cliagent.llm.model.StagePromptTemplates].

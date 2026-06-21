@@ -1,5 +1,6 @@
 package com.cliagent.llm.model
 
+import com.cliagent.state.TaskKind
 import com.cliagent.state.TaskStage
 
 /**
@@ -12,10 +13,17 @@ import com.cliagent.state.TaskStage
  *
  * Подключается в [com.cliagent.agent.ContextAwareAgent.buildMessagesToSend] когда есть активная
  * задача (`taskState != null`); иначе — прежнее поведение (`reasoningStrategy` → `systemPrompt`).
+ *
+ * День 15 (фикс #1): EXECUTION-промпт ветвится по [TaskKind] — код только для программных задач;
+ * для логических/текстовых/объяснительных — ответ/решение/рассуждение без кода. `null` (тип неизвестен)
+ * → универсальный промпт: LLM сама решает, нужен ли код.
  */
 object StagePromptTemplates {
 
-    fun buildSystemMessage(stage: TaskStage): ChatMessage = when (stage) {
+    /** Безопасное делегирование для callers без taskKind (старый контракт). */
+    fun buildSystemMessage(stage: TaskStage): ChatMessage = buildSystemMessage(stage, null)
+
+    fun buildSystemMessage(stage: TaskStage, taskKind: TaskKind?): ChatMessage = when (stage) {
         TaskStage.CLARIFY -> ChatMessage(
             role = "system",
             content = """
@@ -37,12 +45,7 @@ object StagePromptTemplates {
         )
         TaskStage.EXECUTION -> ChatMessage(
             role = "system",
-            content = """
-                You are a senior software assistant in the EXECUTION stage.
-                Implement the task following the approved plan: write working code, make decisions,
-                and record them.
-                Do not re-plan unless the plan is demonstrably broken.
-            """.trimIndent()
+            content = executionPrompt(taskKind)
         )
         TaskStage.VALIDATION -> ChatMessage(
             role = "system",
@@ -61,5 +64,44 @@ object StagePromptTemplates {
                 Do not start new work unless the user begins a new task.
             """.trimIndent()
         )
+    }
+
+    /**
+     * EXECUTION-промпт по [TaskKind] (день 15, фикс #1). Код — только для [TaskKind.CODE];
+     * для остальных — ответ/решение/рассуждение/текст. `null` → универсальный промпт, где LLM
+     * сама решает, нужен ли код (защита от сбоя классификации — не форсируем код).
+     */
+    private fun executionPrompt(taskKind: TaskKind?): String = when (taskKind) {
+        TaskKind.CODE -> """
+            You are a senior software assistant in the EXECUTION stage.
+            Implement the task following the approved plan: write working code, make decisions,
+            and record them.
+            Do not re-plan unless the plan is demonstrably broken.
+        """.trimIndent()
+        TaskKind.REASONING -> """
+            You are a senior assistant in the EXECUTION stage of a reasoning/analytical task.
+            Work through the task following the approved plan and produce the concrete answer,
+            solution or conclusion for each step. Reason explicitly and record key decisions.
+            Do NOT write code unless a step explicitly requires runnable code.
+            Do not re-plan unless the plan is demonstrably broken.
+        """.trimIndent()
+        TaskKind.WRITING -> """
+            You are a senior assistant in the EXECUTION stage of a writing task.
+            Produce the requested text/document following the approved plan, step by step.
+            Do NOT write code. Do not re-plan unless the plan is demonstrably broken.
+        """.trimIndent()
+        TaskKind.EXPLANATION -> """
+            You are a senior assistant in the EXECUTION stage of an explanation task.
+            Explain the topic clearly and concretely, following the approved plan.
+            Do NOT write code unless illustrating a concept is explicitly required.
+            Do not re-plan unless the plan is demonstrably broken.
+        """.trimIndent()
+        null -> """
+            You are a senior software assistant in the EXECUTION stage.
+            Execute the task following the approved plan and produce the concrete result:
+            working code if the task is programming, otherwise the answer, solution or reasoning.
+            Record key decisions.
+            Do not re-plan unless the plan is demonstrably broken.
+        """.trimIndent()
     }
 }

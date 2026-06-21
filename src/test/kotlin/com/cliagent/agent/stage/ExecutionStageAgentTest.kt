@@ -1,8 +1,10 @@
 package com.cliagent.agent.stage
 
+import com.cliagent.state.TaskKind
 import com.cliagent.state.TaskStage
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
@@ -77,5 +79,27 @@ class ExecutionStageAgentTest {
     @Test
     fun `stage is EXECUTION`() {
         assertEquals(TaskStage.EXECUTION, ExecutionStageAgent().stage)
+    }
+
+    // ── День 15 фикс #1: taskKind ветвит промпт шага ──
+
+    @Test
+    fun `REASONING taskKind produces non-code step instruction`() = runTest {
+        val agent = ExecutionStageAgent()
+        var captured = ""
+        val reasonCtx = ctx.copy(taskKind = TaskKind.REASONING)
+        agent.run(reasonCtx) { captured = it; "результат шага" }
+        // промпт шага просит ответ/решение и явно запрещает код
+        assertTrue(captured.contains("Не пиши код"))
+        assertFalse(captured.contains("Дай реализацию текущего шага: код"))
+    }
+
+    @Test
+    fun `CODE taskKind keeps code instruction`() = runTest {
+        val agent = ExecutionStageAgent()
+        var captured = ""
+        val codeCtx = ctx.copy(taskKind = TaskKind.CODE)
+        agent.run(codeCtx) { captured = it; "code" }
+        assertTrue(captured.contains("Дай реализацию текущего шага: код"))
     }
 }

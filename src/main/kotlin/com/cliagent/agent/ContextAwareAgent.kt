@@ -141,7 +141,7 @@ class ContextAwareAgent(
         // иначе reasoningStrategy → иначе статический systemPrompt (поведение Day 1-13).
         val taskState = getTaskState()
         val baseSystem = when {
-            taskState != null -> StagePromptTemplates.buildSystemMessage(taskState.stage)
+            taskState != null -> StagePromptTemplates.buildSystemMessage(taskState.stage, taskState.taskKind)
             reasoningStrategy != null -> PromptTemplates.buildSystemMessage(reasoningStrategy)
             else -> systemPrompt
         }

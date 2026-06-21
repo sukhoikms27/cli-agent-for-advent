@@ -1,5 +1,6 @@
 package com.cliagent.agent.stage
 
+import com.cliagent.state.TaskKind
 import com.cliagent.state.TaskStage
 
 /**
@@ -7,10 +8,13 @@ import com.cliagent.state.TaskStage
  *
  * Гибрид-режим (выбор пользователя «отдельный агент на каждый пункт плана»): план разбирается
  * [PlanParser]'ом на шаги, и на каждый шаг запускается [StepAgent]. Результаты агрегируются
- * в артефакт `implementation` (готовый код + решения по шагам).
+ * в артефакт `implementation` (готовый код/решения по шагам).
  *
  * Если план не распался на шаги (prose) — выполняется целиком одним шагом ([PlanParser.parseOrWhole]).
- * [StageContext.feedback] — уточнение реализации при перегенерации (добашляется в общий промпт).
+ * [StageContext.feedback] — уточнение реализации при перегенерации (добавляется в общий промпт).
+ *
+ * День 15 (фикс #1): [StageContext.taskKind] пробрасывается в [StepAgent] и в прямые промпты —
+ * для некодовых задач агент даёт ответ/решение, а не код.
  */
 class ExecutionStageAgent(
     private val stepAgent: StepAgent = StepAgent()
@@ -37,7 +41,15 @@ class ExecutionStageAgent(
             parts.append("### Шаг ${index + 1}/${steps.size}: $step\n\n")
             // На перегенерации (feedback) — перезапускаем все шаги с чистого листа;
             // feedback добавляется в первый шаг как уточнение.
-            val stepResult = stepAgent.run(step, plan, done, ctx.taskDescription, ctx.profileBlock, chat)
+            val stepResult = stepAgent.run(
+                step = step,
+                plan = plan,
+                doneSteps = done,
+                taskDescription = ctx.taskDescription,
+                profileBlock = ctx.profileBlock,
+                taskKind = ctx.taskKind,
+                chat = chat
+            )
             parts.append(stepResult).append("\n\n")
             done.add(step)
         }
@@ -60,7 +72,7 @@ class ExecutionStageAgent(
 
     private fun noPlanMessage(ctx: StageContext): String = buildString {
         append("Задача: ").append(ctx.taskDescription)
-        append("\n\nПлан не задан. Реализуй задачу напрямую, шаг за шагом.")
+        append("\n\nПлан не задан. ").append(directInstruction(ctx.taskKind))
         ctx.profileBlock?.let { append("\n\n").append(it) }
     }
 
@@ -69,6 +81,15 @@ class ExecutionStageAgent(
         append("\n\nОтзыв/уточнение пользователя:\n").append(feedback)
         profileBlock?.let { append("\n\n").append(it) }
         append("\n\nДай уточнённую реализацию с учётом отзыва.")
+    }
+
+    /** Инструкция «напрямую без плана» по типу задачи (фикс #1). */
+    private fun directInstruction(taskKind: TaskKind?): String = when (taskKind) {
+        TaskKind.CODE -> "Реализуй задачу напрямую, шаг за шагом, с кодом."
+        TaskKind.REASONING -> "Реши задачу напрямую, шаг за шагом, с рассуждением и итоговым ответом. Не пиши код, если он не требуется."
+        TaskKind.WRITING -> "Напиши требуемый текст напрямую, шаг за шагом. Не пиши код."
+        TaskKind.EXPLANATION -> "Объясни тему напрямую, шаг за шагом. Не пиши код, если он не требуется."
+        null -> "Выполни задачу напрямую, шаг за шагом: код, если задача программная, иначе ответ/решение/пояснение."
     }
 
     private companion object {

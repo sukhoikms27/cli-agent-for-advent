@@ -12,6 +12,7 @@ import com.cliagent.llm.model.Usage
 import com.cliagent.memory.LongTermMemory
 import com.cliagent.memory.MemoryStore
 import com.cliagent.memory.WorkingMemory
+import com.cliagent.state.InteractionMode
 import com.cliagent.state.TaskStage
 import io.mockk.coEvery
 import io.mockk.mockk
@@ -225,6 +226,67 @@ class TaskOrchestratorTest {
         assertNull(orch.handleUserInput("что угодно"))
     }
 
+    // ── День 15 фикс #3/#4: AUTO-чейнинг всех стадий до DONE в одном ходе ──
+
+    @Test
+    fun `AUTO startTask chains all stages to DONE in one call with intermediate results`() = runTest {
+        val llm = stageAwareLlm()
+        val agent = ContextAwareAgent(llm, storeMock(), "m", "chat-1")
+        val orch = TaskOrchestrator(agent, llm, "m")
+
+        val out = orch.startTask("сделай калькулятор", InteractionMode.AUTO)
+        val state = agent.getTaskState()
+
+        // Один ход — дошли до терминальной стадии
+        assertEquals(TaskStage.DONE, state?.stage)
+        // Промежуточные результаты каждой стадии присутствуют
+        assertTrue(out.contains("Реализация"), "AUTO должен показать артефакт execution")
+        assertTrue(out.contains("Валидация"), "AUTO должен показать стадию validation")
+        // Фикс #3: в AUTO нет вопроса подтверждения перехода
+        assertFalse(out.contains("Перейти к стадии"), "AUTO не должен спрашивать подтверждение")
+        // Сообщения о переходе есть
+        assertTrue(out.contains("⏭ →"), "AUTO должен показывать переходы между стадиями")
+    }
+
+    @Test
+    fun `AUTO pauses when clarify asks questions`() = runTest {
+        // clarify даёт [ASK] → не ready → AUTO не чейнится, ждёт ответы пользователя
+        val llm = routingLlm(classifierContent = "CLARIFY", stageContent = "[ASK] какой стек?")
+        val agent = ContextAwareAgent(llm, storeMock(), "m", "chat-1")
+        val orch = TaskOrchestrator(agent, llm, "m")
+
+        orch.startTask("сделай калькулятор", InteractionMode.AUTO)
+
+        assertEquals(TaskStage.CLARIFY, agent.getTaskState()?.stage)
+        assertEquals(false, agent.getTaskState()?.awaitingAdvance)   // ждёт ответы
+    }
+
+    @Test
+    fun `AUTO startTask emits one block per stage progressively via onEmit`() = runTest {
+        // Фикс progressive: каждая стадия эміттит свой блок сразу по готовности (>=4 блоков:
+        // planning/execution/validation/done), а не сцепленной строкой в конце.
+        val llm = stageAwareLlm()
+        val agent = ContextAwareAgent(llm, storeMock(), "m", "chat-1")
+        val orch = TaskOrchestrator(agent, llm, "m")
+
+        val emitted = mutableListOf<String>()
+        val stagesSeen = mutableListOf<TaskStage>()
+        orch.startTask(
+            "сделай калькулятор", InteractionMode.AUTO,
+            onEmit = { emitted += it },
+            onStageStart = { stagesSeen += it }
+        )
+
+        assertTrue(emitted.size >= 4, "ожидали >=4 progressive-блоков, получили ${emitted.size}")
+        val all = emitted.joinToString("\n---\n")
+        assertTrue(all.contains("Реализация"), "execution-блок должен быть эміттнут")
+        assertTrue(all.contains("Валидация"), "validation-блок должен быть эміттнут")
+        // onStageStart зовётся перед каждой стадией — фикс per-stage спиннера
+        assertTrue(stagesSeen.contains(TaskStage.EXECUTION))
+        assertTrue(stagesSeen.contains(TaskStage.VALIDATION))
+        assertEquals(TaskStage.DONE, agent.getTaskState()?.stage)
+    }
+
     @Test
     fun `DONE is terminal - confirmation says already finished`() = runTest {
         val llm = stageAwareLlm()
@@ -261,5 +323,82 @@ class TaskOrchestratorTest {
             }
             LlmResult.Success(fakeResponse(content))
         }
+    }
+
+    // ── День 15, доп. п.2: гибридное подтверждение (isYes + ConfirmationClassifier) ──
+
+    /**
+     * LLM с явным управлением confirmation-классификатором: [confirmation] возвращается на запрос
+     * подтверждения (промпт содержит «CONFIRM, REFINE»), [classifierContent] — на entry-классификатор,
+     * [stageContent] — на стадийные вызовы.
+     */
+    private fun confirmationRoutingLlm(
+        confirmation: String,
+        classifierContent: String = "PLANNING",
+        stageContent: String = "1) Setup\n2) Impl"
+    ): LlmClient = mockk {
+        coEvery { chat(any()) } answers {
+            val req = firstArg<ChatRequest>()
+            val last = req.messages.lastOrNull()?.content.orEmpty()
+            val content = when {
+                last.contains("CONFIRM, REFINE", ignoreCase = true) -> confirmation
+                last.contains("ответь строго", ignoreCase = true) -> classifierContent
+                else -> stageContent
+            }
+            LlmResult.Success(fakeResponse(content))
+        }
+    }
+
+    @Test
+    fun `natural-language confirmation via classifier advances to next stage`() = runTest {
+        // «согласен, продолжаем» — не ловится быстрым путём isYes → LLM-классификатор → CONFIRM → advance
+        val llm = confirmationRoutingLlm(confirmation = "CONFIRM")
+        val agent = ContextAwareAgent(llm, storeMock(), "m", "chat-1")
+        val orch = TaskOrchestrator(agent, llm, "m")
+
+        orch.startTask("сделай калькулятор")          // PLANNING, awaitingAdvance=true
+        orch.handleUserInput("согласен, продолжаем")
+
+        assertEquals(TaskStage.EXECUTION, agent.getTaskState()?.stage)
+    }
+
+    @Test
+    fun `conditional reply classified as REFINE stays on stage as feedback`() = runTest {
+        // «да, но без тестов» — оговорка: классификатор → REFINE → доработка, стадия не меняется
+        val llm = confirmationRoutingLlm(confirmation = "REFINE")
+        val agent = ContextAwareAgent(llm, storeMock(), "m", "chat-1")
+        val orch = TaskOrchestrator(agent, llm, "m")
+
+        orch.startTask("сделай калькулятор")          // PLANNING
+        orch.handleUserInput("да, но без тестов")
+
+        assertEquals(TaskStage.PLANNING, agent.getTaskState()?.stage)
+        assertEquals(true, agent.getTaskState()?.awaitingAdvance)
+    }
+
+    @Test
+    fun `classifier not consulted when isYes fast path matches`() = runTest {
+        // «да» ловится isYes → LLM-классификатор подтверждения не должен вызываться.
+        // Если бы он вызывался и возвращал REFINE — перехода бы не было; проверяем переход.
+        val llm = confirmationRoutingLlm(confirmation = "REFINE")
+        val agent = ContextAwareAgent(llm, storeMock(), "m", "chat-1")
+        val orch = TaskOrchestrator(agent, llm, "m")
+
+        orch.startTask("сделай калькулятор")
+        orch.handleUserInput("да")
+
+        assertEquals(TaskStage.EXECUTION, agent.getTaskState()?.stage)
+    }
+
+    @Test
+    fun `classifier ambiguity treated as non-confirm - stays on stage`() = runTest {
+        val llm = confirmationRoutingLlm(confirmation = "AMBIGUOUS")
+        val agent = ContextAwareAgent(llm, storeMock(), "m", "chat-1")
+        val orch = TaskOrchestrator(agent, llm, "m")
+
+        orch.startTask("сделай калькулятор")
+        orch.handleUserInput("ну не знаю")
+
+        assertEquals(TaskStage.PLANNING, agent.getTaskState()?.stage)
     }
 }
