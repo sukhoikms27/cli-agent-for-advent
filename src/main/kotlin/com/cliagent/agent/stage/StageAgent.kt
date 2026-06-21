@@ -1,6 +1,7 @@
 package com.cliagent.agent.stage
 
 import com.cliagent.memory.UserProfile
+import com.cliagent.llm.token.TokenCounter
 import com.cliagent.state.TaskKind
 import com.cliagent.state.TaskStage
 
@@ -39,6 +40,7 @@ interface StageAgent {
  * @param profile          профиль пользователя (style/constraints) — контекст для всех стадий
  * @param feedback         текст-уточнение от пользователя (перегенерация артефакта); null при первом запуске
  * @param taskKind         тип задачи (Day 15 фикс #1) — ветвит EXECUTION/StepAgent-промпты; null — неизвестен
+ * @param tokenCounter     оценка токенов для bounded-усечения межартефактных передач (мера C); null — агент не усекает
  */
 data class StageContext(
     val taskDescription: String,
@@ -48,7 +50,8 @@ data class StageContext(
     val verdict: String? = null,
     val profile: UserProfile? = null,
     val feedback: String? = null,
-    val taskKind: TaskKind? = null
+    val taskKind: TaskKind? = null,
+    val tokenCounter: TokenCounter? = null
 ) {
     /** Профиль в виде блока для промпта (constraints/style), если задан и не пуст. */
     val profileBlock: String?

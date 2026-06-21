@@ -14,7 +14,10 @@ import com.cliagent.llm.model.PromptTemplates
 import com.cliagent.llm.model.ReasoningStrategy
 import com.cliagent.llm.model.StagePromptTemplates
 import com.cliagent.llm.model.SystemPrompts
+import com.cliagent.llm.token.ArtifactLimits
+import com.cliagent.llm.token.OutputBudget
 import com.cliagent.llm.token.TokenCounter
+import com.cliagent.llm.token.truncateToTokens
 import com.cliagent.memory.LongTermMemory
 import com.cliagent.memory.MemoryStore
 import com.cliagent.memory.UserProfile
@@ -40,6 +43,9 @@ class ContextAwareAgent(
     private val profileExtractor: ProfileExtractor? = null,
     private val autoProfileEvery: Int = 0   // 0 = авто-извлечение профиля выключено
 ) : Agent {
+
+    /** Доступ к [TokenCounter] для stage-агентов (мера C: bounded-усечение межартефактных передач). */
+    fun tokenCounter(): TokenCounter = tokenCounter
 
     private var history = mutableListOf<ChatMessage>()
     private var loaded = false
@@ -99,7 +105,11 @@ class ContextAwareAgent(
             println("⚠️ Warning: estimated $estimatedTokens tokens exceeds context limit ($contextLimit)")
         }
 
-        val request = ChatRequest(model = model, messages = messagesToSend)
+        val request = ChatRequest(
+            model = model,
+            messages = messagesToSend,
+            maxTokens = OutputBudget.maxTokensFor(estimatedTokens)   // мера A: бюджет под completion
+        )
         val result = llmClient.chat(request)
 
         return when (result) {
@@ -107,10 +117,27 @@ class ContextAwareAgent(
                 val usage = result.data.usage
                 tokenCounter.recordUsage(chatId, usage)
 
-                val assistantContent = result.data.choices.first().message.content
+                val choice = result.data.choices.first()
+                // Мера B: обрыв ответа по длине — НЕ сохраняем частичный ответ в history/артефакт,
+                // бросаем типизированный сигнал (isTruncated) для auto-continue в оркестраторе.
+                if (choice.finishReason == "length") {
+                    throw LlmCallException.truncated(choice.message.content)
+                }
+
+                val assistantContent = choice.message.content
+                // Мера D1: при активной задаче артефакт уже лежит (будет лежать) в TaskState и явно
+                // инжектируется следующей стадией через StageContext. В history достаточно усечённой
+                // копии — убираем дублирование, раздувавшее контекст (полный implementation в history
+                // съедал окно → обрыв). Полный assistantContent возвращается как артефакт стадии.
+                val taskActive = getTaskState() != null
+                val forHistory = if (taskActive) {
+                    truncateToTokens(assistantContent, ArtifactLimits.HISTORY_STAGE_MSG_TOKENS)
+                } else {
+                    assistantContent
+                }
                 val assistantMsg = ChatMessage(
                     role = "assistant",
-                    content = assistantContent,
+                    content = forHistory,
                     parentId = userMsg.id
                 )
                 history.add(assistantMsg)

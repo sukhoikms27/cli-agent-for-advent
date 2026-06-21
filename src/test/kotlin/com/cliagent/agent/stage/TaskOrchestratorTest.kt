@@ -451,4 +451,48 @@ class TaskOrchestratorTest {
         assertEquals(beforePlan, state?.approvedPlan)
         assertTrue(out.contains("Ошибка запроса к LLM"))
     }
+
+    // ── Мера B: auto-continue при обрыве ответа (finish_reason=length) ──
+
+    @Test
+    fun `truncation on first call then continue succeeds and persists full artifact`() = runTest {
+        val llm = routingLlm(classifierContent = "PLANNING", stageContent = "ignored")
+        val agent = ContextAwareAgent(llm, storeMock(), "m", "chat-1")
+        var call = 0
+        val orch = TaskOrchestrator(
+            agent, llm, "m",
+            chat = { _ ->
+                call++
+                if (call == 1) throw LlmCallException.truncated("частичный план")
+                else "1) Setup\n2) Impl"   // продолжение после continue
+            }
+        )
+
+        orch.startTask("сделай калькулятор")
+        val state = agent.getTaskState()
+
+        assertEquals(TaskStage.PLANNING, state?.stage)
+        // chatWithContinue сшил partial + продолжение
+        assertEquals("частичный план" + "1) Setup\n2) Impl", state?.approvedPlan)
+        assertEquals(true, state?.awaitingAdvance)
+    }
+
+    @Test
+    fun `truncation exhausting continuations yields error and does not persist artifact`() = runTest {
+        val llm = routingLlm(classifierContent = "PLANNING", stageContent = "ignored")
+        val agent = ContextAwareAgent(llm, storeMock(), "m", "chat-1")
+        val orch = TaskOrchestrator(
+            agent, llm, "m",
+            chat = { _ -> throw LlmCallException.truncated("partial") }   // всегда обрыв
+        )
+
+        val out = orch.startTask("сделай калькулятор")
+        val state = agent.getTaskState()
+
+        assertEquals(TaskStage.PLANNING, state?.stage)
+        assertEquals(null, state?.approvedPlan)            // артефакт НЕ персистится
+        assertEquals(false, state?.awaitingAdvance)
+        assertTrue(out.contains("слишком длинный"))        // truncation-exhausted hint
+        assertFalse(out.contains("Перейти к стадии"))      // переход не предлагается
+    }
 }

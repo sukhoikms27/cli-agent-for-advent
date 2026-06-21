@@ -1,5 +1,7 @@
 package com.cliagent.agent.stage
 
+import com.cliagent.llm.token.ArtifactLimits
+import com.cliagent.llm.token.truncateToTokens
 import com.cliagent.state.TaskKind
 import com.cliagent.state.TaskStage
 
@@ -77,8 +79,8 @@ class ExecutionStageAgent(
     }
 
     private fun buildRefinePrompt(feedback: String, currentImpl: String, profileBlock: String?): String = buildString {
-        append("Текущая реализация:\n").append(currentImpl.take(MAX_IMPL_CHARS))
-        append("\n\nОтзыв/уточнение пользователя:\n").append(feedback)
+        append("Текущая реализация:\n").append(truncateToTokens(currentImpl, ArtifactLimits.IMPLEMENTATION_TOKENS))
+        append("\n\nОтзыв/уточнение пользователя:\n").append(truncateToTokens(feedback, ArtifactLimits.FEEDBACK_TOKENS))
         profileBlock?.let { append("\n\n").append(it) }
         append("\n\nДай уточнённую реализацию с учётом отзыва.")
     }
@@ -90,9 +92,5 @@ class ExecutionStageAgent(
         TaskKind.WRITING -> "Напиши требуемый текст напрямую, шаг за шагом. Не пиши код."
         TaskKind.EXPLANATION -> "Объясни тему напрямую, шаг за шагом. Не пиши код, если он не требуется."
         null -> "Выполни задачу напрямую, шаг за шагом: код, если задача программная, иначе ответ/решение/пояснение."
-    }
-
-    private companion object {
-        const val MAX_IMPL_CHARS = 6000
     }
 }

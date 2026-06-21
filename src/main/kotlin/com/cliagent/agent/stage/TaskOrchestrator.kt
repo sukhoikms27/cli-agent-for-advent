@@ -1,6 +1,7 @@
 package com.cliagent.agent.stage
 
 import com.cliagent.agent.ContextAwareAgent
+import com.cliagent.agent.swarm.SwarmStageAgent
 import com.cliagent.llm.LlmCallException
 import com.cliagent.llm.LlmClient
 import com.cliagent.memory.UserProfile
@@ -50,7 +51,14 @@ class TaskOrchestrator(
     private val classifier: EntryStageClassifier = EntryStageClassifier(llmClient, model),
     private val taskKindClassifier: TaskKindClassifier = TaskKindClassifier(llmClient, model),
     private val confirmationClassifier: ConfirmationClassifier = ConfirmationClassifier(llmClient, model),
-    agents: Map<TaskStage, StageAgent> = defaultAgents(),
+    /**
+     * Часть 3: рой V4 на всех стадиях (true → [SwarmStageAgent]; false → простые stage-агенты).
+     * Default false — сохраняет простое поведение в тестах; ChatCommand включает рой (true),
+     * `--no-swarm` отключает. Рой дробит работу → bounded-контекст на worker → структурно убирает
+     * обрыв длинных артефактов.
+     */
+    swarm: Boolean = false,
+    agents: Map<TaskStage, StageAgent> = defaultAgents(swarm),
     /**
      * День 15 (gap №6): провайдер LLM-чата для stage-вызовов. Default — agent.chat (текущее
      * поведение). Wiring (ChatCommand) подставляет StatefulAgent.chat → инварианты покрывают
@@ -240,7 +248,8 @@ class TaskOrchestrator(
             verdict = current.verdict,
             profile = profile,
             feedback = feedback,
-            taskKind = current.taskKind
+            taskKind = current.taskKind,
+            tokenCounter = agent.tokenCounter()
         )
 
         val agentImpl = agents[stage]
@@ -253,8 +262,10 @@ class TaskOrchestrator(
         // LLM-сбой (таймаут/HTTP/мусор) — НЕ трактуем как готовый артефакт: не персистим,
         // не предлагаем переход. Стадия остаётся awaitingAdvance=false → пользователь может
         // повторить отправкой текста (drive перезапустит стадию с feedback) или через `/task`.
+        // Мера B: chat-делегат обёрнут в [chatWithContinue] — обрыв по finish_reason=length
+        // сшивается auto-continue; сюда попадает только исчерпание продолжений или иной сбой.
         return try {
-            val result = agentImpl.run(ctx) { userMsg -> chat(userMsg) }
+            val result = agentImpl.run(ctx) { userMsg -> chatWithContinue(userMsg) }
 
             // Сохраняем артефакт в соответствующее поле + awaitingAdvance
             val updated = storeArtifact(current, stage, result.artifact)
@@ -263,13 +274,51 @@ class TaskOrchestrator(
             result
         } catch (e: LlmCallException) {
             agent.setTaskState(current.copy(awaitingAdvance = false))
+            val hint = if (e.isTruncated) {
+                "⚠️ Ответ модели слишком длинный — не удалось завершить за $MAX_CONTINUATIONS " +
+                    "продолжений. Уточните задачу/разбейте стадию или используйте `/task`."
+            } else {
+                "⚠️ Ошибка запроса к LLM: ${e.message}"
+            }
             StageResult(
                 artifact = null,
-                display = "⚠️ Ошибка запроса к LLM: ${e.message}\n" +
-                    "Стадия не завершена. Отправьте сообщение, чтобы повторить, или используйте `/task`.",
+                display = "$hint\nСтадия не завершена. Отправьте сообщение, чтобы повторить, " +
+                    "или используйте `/task`.",
                 readyToAdvance = false
             )
         }
+    }
+
+    /**
+     * Мера B: chat-делегат с auto-continue. Ловит обрыв ответа по `finish_reason=length`
+     * ([LlmCallException.isTruncated]), копит частичный ответ и досылает continue-промпт.
+     * После [MAX_CONTINUATIONS] продолжений — повторно бросает truncated (попадёт в catch
+     * [runOneStage]). Не-truncated ошибки прокидывает как есть.
+     */
+    private suspend fun chatWithContinue(userMsg: String): String {
+        var accumulated = ""
+        var prompt = userMsg
+        var continuations = 0
+        while (true) {
+            val chunk: String = try {
+                chat(prompt)
+            } catch (e: LlmCallException) {
+                if (!e.isTruncated) throw e
+                if (continuations >= MAX_CONTINUATIONS) throw e   // исчерпали попытки
+                accumulated += e.partial.orEmpty()
+                continuations++
+                prompt = continuePrompt(userMsg, accumulated)
+                continue
+            }
+            return accumulated + chunk   // полный (или финальный) ответ
+        }
+    }
+
+    private fun continuePrompt(originalMessage: String, accumulated: String): String = buildString {
+        append("Продолжи ответ с места обрыва. НЕ повторяй уже написанное.\n\n")
+        append("Исходный запрос:\n").append(originalMessage.take(ORIGINAL_MSG_CHARS))
+        append("\n\nУже сгенерированная часть:\n").append(accumulated.take(ACCUMULATED_CHARS))
+        append("\n\nПродолжай дальше с того места, где обрывилось, не дублируя написанное.")
     }
 
     /** Кладёт артефакт стадии в соответствующее поле TaskState. */
@@ -296,13 +345,26 @@ class TaskOrchestrator(
         /** Разделитель между стадиями в AUTO-чейне (и в clarify→planning склейке). */
         private const val SEP = "\n\n---\n\n"
 
-        /** Реестр стадийных агентов по умолчанию (один агент на каждую стадию FSM). */
-        fun defaultAgents(): Map<TaskStage, StageAgent> = mapOf(
-            TaskStage.CLARIFY to ClarifyStageAgent(),
-            TaskStage.PLANNING to PlanningStageAgent(),
-            TaskStage.EXECUTION to ExecutionStageAgent(),
-            TaskStage.VALIDATION to ValidationStageAgent(),
-            TaskStage.DONE to DoneStageAgent()
-        )
+        /** Мера B: максимум auto-continue попыток при обрыве ответа по длине. */
+        private const val MAX_CONTINUATIONS = 2
+        private const val ORIGINAL_MSG_CHARS = 4000
+        private const val ACCUMULATED_CHARS = 8000
+
+        /**
+         * Реестр стадийных агентов по умолчанию. [swarm]=true → [SwarmStageAgent] на каждую стадию
+         * (рой V4); false → простые последовательные агенты (fallback/тесты).
+         */
+        fun defaultAgents(swarm: Boolean = false): Map<TaskStage, StageAgent> =
+            if (swarm) {
+                TaskStage.entries.associateWith { SwarmStageAgent(it) }
+            } else {
+                mapOf(
+                    TaskStage.CLARIFY to ClarifyStageAgent(),
+                    TaskStage.PLANNING to PlanningStageAgent(),
+                    TaskStage.EXECUTION to ExecutionStageAgent(),
+                    TaskStage.VALIDATION to ValidationStageAgent(),
+                    TaskStage.DONE to DoneStageAgent()
+                )
+            }
     }
 }

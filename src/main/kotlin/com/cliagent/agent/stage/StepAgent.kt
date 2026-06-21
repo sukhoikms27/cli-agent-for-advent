@@ -1,5 +1,7 @@
 package com.cliagent.agent.stage
 
+import com.cliagent.llm.token.ArtifactLimits
+import com.cliagent.llm.token.truncateToTokens
 import com.cliagent.state.TaskKind
 
 /**
@@ -30,11 +32,14 @@ class StepAgent {
     ): String {
         val message = buildString {
             append("Задача: ").append(taskDescription)
-            append("\n\nПолный план:\n").append(plan)
+            append("\n\nПолный план:\n").append(truncateToTokens(plan, ArtifactLimits.PLAN_IN_STEP_TOKENS))
             append("\n\nТекущий шаг (реализуй ТОЛЬКО его, не делай чужие шаги):\n").append(step)
             if (doneSteps.isNotEmpty()) {
+                // doneSteps линейно растут с числом шагов — обрезаем суммарно (мера C),
+                // сохраняя заголовки ранних шагов в начале.
+                val joined = doneSteps.mapIndexed { i, s -> "${i + 1}) $s" }.joinToString("\n")
                 append("\n\nУже сделанные шаги (контекст, не повторяй):\n")
-                doneSteps.forEachIndexed { i, s -> append("${i + 1}) $s\n") }
+                    .append(truncateToTokens(joined, ArtifactLimits.DONE_STEPS_TOTAL_TOKENS))
             }
             profileBlock?.let { append("\n").append(it) }
             append("\n\n").append(stepInstruction(taskKind))

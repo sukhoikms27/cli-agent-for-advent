@@ -2,7 +2,14 @@ package com.cliagent.memory
 
 import com.cliagent.config.AppPaths
 import com.cliagent.llm.model.ChatMessage
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import java.nio.file.Files
@@ -14,7 +21,7 @@ import java.util.UUID
 class JsonChatStore(
     private val chatsDir: Path = AppPaths.chatsDir,
     private val longTermStore: JsonLongTermStore = JsonLongTermStore()
-) : MemoryStore {
+) : MemoryStore, AutoCloseable {
 
     private val json = Json {
         ignoreUnknownKeys = true
@@ -23,36 +30,78 @@ class JsonChatStore(
         prettyPrint = true
     }
 
+    /**
+     * Единый writer-актор: все операции чтение-модификация-запись над чатами
+     * сериализуются в одну очередь. Без этого параллельные шаги (swarm) при
+     * read-modify-write теряют сообщения: оба читают один снимок, каждый
+     * дописывает своё и перезаписывает файл целиком — запись первого теряется.
+     * Чтения идут напрямую: atomicWrite (temp + rename) гарантирует целостный
+     * снимок, поэтому читателям сериализация не нужна.
+     */
+    private val writerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val writeQueue = Channel<WriteOp<*>>(Channel.UNLIMITED)
+
+    private class WriteOp<T>(
+        val action: suspend () -> T,
+        val result: CompletableDeferred<T>
+    )
+
+    init {
+        writerScope.launch {
+            for (op in writeQueue) {
+                @Suppress("UNCHECKED_CAST")
+                val typed = op as WriteOp<Any?>
+                try {
+                    typed.result.complete(typed.action())
+                } catch (e: CancellationException) {
+                    typed.result.completeExceptionally(e)
+                    throw e
+                } catch (e: Throwable) {
+                    typed.result.completeExceptionally(e)
+                }
+            }
+        }
+    }
+
+    /** Останавливает writer-актор. Pending-операции добиваются (channel дренируется при close). */
+    override fun close() {
+        writeQueue.close()
+        writerScope.cancel()
+    }
+
+    /** Ставит RMW-операцию в очередь актора и ждёт её выполнения. */
+    private suspend fun <T> submit(action: suspend () -> T): T {
+        val result = CompletableDeferred<T>()
+        writeQueue.send(WriteOp(action, result))
+        return result.await()
+    }
+
     private suspend fun ensureDir() = withContext(Dispatchers.IO) {
         Files.createDirectories(chatsDir)
     }
 
-    override suspend fun saveMessage(chatId: String, message: ChatMessage) {
+    override suspend fun saveMessage(chatId: String, message: ChatMessage) = submit {
         ensureDir()
-        withContext(Dispatchers.IO) {
-            val chatData = loadChatInternal(chatId) ?: return@withContext
-            val updated = chatData.copy(
-                messages = chatData.messages + message,
-                updatedAt = Instant.now().toString()
-            )
-            atomicWrite(chatFile(chatId), json.encodeToString(ChatData.serializer(), updated))
-        }
+        val chatData = loadChatInternal(chatId) ?: return@submit
+        val updated = chatData.copy(
+            messages = chatData.messages + message,
+            updatedAt = Instant.now().toString()
+        )
+        atomicWrite(chatFile(chatId), json.encodeToString(ChatData.serializer(), updated))
     }
 
     override suspend fun loadHistory(chatId: String): List<ChatMessage> {
         return loadChat(chatId)?.messages ?: emptyList()
     }
 
-    override suspend fun clearHistory(chatId: String) {
+    override suspend fun clearHistory(chatId: String) = submit {
         ensureDir()
-        withContext(Dispatchers.IO) {
-            val chatData = loadChatInternal(chatId) ?: return@withContext
-            val updated = chatData.copy(
-                messages = emptyList(),
-                updatedAt = Instant.now().toString()
-            )
-            atomicWrite(chatFile(chatId), json.encodeToString(ChatData.serializer(), updated))
-        }
+        val chatData = loadChatInternal(chatId) ?: return@submit
+        val updated = chatData.copy(
+            messages = emptyList(),
+            updatedAt = Instant.now().toString()
+        )
+        atomicWrite(chatFile(chatId), json.encodeToString(ChatData.serializer(), updated))
     }
 
     override suspend fun listChats(): List<ChatData> {
@@ -73,7 +122,7 @@ class JsonChatStore(
         }
     }
 
-    override suspend fun createChat(): ChatData {
+    override suspend fun createChat(): ChatData = submit {
         ensureDir()
         val now = Instant.now().toString()
         val chatData = ChatData(
@@ -83,67 +132,57 @@ class JsonChatStore(
             createdAt = now,
             updatedAt = now
         )
-        withContext(Dispatchers.IO) {
-            atomicWrite(chatFile(chatData.id), json.encodeToString(ChatData.serializer(), chatData))
-        }
-        return chatData
+        atomicWrite(chatFile(chatData.id), json.encodeToString(ChatData.serializer(), chatData))
+        chatData
     }
 
-    override suspend fun deleteChat(chatId: String) {
-        withContext(Dispatchers.IO) {
-            Files.deleteIfExists(chatFile(chatId))
-        }
+    override suspend fun deleteChat(chatId: String) = submit<Unit> {
+        Files.deleteIfExists(chatFile(chatId))
     }
 
     override suspend fun loadChat(chatId: String): ChatData? {
         return withContext(Dispatchers.IO) { loadChatInternal(chatId) }
     }
 
-    override suspend fun saveSummary(chatId: String, summary: String) {
+    override suspend fun saveSummary(chatId: String, summary: String) = submit {
         ensureDir()
-        withContext(Dispatchers.IO) {
-            val chatData = loadChatInternal(chatId) ?: return@withContext
-            val updated = chatData.copy(
-                summary = summary,
-                updatedAt = Instant.now().toString()
-            )
-            atomicWrite(chatFile(chatId), json.encodeToString(ChatData.serializer(), updated))
-        }
+        val chatData = loadChatInternal(chatId) ?: return@submit
+        val updated = chatData.copy(
+            summary = summary,
+            updatedAt = Instant.now().toString()
+        )
+        atomicWrite(chatFile(chatId), json.encodeToString(ChatData.serializer(), updated))
     }
 
     override suspend fun loadSummary(chatId: String): String? {
         return loadChat(chatId)?.summary
     }
 
-    override suspend fun clearSummary(chatId: String) {
+    override suspend fun clearSummary(chatId: String) = submit {
         ensureDir()
-        withContext(Dispatchers.IO) {
-            val chatData = loadChatInternal(chatId) ?: return@withContext
-            val updated = chatData.copy(
-                summary = null,
-                updatedAt = Instant.now().toString()
-            )
-            atomicWrite(chatFile(chatId), json.encodeToString(ChatData.serializer(), updated))
-        }
+        val chatData = loadChatInternal(chatId) ?: return@submit
+        val updated = chatData.copy(
+            summary = null,
+            updatedAt = Instant.now().toString()
+        )
+        atomicWrite(chatFile(chatId), json.encodeToString(ChatData.serializer(), updated))
     }
 
-    override suspend fun saveFacts(chatId: String, facts: Map<String, String>) {
+    override suspend fun saveFacts(chatId: String, facts: Map<String, String>) = submit {
         ensureDir()
-        withContext(Dispatchers.IO) {
-            val chatData = loadChatInternal(chatId) ?: return@withContext
-            val updated = chatData.copy(
-                facts = facts,
-                updatedAt = Instant.now().toString()
-            )
-            atomicWrite(chatFile(chatId), json.encodeToString(ChatData.serializer(), updated))
-        }
+        val chatData = loadChatInternal(chatId) ?: return@submit
+        val updated = chatData.copy(
+            facts = facts,
+            updatedAt = Instant.now().toString()
+        )
+        atomicWrite(chatFile(chatId), json.encodeToString(ChatData.serializer(), updated))
     }
 
     override suspend fun loadFacts(chatId: String): Map<String, String> {
         return loadChat(chatId)?.facts ?: emptyMap()
     }
 
-    override suspend fun createBranch(chatId: String, name: String, leafMessageId: String?, fromIndex: Int): BranchData {
+    override suspend fun createBranch(chatId: String, name: String, leafMessageId: String?, fromIndex: Int): BranchData = submit {
         ensureDir()
         val branch = BranchData(
             id = "branch-${UUID.randomUUID()}",
@@ -152,60 +191,52 @@ class JsonChatStore(
             fromIndex = fromIndex,
             createdAt = Instant.now().toString()
         )
-        withContext(Dispatchers.IO) {
-            val chatData = loadChatInternal(chatId) ?: return@withContext
-            val updated = chatData.copy(
-                branches = chatData.branches + branch,
-                updatedAt = Instant.now().toString()
-            )
-            atomicWrite(chatFile(chatId), json.encodeToString(ChatData.serializer(), updated))
-        }
-        return branch
+        val chatData = loadChatInternal(chatId) ?: return@submit branch
+        val updated = chatData.copy(
+            branches = chatData.branches + branch,
+            updatedAt = Instant.now().toString()
+        )
+        atomicWrite(chatFile(chatId), json.encodeToString(ChatData.serializer(), updated))
+        branch
     }
 
     override suspend fun listBranches(chatId: String): List<BranchData> {
         return loadChat(chatId)?.branches ?: emptyList()
     }
 
-    override suspend fun deleteBranch(chatId: String, branchId: String) {
+    override suspend fun deleteBranch(chatId: String, branchId: String) = submit {
         ensureDir()
-        withContext(Dispatchers.IO) {
-            val chatData = loadChatInternal(chatId) ?: return@withContext
-            val updated = chatData.copy(
-                branches = chatData.branches.filter { it.id != branchId },
-                updatedAt = Instant.now().toString()
-            )
-            atomicWrite(chatFile(chatId), json.encodeToString(ChatData.serializer(), updated))
-        }
+        val chatData = loadChatInternal(chatId) ?: return@submit
+        val updated = chatData.copy(
+            branches = chatData.branches.filter { it.id != branchId },
+            updatedAt = Instant.now().toString()
+        )
+        atomicWrite(chatFile(chatId), json.encodeToString(ChatData.serializer(), updated))
     }
 
     // Working memory — per-chat (день 11)
-    override suspend fun saveWorkingMemory(chatId: String, memory: WorkingMemory) {
+    override suspend fun saveWorkingMemory(chatId: String, memory: WorkingMemory) = submit {
         ensureDir()
-        withContext(Dispatchers.IO) {
-            val chatData = loadChatInternal(chatId) ?: return@withContext
-            val updated = chatData.copy(
-                workingMemory = memory,
-                updatedAt = Instant.now().toString()
-            )
-            atomicWrite(chatFile(chatId), json.encodeToString(ChatData.serializer(), updated))
-        }
+        val chatData = loadChatInternal(chatId) ?: return@submit
+        val updated = chatData.copy(
+            workingMemory = memory,
+            updatedAt = Instant.now().toString()
+        )
+        atomicWrite(chatFile(chatId), json.encodeToString(ChatData.serializer(), updated))
     }
 
     override suspend fun loadWorkingMemory(chatId: String): WorkingMemory? {
         return loadChat(chatId)?.workingMemory
     }
 
-    override suspend fun clearWorkingMemory(chatId: String) {
+    override suspend fun clearWorkingMemory(chatId: String) = submit {
         ensureDir()
-        withContext(Dispatchers.IO) {
-            val chatData = loadChatInternal(chatId) ?: return@withContext
-            val updated = chatData.copy(
-                workingMemory = null,
-                updatedAt = Instant.now().toString()
-            )
-            atomicWrite(chatFile(chatId), json.encodeToString(ChatData.serializer(), updated))
-        }
+        val chatData = loadChatInternal(chatId) ?: return@submit
+        val updated = chatData.copy(
+            workingMemory = null,
+            updatedAt = Instant.now().toString()
+        )
+        atomicWrite(chatFile(chatId), json.encodeToString(ChatData.serializer(), updated))
     }
 
     // Long-term memory — global (день 11), форвард в JsonLongTermStore
@@ -226,8 +257,16 @@ class JsonChatStore(
     private fun chatFile(chatId: String): Path = chatsDir.resolve("$chatId.json")
 
     private fun atomicWrite(target: Path, content: String) {
-        val tmp = target.resolveSibling(".${target.fileName}.tmp")
+        // Уникальный tmp-файл на вызов — защита от остаточной гонки, если когда-либо
+        // появится несериализованный путь записи (напрямую atomicWrite не зовётся снаружи,
+        // но дешёвый страховочный слой).
+        val tmp = target.resolveSibling(".${target.fileName}.${UUID.randomUUID()}.tmp")
         Files.writeString(tmp, content)
-        Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+        try {
+            Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+        } catch (e: Throwable) {
+            Files.deleteIfExists(tmp)
+            throw e
+        }
     }
 }

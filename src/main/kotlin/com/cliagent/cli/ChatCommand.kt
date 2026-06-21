@@ -56,6 +56,10 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         help = "Enforce project invariants: refuse violating requests, retry violating responses"
     ).flag("--no-invariants")
     private val noColor by option("--no-color", help = "Disable colored output").flag()
+    private val noSwarm by option(
+        "--no-swarm",
+        help = "Disable swarm agents (V4 lead+workers+integrate) on each stage; use simple sequential agents"
+    ).flag()
 
     /**
      * День 15 (п.4): кэшированная стадия для динамического лейбла спиннера.
@@ -140,6 +144,7 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         // печати блока → гарблинга нет. Блоки стадий печатаются progressive через onEmit.
         val orchestrator = TaskOrchestrator(
             agent, client, model,
+            swarm = !noSwarm,
             chat = { msg -> AppTerminal.withSpinner({ spinnerLabel() }) { statefulAgent.chat(msg) } }
         )
 
@@ -149,8 +154,9 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
 
         val invariantsLabel = if (invariantsEnabled) "ON" else "OFF"
         val compressLabel = if (compress) "ON" else "OFF"
+        val swarmLabel = if (noSwarm) "OFF" else "ON"
         val modeLabel = (agent.getWorkingMemory()?.interactionMode ?: InteractionMode.PLAN).name.lowercase()
-        AppTerminal.println("CLI Agent v0.8 | Chat: $chatId | Model: $model | Context: ${contextManager.getStrategy().getName()} | Compress: $compressLabel | Invariants: $invariantsLabel | Mode: $modeLabel")
+        AppTerminal.println("CLI Agent v0.8 | Chat: $chatId | Model: $model | Context: ${contextManager.getStrategy().getName()} | Compress: $compressLabel | Invariants: $invariantsLabel | Swarm: $swarmLabel | Mode: $modeLabel")
         AppTerminal.println("Type /help for commands, /exit to quit")
 
         val repl = ReplEngine()
