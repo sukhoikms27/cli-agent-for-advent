@@ -15,6 +15,7 @@ import com.cliagent.context.strategy.ContextStrategyType
 import com.cliagent.context.strategy.SlidingWindowStrategy
 import com.cliagent.context.strategy.StickyFactsStrategy
 import com.cliagent.context.strategy.SummaryStrategy
+import com.cliagent.llm.LlmCallException
 import com.cliagent.llm.OpenAiCompatibleClient
 import com.cliagent.llm.model.ReasoningStrategy
 import com.cliagent.llm.pricing.Pricing
@@ -255,7 +256,16 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         if (taskResponse != null) return taskResponse
 
         // День 14/15: свободный чат через StatefulAgent (инварианты opt-in --invariants).
-        val response = AppTerminal.withSpinner({ spinnerLabel() }) { statefulAgent.chat(input) }
+        // LLM-сбой (таймаут/HTTP) — раньше сворачивался в строку "Error: ..." и печатался как
+        // обычный ответ; теперь ContextAwareAgent.chat бросает LlmCallException — ловим тут,
+        // чтобы REPL не упал, а показал понятную ошибку.
+        val response = try {
+            AppTerminal.withSpinner({ spinnerLabel() }) { statefulAgent.chat(input) }
+        } catch (e: LlmCallException) {
+            val msg = "⚠️ Ошибка запроса к LLM: ${e.message}"
+            onEmit(msg)
+            return msg
+        }
         onEmit(response)
         return response
     }

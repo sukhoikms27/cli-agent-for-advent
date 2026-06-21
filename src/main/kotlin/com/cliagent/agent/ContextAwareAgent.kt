@@ -6,6 +6,7 @@ import com.cliagent.context.strategy.BranchingStrategy
 import com.cliagent.context.strategy.ContextStrategyType
 import com.cliagent.context.strategy.StickyFactsStrategy
 import com.cliagent.llm.LlmClient
+import com.cliagent.llm.LlmCallException
 import com.cliagent.llm.LlmResult
 import com.cliagent.llm.model.ChatMessage
 import com.cliagent.llm.model.ChatRequest
@@ -132,7 +133,7 @@ class ContextAwareAgent(
 
                 assistantContent
             }
-            is LlmResult.Error -> "Error: ${result.code} — ${result.message}"
+            is LlmResult.Error -> throw LlmCallException(result.code, result.message)
         }
     }
 

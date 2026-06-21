@@ -3,6 +3,7 @@ package com.cliagent.agent.stage
 import com.cliagent.agent.ContextAwareAgent
 import com.cliagent.agent.ProfileExtractor
 import com.cliagent.llm.LlmClient
+import com.cliagent.llm.LlmCallException
 import com.cliagent.llm.LlmResult
 import com.cliagent.llm.model.ChatMessage
 import com.cliagent.llm.model.ChatRequest
@@ -400,5 +401,54 @@ class TaskOrchestratorTest {
         orch.handleUserInput("ну не знаю")
 
         assertEquals(TaskStage.PLANNING, agent.getTaskState()?.stage)
+    }
+
+    // ── Обработка LLM-ошибок (таймаут/HTTP): сбой не трактуется как готовый артефакт ──
+
+    @Test
+    fun `LLM error during stage yields error result without advancing or persisting artifact`() = runTest {
+        // Классификатор → PLANNING (нужно для startTask); stage-вызов падает с LlmCallException.
+        val llm = routingLlm(classifierContent = "PLANNING", stageContent = "irrelevant")
+        val agent = ContextAwareAgent(llm, storeMock(), "m", "chat-1")
+        // chat-делегат имитирует сбой LLM (как ContextAwareAgent.chat на LlmResult.Error).
+        val orch = TaskOrchestrator(
+            agent, llm, "m",
+            chat = { _ -> throw LlmCallException(0, "Request timeout has expired") }
+        )
+
+        val out = orch.startTask("сделай калькулятор")
+        val state = agent.getTaskState()
+
+        // Стадия осталась PLANNING (не avanzed), артефакт НЕ персистился (план null),
+        // переход не предлагается.
+        assertEquals(TaskStage.PLANNING, state?.stage)
+        assertEquals(null, state?.approvedPlan)
+        assertEquals(false, state?.awaitingAdvance)
+        assertTrue(out.contains("Ошибка запроса к LLM"), "должен показать ошибку: $out")
+        assertFalse(out.contains("Перейти к стадии"), "не должен предлагать переход: $out")
+    }
+
+    @Test
+    fun `LLM error on handleUserInput keeps stage and lets user retry via feedback`() = runTest {
+        // Старт проходит нормально (план готов); затем повторный запуск стадии падает.
+        var fail = false
+        val llm = routingLlm(classifierContent = "PLANNING", stageContent = "1) Setup\n2) Impl")
+        val agent = ContextAwareAgent(llm, storeMock(), "m", "chat-1")
+        val orch = TaskOrchestrator(
+            agent, llm, "m",
+            chat = { _ -> if (fail) throw LlmCallException(0, "boom") else "1) Setup\n2) Impl" }
+        )
+
+        orch.startTask("сделай калькулятор")          // PLANNING, план готов
+        val beforePlan = agent.getTaskState()!!.approvedPlan
+        fail = true
+        val out = orch.handleUserInput("перепиши план")!!   // feedback → перегенерация → сбой
+        val state = agent.getTaskState()
+
+        assertEquals(TaskStage.PLANNING, state?.stage)
+        assertEquals(false, state?.awaitingAdvance)
+        // Прежний план сохранён (не затёрт мусором/ null при сбое)
+        assertEquals(beforePlan, state?.approvedPlan)
+        assertTrue(out.contains("Ошибка запроса к LLM"))
     }
 }

@@ -1,6 +1,7 @@
 package com.cliagent.agent.stage
 
 import com.cliagent.agent.ContextAwareAgent
+import com.cliagent.llm.LlmCallException
 import com.cliagent.llm.LlmClient
 import com.cliagent.memory.UserProfile
 import com.cliagent.state.InteractionMode
@@ -249,13 +250,26 @@ class TaskOrchestrator(
                 readyToAdvance = false
             )
 
-        val result = agentImpl.run(ctx) { userMsg -> chat(userMsg) }
+        // LLM-сбой (таймаут/HTTP/мусор) — НЕ трактуем как готовый артефакт: не персистим,
+        // не предлагаем переход. Стадия остаётся awaitingAdvance=false → пользователь может
+        // повторить отправкой текста (drive перезапустит стадию с feedback) или через `/task`.
+        return try {
+            val result = agentImpl.run(ctx) { userMsg -> chat(userMsg) }
 
-        // Сохраняем артефакт в соответствующее поле + awaitingAdvance
-        val updated = storeArtifact(current, stage, result.artifact)
-            .copy(awaitingAdvance = result.readyToAdvance)
-        agent.setTaskState(updated)
-        return result
+            // Сохраняем артефакт в соответствующее поле + awaitingAdvance
+            val updated = storeArtifact(current, stage, result.artifact)
+                .copy(awaitingAdvance = result.readyToAdvance)
+            agent.setTaskState(updated)
+            result
+        } catch (e: LlmCallException) {
+            agent.setTaskState(current.copy(awaitingAdvance = false))
+            StageResult(
+                artifact = null,
+                display = "⚠️ Ошибка запроса к LLM: ${e.message}\n" +
+                    "Стадия не завершена. Отправьте сообщение, чтобы повторить, или используйте `/task`.",
+                readyToAdvance = false
+            )
+        }
     }
 
     /** Кладёт артефакт стадии в соответствующее поле TaskState. */
