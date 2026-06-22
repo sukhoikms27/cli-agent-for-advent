@@ -97,11 +97,18 @@ class McpClient(private val command: List<String>) {
         process = null
     }
 
-    /** destroy (SIGTERM) → waitFor(2с) → destroyForcibly (паттерн stopProcess самого SDK). */
+    /**
+     * destroy (SIGTERM) → waitFor(2с) → destroyForcibly. Сначала убиваются descendant'ы:
+     * `npx` порождает `node`-сервер как дочерний процесс — убийство только `npx` оставляет
+     * node-ребёнка сиротой (orphan), копящийся от вызова к вызову. `ProcessHandle.descendants()`
+     * покрывает всё дерево (JDK 9+).
+     */
     private fun stopProcess() {
         val p = process ?: return
+        runCatching { p.descendants().forEach { it.destroyForcibly() } }
         p.destroy()
         if (!p.waitFor(2, TimeUnit.SECONDS)) p.destroyForcibly()
+        runCatching { p.descendants().forEach { it.destroyForcibly() } }
     }
 
     private fun Tool.toMcpTool(): McpTool = McpTool(
