@@ -916,8 +916,9 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                     return
                 }
 
-                val client = mcpClientFactory(command)
+                var client: McpClient? = null
                 try {
+                    client = mcpClientFactory(command)
                     AppTerminal.println("🔌 Connecting to MCP server: ${command.joinToString(" ")}")
                     AppTerminal.withSpinner("Connecting to MCP server…") { client.connect() }
                     val tools = client.listTools()
@@ -941,7 +942,7 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                     if (e is kotlinx.coroutines.CancellationException) throw e
                     AppTerminal.err("MCP failed: ${e.message}")
                 } finally {
-                    runCatching { client.close() }
+                    client?.let { runCatching { it.close() } }
                 }
             }
             else -> AppTerminal.println("Unknown /mcp command: ${parts[1]}. Use: list-tools")
