@@ -24,6 +24,8 @@ import com.cliagent.memory.LongTermMemory
 import com.cliagent.memory.MemoryStore
 import com.cliagent.memory.UserProfile
 import com.cliagent.memory.WorkingMemory
+import com.cliagent.mcp.McpClient
+import com.cliagent.mcp.McpException
 import com.cliagent.state.TaskStage
 import com.cliagent.state.TaskState
 import com.cliagent.state.TaskStateMachine
@@ -182,6 +184,7 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                 input.startsWith("/invariants") -> handleInvariants(input, agent)
                 input.startsWith("/task") -> handleTask(input, agent, orchestrator)
                 input.startsWith("/mode") -> handleMode(input, agent)
+                input.startsWith("/mcp") -> handleMcp(input, config.mcpCommand, ::McpClient)
                 input == "/reset" -> {
                     agent.reset()
                     AppTerminal.ok("History, summary, facts, branches, working memory cleared.")
@@ -364,6 +367,10 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             |  /mode <mode>          — Set mode: manual (chat-only, FSM via /task),
             |                          plan (default; stage-flow with confirmation),
             |                          auto (full automation; transitions without confirmation)
+            |  /mcp                  — Show MCP config status
+            |  /mcp list-tools      — Connect to configured MCP server & list its tools
+            |  /mcp list-tools <cmd…> — Override server command for this call
+            |                          (e.g. /mcp list-tools npx -y @modelcontextprotocol/server-filesystem <dir>)
             |  /reset               — Clear chat history, summary, facts, branches, working memory
             |  /exit                — Exit the program
             |
@@ -862,6 +869,90 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             }
             else -> AppTerminal.println("Unknown /invariants command: ${parts[1]}. Use: show, add, remove, clear")
         }
+    }
+
+    // ── /mcp: подключение к MCP-серверу и список инструментов (день 16) ──
+
+    /**
+     * `internal` для юнит-тестов (шов, как [dispatchFreeText]): конфиг-ветки и путь исключений
+     * покрываются без реального MCP-сервера. [mcpClientFactory] — DI-шов: в тестах подменяется
+     * фабрикой, бросающей [McpException], чтобы проверить, что REPL не падает при сбое subprocess.
+     */
+    internal suspend fun handleMcp(
+        input: String,
+        mcpCommand: String?,
+        mcpClientFactory: (List<String>) -> McpClient = ::McpClient
+    ) {
+        val parts = input.trim().split("\\s+".toRegex())
+        if (parts.size < 2) {
+            // /mcp — статус конфигурации
+            val src = when {
+                System.getenv("CLI_AGENT_MCP_COMMAND") != null -> "env CLI_AGENT_MCP_COMMAND"
+                mcpCommand != null -> "local.properties mcp.command"
+                else -> null
+            }
+            if (src != null) {
+                AppTerminal.println("🔌 MCP: command configured ($src).")
+                AppTerminal.println("   /mcp list-tools         — connect & list server tools")
+                AppTerminal.println("   /mcp list-tools <cmd…>  — override server command for this call")
+            } else {
+                AppTerminal.println("🔌 MCP: no command configured.")
+                AppTerminal.println("   Set CLI_AGENT_MCP_COMMAND env or mcp.command in local.properties,")
+                AppTerminal.println("   or pass inline: /mcp list-tools npx -y @modelcontextprotocol/server-filesystem <dir>")
+            }
+            return
+        }
+
+        when (parts[1]) {
+            "list-tools" -> {
+                // Override (parts.drop(2)) имеет приоритет; иначе — mcp.command из конфига.
+                val command: List<String> = if (parts.size >= 3) {
+                    parts.drop(2)
+                } else {
+                    mcpCommand?.takeIf { it.isNotBlank() }?.trim()?.split("\\s+".toRegex())
+                } ?: run {
+                    AppTerminal.warn("No MCP command. Configure mcp.command or pass inline:")
+                    AppTerminal.println("  /mcp list-tools npx -y @modelcontextprotocol/server-filesystem <dir>")
+                    return
+                }
+
+                val client = mcpClientFactory(command)
+                try {
+                    AppTerminal.println("🔌 Connecting to MCP server: ${command.joinToString(" ")}")
+                    AppTerminal.withSpinner("Connecting to MCP server…") { client.connect() }
+                    val tools = client.listTools()
+                    if (tools.isEmpty()) {
+                        AppTerminal.println("Server exposed 0 tools.")
+                        return
+                    }
+                    val tbl = table {
+                        captionTop("🔌 MCP Tools (${tools.size})")
+                        header { style(bold = true); row("#", "Name", "Description") }
+                        body {
+                            tools.forEachIndexed { i, t ->
+                                row("${i + 1}", t.name, truncateDesc(t.description))
+                            }
+                        }
+                    }
+                    AppTerminal.println(tbl)
+                } catch (e: McpException) {
+                    AppTerminal.err("MCP failed: ${e.message}")
+                } catch (e: Exception) {
+                    if (e is kotlinx.coroutines.CancellationException) throw e
+                    AppTerminal.err("MCP failed: ${e.message}")
+                } finally {
+                    runCatching { client.close() }
+                }
+            }
+            else -> AppTerminal.println("Unknown /mcp command: ${parts[1]}. Use: list-tools")
+        }
+    }
+
+    /** Description инструмента для таблицы: первая строка, обрезанная до ~80 символов. */
+    private fun truncateDesc(description: String?): String {
+        if (description.isNullOrBlank()) return ""
+        val firstLine = description.lineSequence().firstOrNull().orEmpty().trim()
+        return if (firstLine.length <= 80) firstLine else firstLine.take(80) + "…"
     }
 
     // ── /task: состояние задачи как конечный автомат (день 13) ──
