@@ -1,5 +1,6 @@
 package com.cliagent.memory
 
+import com.cliagent.state.InteractionMode
 import com.cliagent.state.TaskState
 import com.cliagent.state.invariant.Invariant
 import kotlinx.serialization.Serializable
@@ -26,11 +27,12 @@ data class WorkingMemory(
     val plan: String? = null,
     val scratchNotes: String? = null,
     val taskDecisions: List<String> = emptyList(),
-    val taskState: TaskState? = null   // день 13: состояние задачи (FSM)
+    val taskState: TaskState? = null,   // день 13: состояние задачи (FSM)
+    val interactionMode: InteractionMode = InteractionMode.PLAN   // день 15, п.3 (default = текущее поведение)
 ) {
     fun isEmpty(): Boolean =
         currentTask == null && plan == null && scratchNotes == null && taskDecisions.isEmpty() &&
-            taskState == null
+            taskState == null && interactionMode == InteractionMode.PLAN
 }
 
 /**

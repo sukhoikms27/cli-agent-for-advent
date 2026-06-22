@@ -50,8 +50,13 @@ class JsonLongTermStore(
     }
 
     private fun atomicWrite(target: Path, content: String) {
-        val tmp = target.resolveSibling(".${target.fileName}.tmp")
+        val tmp = target.resolveSibling(".${target.fileName}.${java.util.UUID.randomUUID()}.tmp")
         Files.writeString(tmp, content)
-        Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+        try {
+            Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+        } catch (e: Throwable) {
+            Files.deleteIfExists(tmp)
+            throw e
+        }
     }
 }

@@ -1,5 +1,7 @@
 package com.cliagent.agent.stage
 
+import com.cliagent.llm.token.ArtifactLimits
+import com.cliagent.llm.token.truncateToTokens
 import com.cliagent.state.TaskStage
 
 /**
@@ -17,9 +19,13 @@ class ValidationStageAgent : StageAgent {
     override suspend fun run(ctx: StageContext, chat: suspend (String) -> String): StageResult {
         val message = buildString {
             append("Задача: ").append(ctx.taskDescription)
-            append("\n\nУтверждённый план:\n").append(ctx.approvedPlan ?: "(план не задан)")
-            append("\n\nРеализация:\n").append(ctx.implementation?.take(MAX_CHARS) ?: "(нет реализации)")
-            ctx.feedback?.let { append("\n\nОтзыв при перепроверке:\n").append(it) }
+            append("\n\nУтверждённый план:\n")
+                .append(ctx.approvedPlan?.let { truncateToTokens(it, ArtifactLimits.PLAN_TOKENS) } ?: "(план не задан)")
+            append("\n\nРеализация:\n")
+                .append(ctx.implementation?.let { truncateToTokens(it, ArtifactLimits.IMPLEMENTATION_TOKENS) } ?: "(нет реализации)")
+            ctx.feedback?.let {
+                append("\n\nОтзыв при перепроверке:\n").append(truncateToTokens(it, ArtifactLimits.FEEDBACK_TOKENS))
+            }
             ctx.profileBlock?.let { append("\n\n").append(it) }
             append("\n\nПроверь реализацию против плана и ограничений. Найди дефекты, ")
                 .append("несоответствия, пропущенные шаги. НЕ добавляй новый функционал — ")
@@ -49,9 +55,5 @@ class ValidationStageAgent : StageAgent {
             display = if (passed) "✅ Проверка:\n\n$verdict" else "🟡 Проверка (найдены проблемы):\n\n$verdict",
             readyToAdvance = passed
         )
-    }
-
-    private companion object {
-        const val MAX_CHARS = 6000
     }
 }

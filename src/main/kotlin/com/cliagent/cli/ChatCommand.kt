@@ -2,9 +2,11 @@ package com.cliagent.cli
 
 import com.cliagent.agent.Agent
 import com.cliagent.agent.ContextAwareAgent
-import com.cliagent.agent.InvariantGuard
 import com.cliagent.agent.ProfileExtractor
+import com.cliagent.agent.StatefulAgent
+import com.cliagent.agent.stage.IntentClassifier
 import com.cliagent.agent.stage.TaskOrchestrator
+import com.cliagent.agent.stage.UserIntent
 import com.cliagent.config.ConfigRepository
 import com.cliagent.context.ContextManager
 import com.cliagent.context.HistoryCompressor
@@ -13,6 +15,7 @@ import com.cliagent.context.strategy.ContextStrategyType
 import com.cliagent.context.strategy.SlidingWindowStrategy
 import com.cliagent.context.strategy.StickyFactsStrategy
 import com.cliagent.context.strategy.SummaryStrategy
+import com.cliagent.llm.LlmCallException
 import com.cliagent.llm.OpenAiCompatibleClient
 import com.cliagent.llm.model.ReasoningStrategy
 import com.cliagent.llm.pricing.Pricing
@@ -24,6 +27,8 @@ import com.cliagent.memory.WorkingMemory
 import com.cliagent.state.TaskStage
 import com.cliagent.state.TaskState
 import com.cliagent.state.TaskStateMachine
+import com.cliagent.state.TransitionOutcome
+import com.cliagent.state.InteractionMode
 import com.cliagent.state.invariant.Invariant
 import com.cliagent.state.invariant.InvariantCategory
 import com.cliagent.state.invariant.LlmInvariantChecker
@@ -51,6 +56,26 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         help = "Enforce project invariants: refuse violating requests, retry violating responses"
     ).flag("--no-invariants")
     private val noColor by option("--no-color", help = "Disable colored output").flag()
+    private val noSwarm by option(
+        "--no-swarm",
+        help = "Disable swarm agents (V4 lead+workers+integrate) on each stage; use simple sequential agents"
+    ).flag()
+
+    /**
+     * День 15 (п.4): кэшированная стадия для динамического лейбла спиннера.
+     * `getTaskState()` — suspend, а render-лямбда спиннера non-suspend; обновляем перед каждым
+     * `withSpinner` из REPL-цикла. null → «Thinking…».
+     */
+    private var currentSpinnerStage: TaskStage? = null
+
+    /** День 15 (п.4): лейбл спиннера по текущей стадии. Never throws (safe для render-лямбды). */
+    private fun spinnerLabel(): String = when (currentSpinnerStage) {
+        null, TaskStage.CLARIFY -> if (currentSpinnerStage == null) "Thinking…" else "Clarifying…"
+        TaskStage.PLANNING -> "Planning…"
+        TaskStage.EXECUTION -> "Executing…"
+        TaskStage.VALIDATION -> "Validating…"
+        TaskStage.DONE -> "Finalizing…"
+    }
 
     override fun run() = runBlocking {
         if (noColor) AppTerminal.disableColor()
@@ -109,20 +134,29 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         // День 13 (авто-поток стадий): оркестратор автоматизирует /task start → артефакт стадии →
         // подтверждение перехода. Один StageAgent на каждую стадию FSM + StepAgent на каждый
         // пункт плана внутри execution. Свободный текст при активной задаче = подтверждение/уточнение.
-        val orchestrator = TaskOrchestrator(agent, client, model)
+        // День 15 (B, gap №6): оркестратор использует защищённый chat-провайдер от StatefulAgent →
+        // инварианты (если включены) покрывают и stage-поток, а не только свободный чат.
+        val checker = if (invariantsEnabled) LlmInvariantChecker(client, model) else null
+        val statefulAgent = StatefulAgent(agent, checker) { agent.getInvariants() }
+        // День 15 (progressive): спиннер на уровне одного stage-LLM-вызова. Каждый chat()-вызоз
+        // оркестратора крутит спиннер с лейблом текущей стадии (spinnerLabel читает
+        // currentSpinnerStage, который ставится через onStageStart); finally чистит кадр до
+        // печати блока → гарблинга нет. Блоки стадий печатаются progressive через onEmit.
+        val orchestrator = TaskOrchestrator(
+            agent, client, model,
+            swarm = !noSwarm,
+            chat = { msg -> AppTerminal.withSpinner({ spinnerLabel() }) { statefulAgent.chat(msg) } }
+        )
 
-        // День 14 (инварианты): decorator поверх агента для свободного чата (opt-in `--invariants`).
-        // Запрос-нарушитель → отказ без LLM; ответ-нарушитель → retry-loop. Slash-команды и
-        // orchestrator работают с базой (agent) напрямую — им нужны ContextAwareAgent-аксессоры.
-        val chatAgent: Agent = if (invariantsEnabled) {
-            InvariantGuard(agent, LlmInvariantChecker(client, model)) { agent.getInvariants() }
-        } else {
-            agent
-        }
+        // День 15 (п.1): авто-определение «простой вопрос vs задача» при отсутствии активной задачи
+        // и режиме ≠ MANUAL. QUESTION → обычный чат; TASK → автостарт FSM без /task start.
+        val intentClassifier = IntentClassifier(client, model)
 
         val invariantsLabel = if (invariantsEnabled) "ON" else "OFF"
         val compressLabel = if (compress) "ON" else "OFF"
-        AppTerminal.println("CLI Agent v0.7 | Chat: $chatId | Model: $model | Context: ${contextManager.getStrategy().getName()} | Compress: $compressLabel | Invariants: $invariantsLabel")
+        val swarmLabel = if (noSwarm) "OFF" else "ON"
+        val modeLabel = (agent.getWorkingMemory()?.interactionMode ?: InteractionMode.PLAN).name.lowercase()
+        AppTerminal.println("CLI Agent v0.8 | Chat: $chatId | Model: $model | Context: ${contextManager.getStrategy().getName()} | Compress: $compressLabel | Invariants: $invariantsLabel | Swarm: $swarmLabel | Mode: $modeLabel")
         AppTerminal.println("Type /help for commands, /exit to quit")
 
         val repl = ReplEngine()
@@ -147,31 +181,99 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                 input.startsWith("/profile") -> handleProfile(input, agent, client, model)
                 input.startsWith("/invariants") -> handleInvariants(input, agent)
                 input.startsWith("/task") -> handleTask(input, agent, orchestrator)
+                input.startsWith("/mode") -> handleMode(input, agent)
                 input == "/reset" -> {
                     agent.reset()
                     AppTerminal.ok("History, summary, facts, branches, working memory cleared.")
                 }
                 else -> {
-                    // День 13 (авто-поток): при активной задаче свободный текст = подтверждение
-                    // перехода («да») или уточнение артефакта текущей стадии. Иначе — обычный чат.
-                    val taskResponse = AppTerminal.withSpinner("Thinking…") {
-                        orchestrator.handleUserInput(input)
-                    }
-                    if (taskResponse != null) {
-                        AppTerminal.println()
-                        AppTerminal.markdown(taskResponse)
-                        AppTerminal.println()
-                    } else {
-                        // День 14: при --invariants свободный чат идёт через InvariantGuard
-                        // (отказ запроса-нарушителя + retry ответа-нарушителя).
-                        val response = AppTerminal.withSpinner("Thinking…") { chatAgent.chat(input) }
-                        AppTerminal.println()
-                        AppTerminal.markdown(response)
-                        AppTerminal.println()
-                    }
+                    // День 15 (progressive): каждый блок стадии печатается сразу через onEmit
+                    // по мере готовности; onStageStart ставит лейбл спиннера per-stage.
+                    dispatchFreeText(
+                        input, agent, statefulAgent, orchestrator, intentClassifier,
+                        onEmit = { block ->
+                            AppTerminal.println()
+                            AppTerminal.markdown(block)
+                            AppTerminal.println()
+                        },
+                        onStageStart = { stage -> currentSpinnerStage = stage }
+                    )
                 }
             }
         }
+    }
+
+    /**
+     * Диспетчеризация свободного текста (не slash-команды) — единый тестируемый шов stage-потока
+     * (день 15). Извлечён из `else`-ветки REPL, чтобы покрыть юнит-тестами логику без мока
+     * терминала: DONE-reset → авто-определение интента → автостарт FSM → stage-поток / обычный чат.
+     *
+     * I/O (печать, спиннер) остаются здесь, но они test-safe: mordant non-TTY no-op (см.
+     * MarkdownRenderTest), `withSpinner` под `runTest` не виснет. Возврат — markdown-строка для
+     * печати; null — ничего не выводить.
+     */
+    internal suspend fun dispatchFreeText(
+        input: String,
+        agent: ContextAwareAgent,
+        statefulAgent: StatefulAgent,
+        orchestrator: TaskOrchestrator,
+        intentClassifier: IntentClassifier,
+        onEmit: suspend (String) -> Unit = {},
+        onStageStart: (TaskStage) -> Unit = {}
+    ): String? {
+        var taskState = agent.getTaskState()
+        val mode = agent.getWorkingMemory()?.interactionMode ?: InteractionMode.PLAN
+
+        // День 15 (follow-up): завершённая задача (DONE) в режиме ≠ MANUAL — сбросить FSM,
+        // чтобы новое сообщение прошло обычную классификацию интента (новая задача vs вопрос),
+        // а не ушло как feedback в DoneStageAgent. MANUAL не трогаем — там FSM через /task.
+        if (taskState != null && taskState.stage == TaskStage.DONE &&
+            mode != InteractionMode.MANUAL
+        ) {
+            agent.setTaskState(null)
+            taskState = null
+        }
+
+        // День 15 (progressive): сброс лейбла спиннера → «Thinking…» для classify/chat-ветки;
+        // stage-флоу выставит свою стадию через onStageStart.
+        currentSpinnerStage = null
+
+        // День 15 (п.1): при отсутствии активной задачи и режиме ≠ MANUAL — авто-определение
+        // интента. QUESTION → обычный чат; TASK → автостарт жизненного цикла FSM.
+        if (taskState == null && mode != InteractionMode.MANUAL) {
+            val intent = AppTerminal.withSpinner({ spinnerLabel() }) {
+                intentClassifier.classify(input)
+            }
+            if (intent == UserIntent.TASK) {
+                val w = agent.getWorkingMemory() ?: WorkingMemory()
+                agent.setWorkingMemory(w.copy(currentTask = input))
+                // Спиннер — в chat-делегате оркестратора (per LLM-вызов); блоки печатаются
+                // progressive через onEmit. Возврат = сцепленная строка (caller в проде игнорирует).
+                return orchestrator.startTask(input, mode, onEmit = onEmit, onStageStart = onStageStart)
+            }
+            // QUESTION → обычный чат ниже
+        }
+
+        // День 13 (авто-поток): при активной задаче свободный текст = подтверждение
+        // перехода («да») или уточнение артефакта текущей стадии. Иначе — обычный чат.
+        // День 15 (п.3): режим передаётся — AUTO авто-advance без подтверждения.
+        val taskResponse = orchestrator.handleUserInput(input, mode, onEmit = onEmit, onStageStart = onStageStart)
+        currentSpinnerStage = agent.getTaskState()?.stage
+        if (taskResponse != null) return taskResponse
+
+        // День 14/15: свободный чат через StatefulAgent (инварианты opt-in --invariants).
+        // LLM-сбой (таймаут/HTTP) — раньше сворачивался в строку "Error: ..." и печатался как
+        // обычный ответ; теперь ContextAwareAgent.chat бросает LlmCallException — ловим тут,
+        // чтобы REPL не упал, а показал понятную ошибку.
+        val response = try {
+            AppTerminal.withSpinner({ spinnerLabel() }) { statefulAgent.chat(input) }
+        } catch (e: LlmCallException) {
+            val msg = "⚠️ Ошибка запроса к LLM: ${e.message}"
+            onEmit(msg)
+            return msg
+        }
+        onEmit(response)
+        return response
     }
 
     private fun createStrategy(
@@ -244,7 +346,9 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             |  /task start <text>    — Start a task: auto-selects first stage (clarify/planning),
             |                          generates its artifact via LLM, then asks to confirm advancing
             |  /task next            — Advance to next stage (manual escape hatch)
-            |  /task set <stage>     — Force-set stage (clarify, planning, execution, validation, done)
+            |  /task set <stage>     — Set stage (clarify, planning, execution, validation, done).
+            |                          Hard mode: illegal/artifact-missing transitions are blocked;
+            |                          use --force (or -f) to override and jump.
             |  /task step <text>     — Set current step
             |  /task expect <text>   — Set expected action
             |  /task plan <text>     — Set approved plan (planning artifact)
@@ -256,6 +360,10 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             |  Note: after /task start the agent drives the flow — just type «да» to advance,
             |        or any other text to refine the current artifact. One stage = one agent;
             |        each plan step runs its own step-agent. /task next & /task set are escape hatches.
+            |  /mode                 — Show interaction mode (manual/plan/auto)
+            |  /mode <mode>          — Set mode: manual (chat-only, FSM via /task),
+            |                          plan (default; stage-flow with confirmation),
+            |                          auto (full automation; transitions without confirmation)
             |  /reset               — Clear chat history, summary, facts, branches, working memory
             |  /exit                — Exit the program
             |
@@ -758,6 +866,32 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
 
     // ── /task: состояние задачи как конечный автомат (день 13) ──
 
+    /**
+     * День 15 (п.3): показать/сменить режим взаимодействия (MANUAL/PLAN/AUTO).
+     * Режим хранится в [WorkingMemory.interactionMode] (per-chat, персистится). Default PLAN.
+     */
+    private suspend fun handleMode(input: String, agent: ContextAwareAgent) {
+        val parts = input.trim().split("\\s+".toRegex())
+        val w = agent.getWorkingMemory() ?: WorkingMemory()
+        when {
+            parts.size == 1 || parts[1] == "show" -> {
+                AppTerminal.println("Interaction mode: ${w.interactionMode.name.lowercase()}")
+                AppTerminal.println("  manual — свободный чат; FSM только через /task")
+                AppTerminal.println("  plan   — stage-поток с подтверждением переходов (default)")
+                AppTerminal.println("  auto   — полная автоматизация; переходы без подтверждения")
+            }
+            parts[1] in listOf("manual", "plan", "auto") -> {
+                val newMode = InteractionMode.valueOf(parts[1].uppercase())
+                agent.setWorkingMemory(w.copy(interactionMode = newMode))
+                AppTerminal.ok("Interaction mode set to: ${newMode.name.lowercase()}")
+            }
+            else -> {
+                AppTerminal.println("Usage: /mode [manual|plan|auto]")
+                AppTerminal.println("Unknown mode: ${parts[1]}. Use: manual, plan, auto")
+            }
+        }
+    }
+
     private suspend fun handleTask(input: String, agent: ContextAwareAgent, orchestrator: TaskOrchestrator) {
         val parts = input.trim().split("\\s+".toRegex())
         if (parts.size < 2 || parts[1] == "show") {
@@ -798,10 +932,17 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                 // Запасной ручной путь — /task set <stage>.
                 val w = agent.getWorkingMemory() ?: WorkingMemory()
                 agent.setWorkingMemory(w.copy(currentTask = desc))
-                val display = AppTerminal.withSpinner("Thinking…") { orchestrator.startTask(desc) }
-                AppTerminal.println()
-                AppTerminal.markdown(display)
-                AppTerminal.println()
+                // День 15 (progressive): блоки стадий печатаются по мере готовности через onEmit.
+                currentSpinnerStage = null
+                orchestrator.startTask(
+                    desc, w.interactionMode,
+                    onEmit = { block ->
+                        AppTerminal.println()
+                        AppTerminal.markdown(block)
+                        AppTerminal.println()
+                    },
+                    onStageStart = { stage -> currentSpinnerStage = stage }
+                )
             }
             "next" -> {
                 val cur = agent.getTaskState()
@@ -809,22 +950,27 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                     AppTerminal.println("No active task. Use: /task start <description>")
                     return
                 }
-                // Artifact-gate (доработка Day 13, Вариант 2): переход вперёд только когда
-                // артефакт стадии готов. Escape hatch — /task set <stage> (force).
-                if (!TaskStateMachine.canAdvance(cur)) {
-                    AppTerminal.warn("Stage ${cur.stage.name.lowercase()} not ready: missing artifact. ${gateHint(cur.stage)}")
+                // День 15: единая точка перехода через TransitionGuard (структурная + артефактная
+                // проверки). next() всегда даёт легальный forward-canonical → Illegal невозможен.
+                val nextStage = TaskStateMachine.next(cur.stage)
+                if (nextStage == null) {
+                    AppTerminal.warn("No next stage from ${cur.stage.name.lowercase()} (already done?).")
                     return
                 }
-                val updated = agent.advanceTaskState()
-                if (updated == null) {
-                    AppTerminal.warn("No next stage from ${cur.stage.name.lowercase()} (already done?).")
-                } else {
-                    AppTerminal.ok("Advanced to stage: ${updated.stage.name.lowercase()}")
+                when (val outcome = agent.attemptTransition(nextStage)) {
+                    is TransitionOutcome.Allowed ->
+                        AppTerminal.ok("Advanced to stage: ${outcome.newState.stage.name.lowercase()}")
+                    is TransitionOutcome.ArtifactMissing ->
+                        AppTerminal.warn("Stage ${cur.stage.name.lowercase()} not ready: missing artifact. ${outcome.hint}")
+                    is TransitionOutcome.Illegal ->
+                        // невозможно: next() всегда даёт легальный forward; защита от будущих изменений
+                        AppTerminal.warn("⛔ Blocked: illegal transition ${cur.stage.name.lowercase()}→${nextStage.name.lowercase()}.")
+                    null -> AppTerminal.println("No active task. Use: /task start <description>")
                 }
             }
             "set" -> {
                 if (parts.size < 3) {
-                    AppTerminal.println("Usage: /task set <clarify|planning|execution|validation|done>")
+                    AppTerminal.println("Usage: /task set <clarify|planning|execution|validation|done> [--force]")
                     return
                 }
                 val cur = agent.getTaskState()
@@ -832,17 +978,29 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                     AppTerminal.println("No active task. Use: /task start <description>")
                     return
                 }
+                // День 15 (п.1 доработки): жёсткий режим. --force (или -f) — осознанный escape.
+                val stageArg = parts[2]
                 val stage = try {
-                    TaskStage.valueOf(parts[2].uppercase())
+                    TaskStage.valueOf(stageArg.uppercase())
                 } catch (e: IllegalArgumentException) {
-                    AppTerminal.println("Unknown stage: ${parts[2]}. Use: clarify, planning, execution, validation, done")
+                    AppTerminal.println("Unknown stage: $stageArg. Use: clarify, planning, execution, validation, done")
                     return
                 }
-                if (!TaskStateMachine.isAllowed(cur.stage, stage)) {
-                    AppTerminal.warn("Illegal transition ${cur.stage.name.lowercase()}→${stage.name.lowercase()}; forcing anyway.")
+                val force = parts.any { it.equals("--force", ignoreCase = true) || it == "-f" }
+                when (val outcome = agent.attemptTransition(stage, force)) {
+                    is TransitionOutcome.Allowed ->
+                        AppTerminal.ok("Stage set to: ${outcome.newState.stage.name.lowercase()}" +
+                            if (force) " (forced)" else "")
+                    is TransitionOutcome.Illegal -> {
+                        val targets = outcome.allowedTargets.joinToString(", ") { it.name.lowercase() }
+                        AppTerminal.warn("⛔ Blocked: illegal transition ${outcome.from.name.lowercase()}→" +
+                            "${outcome.to.name.lowercase()}. Allowed: $targets. Use --force to override.")
+                    }
+                    is TransitionOutcome.ArtifactMissing ->
+                        AppTerminal.warn("⛔ Blocked: stage ${outcome.from.name.lowercase()} not ready " +
+                            "(missing artifact). ${outcome.hint} Use --force to override.")
+                    null -> AppTerminal.println("No active task. Use: /task start <description>")
                 }
-                agent.setTaskState(TaskStateMachine.forceSet(cur, stage))
-                AppTerminal.ok("Stage set to: ${stage.name.lowercase()}")
             }
             "step" -> {
                 val text = parts.drop(2).joinToString(" ").trim()
@@ -932,17 +1090,22 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                     AppTerminal.println("No active task. Use: /task start <description>")
                     return
                 }
-                if (cur.stage == TaskStage.VALIDATION) {
-                    // Уважаем artifact-gate: из validation → done только при готовом verdict.
-                    if (!TaskStateMachine.canAdvance(cur)) {
-                        AppTerminal.warn("Stage validation not ready: missing artifact. ${gateHint(cur.stage)}")
-                        return
+                // День 15: единая точка через TransitionGuard. Из VALIDATION — артефактный gate
+                // (нужен verdict); из других стадий — Illegal (надо пройти VALIDATION); escape —
+                // /task set done --force (явный, не здесь).
+                when (val outcome = agent.attemptTransition(TaskStage.DONE)) {
+                    is TransitionOutcome.Allowed ->
+                        AppTerminal.ok("Task done. (stage: ${outcome.newState.stage.name.lowercase()})")
+                    is TransitionOutcome.ArtifactMissing ->
+                        AppTerminal.warn("⛔ Blocked: validation not ready (missing verdict). ${outcome.hint} " +
+                            "Use /task set done --force to override.")
+                    is TransitionOutcome.Illegal -> {
+                        val targets = outcome.allowedTargets.joinToString(", ") { it.name.lowercase() }
+                        AppTerminal.warn("⛔ Blocked: cannot finish from ${cur.stage.name.lowercase()}. " +
+                            "Reach VALIDATION first. Allowed from here: $targets. " +
+                            "Use /task set done --force to override.")
                     }
-                    val updated = agent.advanceTaskState()
-                    AppTerminal.ok("Task done. (stage: ${updated?.stage?.name?.lowercase() ?: "done"})")
-                } else {
-                    agent.setTaskState(TaskStateMachine.forceSet(cur, TaskStage.DONE))
-                    AppTerminal.ok("Task done. (forced from ${cur.stage.name.lowercase()})")
+                    null -> AppTerminal.println("No active task. Use: /task start <description>")
                 }
             }
             "reset" -> {
@@ -951,13 +1114,5 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             }
             else -> AppTerminal.println("Unknown /task command: ${parts[1]}. Use: show, start, next, set, step, expect, plan, impl, verdict, back, done, reset")
         }
-    }
-
-    /** Подсказка, какой артефакт нужен для перехода со стадии (для hard-block warn). */
-    private fun gateHint(stage: TaskStage): String = when (stage) {
-        TaskStage.PLANNING -> "Set approved plan: /task plan <text>"
-        TaskStage.EXECUTION -> "Set implementation: /task impl <text>"
-        TaskStage.VALIDATION -> "Set verdict: /task verdict <text>"
-        else -> "Use /task set <stage> to force a transition."
     }
 }

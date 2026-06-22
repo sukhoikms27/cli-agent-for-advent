@@ -42,3 +42,42 @@ class TokenCounter {
         sessionStats.remove(sessionId)
     }
 }
+
+/**
+ * Оценка числа токенов в произвольной строке (без overhead-константы сообщения) — для
+ * межартефактных передач и усечения. Та же эвристика ~4 символа/токен, что в [TokenCounter].
+ */
+fun estimateTokens(text: String): Int = text.length / 4
+
+/**
+ * Обрезать строку до <= [maxTokens] (по оценке ~4 символа/токен), добавив [marker] при усечении.
+ * Если оценка уже в пределах лимита — возвращается без изменений.
+ *
+ * Используется для bounded-контекста при межстадийных передачах артефактов (мера C),
+ * см. [ArtifactLimits].
+ */
+fun truncateToTokens(text: String, maxTokens: Int, marker: String = "\n…[усечено]…"): String {
+    if (text.isEmpty() || maxTokens <= 0) return if (maxTokens <= 0) marker else text
+    if (estimateTokens(text) <= maxTokens) return text
+    val charLimit = maxTokens * 4
+    return text.take(charLimit) + marker
+}
+
+/**
+ * Единый источник лимитов межстадийных передач артефактов (мера C) в токенах. Заменяет
+ * разбросанные символьные `MAX_CHARS` (4000/6000) в stage-агентах. Оценка ~4 символа/токен.
+ *
+ * Лимитируются **входные** передачи (артефакт кормит следующую стадию); сам создаваемый
+ * артефакт хранится в [com.cliagent.state.TaskState] целиком.
+ */
+object ArtifactLimits {
+    const val PLAN_TOKENS = 2_000              // approvedPlan → execution/validation
+    const val IMPLEMENTATION_TOKENS = 4_000    // implementation → validation/done
+    const val VERDICT_TOKENS = 2_000           // verdict → done
+    const val REQUIREMENTS_TOKENS = 2_000      // requirements → planning
+    const val FEEDBACK_TOKENS = 1_500          // feedback → любая стадия
+    const val DONE_SUMMARY_INPUT = 3_000       // каждый артефакт в done
+    const val DONE_STEPS_TOTAL_TOKENS = 2_000  // суммарно по всем doneSteps в StepAgent
+    const val PLAN_IN_STEP_TOKENS = 2_000      // полный план в контексте шага
+    const val HISTORY_STAGE_MSG_TOKENS = 1_000 // copy stage-сообщения в history (мера D1)
+}

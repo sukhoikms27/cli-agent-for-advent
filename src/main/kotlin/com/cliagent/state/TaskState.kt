@@ -51,5 +51,6 @@ data class TaskState(
     val verdict: String? = null,            // артефакт validation (доработка Day 13)
     val stageHistory: List<StageTransition> = emptyList(),
     val awaitingAdvance: Boolean = false,   // ждёт подтверждения перехода (авто-поток, Day 13)
-    val requirements: String? = null        // артефакт clarify (сводка требований, Day 13)
+    val requirements: String? = null,       // артефакт clarify (сводка требований, Day 13)
+    val taskKind: TaskKind? = null          // тип задачи (Day 15 фикс #1): ветвит EXECUTION-промпт
 )

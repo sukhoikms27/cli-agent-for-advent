@@ -6,6 +6,7 @@ import com.cliagent.context.strategy.BranchingStrategy
 import com.cliagent.context.strategy.ContextStrategyType
 import com.cliagent.context.strategy.StickyFactsStrategy
 import com.cliagent.llm.LlmClient
+import com.cliagent.llm.LlmCallException
 import com.cliagent.llm.LlmResult
 import com.cliagent.llm.model.ChatMessage
 import com.cliagent.llm.model.ChatRequest
@@ -13,7 +14,10 @@ import com.cliagent.llm.model.PromptTemplates
 import com.cliagent.llm.model.ReasoningStrategy
 import com.cliagent.llm.model.StagePromptTemplates
 import com.cliagent.llm.model.SystemPrompts
+import com.cliagent.llm.token.ArtifactLimits
+import com.cliagent.llm.token.OutputBudget
 import com.cliagent.llm.token.TokenCounter
+import com.cliagent.llm.token.truncateToTokens
 import com.cliagent.memory.LongTermMemory
 import com.cliagent.memory.MemoryStore
 import com.cliagent.memory.UserProfile
@@ -21,6 +25,9 @@ import com.cliagent.memory.WorkingMemory
 import com.cliagent.state.invariant.Invariant
 import com.cliagent.state.TaskState
 import com.cliagent.state.TaskStateMachine
+import com.cliagent.state.TaskStage
+import com.cliagent.state.TransitionGuard
+import com.cliagent.state.TransitionOutcome
 
 class ContextAwareAgent(
     private val llmClient: LlmClient,
@@ -36,6 +43,9 @@ class ContextAwareAgent(
     private val profileExtractor: ProfileExtractor? = null,
     private val autoProfileEvery: Int = 0   // 0 = авто-извлечение профиля выключено
 ) : Agent {
+
+    /** Доступ к [TokenCounter] для stage-агентов (мера C: bounded-усечение межартефактных передач). */
+    fun tokenCounter(): TokenCounter = tokenCounter
 
     private var history = mutableListOf<ChatMessage>()
     private var loaded = false
@@ -95,7 +105,11 @@ class ContextAwareAgent(
             println("⚠️ Warning: estimated $estimatedTokens tokens exceeds context limit ($contextLimit)")
         }
 
-        val request = ChatRequest(model = model, messages = messagesToSend)
+        val request = ChatRequest(
+            model = model,
+            messages = messagesToSend,
+            maxTokens = OutputBudget.maxTokensFor(estimatedTokens)   // мера A: бюджет под completion
+        )
         val result = llmClient.chat(request)
 
         return when (result) {
@@ -103,10 +117,27 @@ class ContextAwareAgent(
                 val usage = result.data.usage
                 tokenCounter.recordUsage(chatId, usage)
 
-                val assistantContent = result.data.choices.first().message.content
+                val choice = result.data.choices.first()
+                // Мера B: обрыв ответа по длине — НЕ сохраняем частичный ответ в history/артефакт,
+                // бросаем типизированный сигнал (isTruncated) для auto-continue в оркестраторе.
+                if (choice.finishReason == "length") {
+                    throw LlmCallException.truncated(choice.message.content)
+                }
+
+                val assistantContent = choice.message.content
+                // Мера D1: при активной задаче артефакт уже лежит (будет лежать) в TaskState и явно
+                // инжектируется следующей стадией через StageContext. В history достаточно усечённой
+                // копии — убираем дублирование, раздувавшее контекст (полный implementation в history
+                // съедал окно → обрыв). Полный assistantContent возвращается как артефакт стадии.
+                val taskActive = getTaskState() != null
+                val forHistory = if (taskActive) {
+                    truncateToTokens(assistantContent, ArtifactLimits.HISTORY_STAGE_MSG_TOKENS)
+                } else {
+                    assistantContent
+                }
                 val assistantMsg = ChatMessage(
                     role = "assistant",
-                    content = assistantContent,
+                    content = forHistory,
                     parentId = userMsg.id
                 )
                 history.add(assistantMsg)
@@ -129,7 +160,7 @@ class ContextAwareAgent(
 
                 assistantContent
             }
-            is LlmResult.Error -> "Error: ${result.code} — ${result.message}"
+            is LlmResult.Error -> throw LlmCallException(result.code, result.message)
         }
     }
 
@@ -138,7 +169,7 @@ class ContextAwareAgent(
         // иначе reasoningStrategy → иначе статический systemPrompt (поведение Day 1-13).
         val taskState = getTaskState()
         val baseSystem = when {
-            taskState != null -> StagePromptTemplates.buildSystemMessage(taskState.stage)
+            taskState != null -> StagePromptTemplates.buildSystemMessage(taskState.stage, taskState.taskKind)
             reasoningStrategy != null -> PromptTemplates.buildSystemMessage(reasoningStrategy)
             else -> systemPrompt
         }
@@ -286,13 +317,45 @@ class ContextAwareAgent(
         setWorkingMemory(w.copy(taskState = state))
     }
 
-    /** Канонический переход вперёд ([TaskStateMachine.next]); null если некуда/нет задачи. */
+    /**
+     * Канонический переход вперёд ([TaskStateMachine.next]); null если некуда/нет задачи.
+     *
+     * День 15: делегирует в [attemptTransition] (единый путь через guard). `next(stage)` всегда
+     * возвращает легальный forward-canonical переход, поэтому outcome = Allowed или ArtifactMissing
+     * (Illegal невозможен). При ArtifactMissing — поведение как раньше: состояние не меняется,
+     * возвращается null (канонический advance «не состоялся»). Для машиночитаемой причины блокировки
+     * используй [attemptTransition] напрямую.
+     */
     suspend fun advanceTaskState(note: String? = null): TaskState? {
         val cur = getTaskState() ?: return null
         val nextStage = TaskStateMachine.next(cur.stage) ?: return null
-        val updated = TaskStateMachine.transition(cur, nextStage, note)
-        setTaskState(updated)
-        return updated
+        val outcome = attemptTransition(nextStage)
+        return when (outcome) {
+            is TransitionOutcome.Allowed -> outcome.newState
+            is TransitionOutcome.ArtifactMissing,
+            is TransitionOutcome.Illegal,
+            null -> null
+        }
+    }
+
+    /**
+     * Контролируемый переход через [TransitionGuard] (день 15).
+     *
+     * Единая точка перехода для CLI/оркестратора: проверяет легальность + артефакт, возвращает
+     * типобезопасный [TransitionOutcome]. При [TransitionOutcome.Allowed] — персистит новое состояние.
+     * При Illegal/ArtifactMissing — состояние НЕ меняется, потребитель сам решает реакцию.
+     *
+     * @param to    целевая стадия
+     * @param force осознанный escape (note="forced" в history); обходит все правила
+     * @return outcome перехода; null если нет активной задачи (taskState == null)
+     */
+    suspend fun attemptTransition(to: TaskStage, force: Boolean = false): TransitionOutcome? {
+        val cur = getTaskState() ?: return null
+        val outcome = TransitionGuard.attempt(cur, to, force)
+        if (outcome is TransitionOutcome.Allowed) {
+            setTaskState(outcome.newState)
+        }
+        return outcome
     }
 
     /** Откат на одну стадию назад по history; null если история пуста/нет задачи. */

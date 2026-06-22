@@ -1,5 +1,7 @@
 package com.cliagent.agent.stage
 
+import com.cliagent.llm.token.ArtifactLimits
+import com.cliagent.llm.token.truncateToTokens
 import com.cliagent.state.TaskStage
 
 /**
@@ -15,9 +17,12 @@ class PlanningStageAgent : StageAgent {
     override suspend fun run(ctx: StageContext, chat: suspend (String) -> String): StageResult {
         val message = buildString {
             append("Задача: ").append(ctx.taskDescription)
-            ctx.requirements?.let { append("\n\nТребования:\n").append(it) }
+            ctx.requirements?.let {
+                append("\n\nТребования:\n").append(truncateToTokens(it, ArtifactLimits.REQUIREMENTS_TOKENS))
+            }
             ctx.feedback?.let {
-                append("\n\nУточнение к плану (учти при переработке):\n").append(it)
+                append("\n\nУточнение к плану (учти при переработке):\n")
+                    .append(truncateToTokens(it, ArtifactLimits.FEEDBACK_TOKENS))
             }
             ctx.profileBlock?.let { append("\n\n").append(it) }
             append("\n\nПострой конкретный пошаговый план выполнения задачи. ")

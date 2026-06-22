@@ -1,5 +1,7 @@
 package com.cliagent.agent.stage
 
+import com.cliagent.llm.token.ArtifactLimits
+import com.cliagent.llm.token.truncateToTokens
 import com.cliagent.state.TaskStage
 
 /**
@@ -20,8 +22,12 @@ class ClarifyStageAgent : StageAgent {
     override suspend fun run(ctx: StageContext, chat: suspend (String) -> String): StageResult {
         val message = buildString {
             append("Задача: ").append(ctx.taskDescription)
-            ctx.requirements?.let { append("\n\nУже уточнено:\n").append(it) }
-            ctx.feedback?.let { append("\n\nОтветы пользователя:\n").append(it) }
+            ctx.requirements?.let {
+                append("\n\nУже уточнено:\n").append(truncateToTokens(it, ArtifactLimits.REQUIREMENTS_TOKENS))
+            }
+            ctx.feedback?.let {
+                append("\n\nОтветы пользователя:\n").append(truncateToTokens(it, ArtifactLimits.FEEDBACK_TOKENS))
+            }
             ctx.profileBlock?.let { append("\n\n").append(it) }
             append("\n\nПроанализируй задачу. Если требований достаточно для построения плана, ")
                 .append("начни ответ со слова [CLEAR] и затем дай краткую сводку уточнённых требований ")

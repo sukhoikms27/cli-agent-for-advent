@@ -30,9 +30,9 @@ class OpenAiCompatibleClient(
             json(json)
         }
         install(HttpTimeout) {
-            requestTimeoutMillis = 60_000
+            requestTimeoutMillis = 120_000
             connectTimeoutMillis = 10_000
-            socketTimeoutMillis = 60_000
+            socketTimeoutMillis = 120_000
         }
     }
 

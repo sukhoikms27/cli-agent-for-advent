@@ -60,16 +60,33 @@ object AppTerminal {
     /**
      * Крутит спиннер с [label], пока выполняется [block] (LLM-вызов и т.п.).
      *
+     * День 15 (п.4): делегирует в [withSpinner] с [labelProvider] — статичный лейбл как частный
+     * случай. Обратно совместимо: существующие call-sites `withSpinner("Thinking…") { ... }` не
+     * меняются.
+     *
      * mordant `Animation` сам ничего не выводит на non-interactive терминале (piped stdin),
      * поэтому спиннер не garble'ит вывод в пайпах; на TTY рисует кадры в одной строке.
      *
      * `CancellationException` не глотаем: finally отменяет джобу и чистит кадр,
      * затем исключение пробрасывается стандартно.
      */
-    suspend fun <T> withSpinner(label: String, block: suspend () -> T): T = coroutineScope {
+    suspend fun <T> withSpinner(label: String, block: suspend () -> T): T =
+        withSpinner({ label }, block)
+
+    /**
+     * Крутит спиннер с динамическим [labelProvider], пока выполняется [block] (день 15, п.4).
+     *
+     * В отличие от overload-а со статичным [String], [labelProvider] вызывается на каждом кадре —
+     * лейбл отражает текущую стадию/действие (thinking/planning/executing/validating/…). Источник
+     * метки — состояние агента (см. ChatCommand.spinnerLabel, задача 22).
+     *
+     * mordant `Animation` сам ничего не выводит на non-interactive терминале; на TTY рисует кадры
+     * в одной строке. `CancellationException` пробрасывается после очистки кадра.
+     */
+    suspend fun <T> withSpinner(labelProvider: () -> String, block: suspend () -> T): T = coroutineScope {
         val frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
         val animation = t.textAnimation<Int> { tick ->
-            "${frames[tick % frames.length]} $label"
+            "${frames[tick % frames.length]} ${labelProvider()}"
         }
         val job = launch {
             var tick = 0
