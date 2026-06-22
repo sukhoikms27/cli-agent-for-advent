@@ -23,7 +23,10 @@ class ConfigRepository {
             ?: localProps.getProperty("base.url")
             ?: "https://api.z.ai/api/coding/paas/v4"
 
-        return AppConfig(apiKey = apiKey, model = model, baseUrl = baseUrl)
+        val mcpCommand = System.getenv("CLI_AGENT_MCP_COMMAND")
+            ?: localProps.getProperty("mcp.command")
+
+        return AppConfig(apiKey = apiKey, model = model, baseUrl = baseUrl, mcpCommand = mcpCommand)
     }
 
     private fun loadLocalProperties(): Properties {
