@@ -11,7 +11,7 @@ repositories {
     mavenCentral()
 }
 
-val ktorVersion = "3.1.3"
+val ktorVersion = "3.4.3"
 val kotlinxSerializationVersion = "1.11.0"
 val kotlinxCoroutinesVersion = "1.11.0"
 val kotlinIoVersion = "0.9.0"
@@ -43,6 +43,9 @@ dependencies {
 
     // JLine3 — REPL input (история, completion, редактирование строк, сигналы)
     implementation("org.jline:jline:3.29.0")
+
+    // MCP — Model Context Protocol client (официальный Kotlin SDK, день 16)
+    implementation("io.modelcontextprotocol:kotlin-sdk-client:0.13.0")
 
     // Testing (день 11)
     testImplementation(platform("org.junit:junit-bom:5.12.2"))
