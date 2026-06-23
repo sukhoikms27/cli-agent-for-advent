@@ -1,6 +1,6 @@
 plugins {
-    kotlin("jvm") version "2.1.21"
-    kotlin("plugin.serialization") version "2.1.21"
+    kotlin("jvm") version "2.3.21"
+    kotlin("plugin.serialization") version "2.3.21"
     application
 }
 
@@ -11,9 +11,10 @@ repositories {
     mavenCentral()
 }
 
-val ktorVersion = "3.1.3"
-val kotlinxSerializationVersion = "1.8.1"
-val kotlinxCoroutinesVersion = "1.10.2"
+val ktorVersion = "3.4.3"
+val kotlinxSerializationVersion = "1.11.0"
+val kotlinxCoroutinesVersion = "1.11.0"
+val kotlinIoVersion = "0.9.0"
 
 dependencies {
     // Ktor HTTP client
@@ -28,6 +29,12 @@ dependencies {
     // kotlinx.coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:$kotlinxCoroutinesVersion")
 
+    // kotlinx-io — Source/Sink для MCP stdio-транспорта (день 16)
+    implementation("org.jetbrains.kotlinx:kotlinx-io-core:$kotlinIoVersion")
+
+    // SLF4J-бэкенд для MCP SDK (io.github.oshai:kotlin-logging); runtime-only
+    runtimeOnly("org.slf4j:slf4j-simple:2.0.18")
+
     // clikt — CLI framework
     implementation("com.github.ajalt.clikt:clikt:4.4.0")
 
@@ -36,6 +43,9 @@ dependencies {
 
     // JLine3 — REPL input (история, completion, редактирование строк, сигналы)
     implementation("org.jline:jline:3.29.0")
+
+    // MCP — Model Context Protocol client (официальный Kotlin SDK, день 16)
+    implementation("io.modelcontextprotocol:kotlin-sdk-client:0.13.0")
 
     // Testing (день 11)
     testImplementation(platform("org.junit:junit-bom:5.12.2"))
