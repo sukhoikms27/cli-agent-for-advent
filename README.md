@@ -6,7 +6,7 @@
 
 **Текущая фаза:** Неделя 3 — stateful-агент (Days 11–15): трёхслойная память (short/working/long-term), FSM задач (clarify → planning → execution → validation → done), авто-извлечение профиля, проектные инварианты с runtime-enforcement, рой агентов (swarm: lead + workers + integrate) на каждой стадии.
 
-Подробности архитектуры — в [`plan/global-plan.md`](plan/global-plan.md). Известные проблемы — в [`critical-issues.md`](critical-issues.md), [`arch-issues.md`](arch-issues.md), [`oop-issues.md`](oop-issues.md), [`bugs.md`](bugs.md).
+Подробности архитектуры — в [`plan/global-plan.md`](plan/finisheddays/day-16/global-plan.md). Известные проблемы — в [`critical-issues.md`](critical-issues.md), [`arch-issues.md`](arch-issues.md), [`oop-issues.md`](oop-issues.md), [`bugs.md`](bugs.md).
 
 ---
 
@@ -124,4 +124,4 @@ Infrastructure (JSON files, Ktor, Config)
 `MemoryStore` (impl `JsonChatStore`), `Agent` (+ decoration: `StatefulAgent`, `InvariantGuard`),
 `StageAgent` (5 stage-impl + `SwarmStageAgent`), `InvariantChecker` (impl `LlmInvariantChecker`).
 
-Структура пакетов и фазы развития — в [`CLAUDE.md`](CLAUDE.md) и [`plan/global-plan.md`](plan/global-plan.md).
+Структура пакетов и фазы развития — в [`CLAUDE.md`](CLAUDE.md) и [`plan/global-plan.md`](plan/finisheddays/day-16/global-plan.md).
