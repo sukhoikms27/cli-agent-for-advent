@@ -346,7 +346,7 @@ This project fulfills the AI Advent Challenge #8 assignments. Each phase maps to
 - **Schema evolution:** add fields with defaults, never remove — old JSON always loads
 - **Testing:** JUnit 5 + MockK for unit, `cmd.parse()` for clikt, `runTest` for coroutines
 - **Logging:** use kotlin.io or add kotlinx-logging if needed
-- **Git:** conventional commits (feat:, fix:, refactor:, chore:)
+- **Git:** totally blocks git usage
 - **CLI output:** data → stdout, errors → stderr, colors via mordant
 
 ## Environment Variables
