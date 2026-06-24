@@ -346,7 +346,7 @@ This project fulfills the AI Advent Challenge #8 assignments. Each phase maps to
 - **Schema evolution:** add fields with defaults, never remove — old JSON always loads
 - **Testing:** JUnit 5 + MockK for unit, `cmd.parse()` for clikt, `runTest` for coroutines
 - **Logging:** use kotlin.io or add kotlinx-logging if needed
-- **Git:** conventional commits (feat:, fix:, refactor:, chore:)
+- **Git:** totally blocks git usage
 - **CLI output:** data → stdout, errors → stderr, colors via mordant
 
 ## Environment Variables
@@ -356,3 +356,6 @@ This project fulfills the AI Advent Challenge #8 assignments. Each phase maps to
 - `CLI_AGENT_BASE_URL` — API base URL (default: https://api.z.ai/api/coding/paas/v4)
 - `XDG_DATA_HOME` — data directory override (default: ~/.local/share)
 - `XDG_CONFIG_HOME` — config directory override (default: ~/.config)
+
+### Agent info
+- use ast-index tool every time, when you need to find out anything in project

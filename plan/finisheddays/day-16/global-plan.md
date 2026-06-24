@@ -24,7 +24,8 @@
 | **Streaming** | Фаза 2 (SSE через Ktor, инкрементальный рендер через mordant live-line) |
 | **Стиль CLI** | REPL по умолчанию + CLI-аргументы для подкоманд |
 | **TUI-стратегия** | JLine3 + mordant (внедрено); kotter (декларативный live-TUI) — отложен до потребности в live-панелях todo/tool-use |
-| **Выполненные задания курса** | Дни 1–11 (API-вызов → формат → рассуждения → температура → модели → агент → контекст → токены → сжатие → 4 стратегии → модель памяти: short/working/long-term layers) |
+| **Выполненные задания курса** | Дни 1–17 (API-вызов → формат → рассуждения → температура → модели → агент → контекст → токены → сжатие → 4 стратегии → модель памяти: short/working/long-term layers → Day 16: MCP-соединение + tools/list по stdio → Day 17: свой MCP-сервер (GitHub `get_repo`) + agent tool-use loop через LLM function-calling) |
+| **MCP-интеграция** | Model Context Protocol Kotlin SDK 0.13.0; local stdio transport (subprocess через npx); REPL-команда `/mcp`; remote Streamable HTTP — отложен |
 
 ---
 
@@ -57,6 +58,11 @@
 **Принцип разделения:** Каждый слой общается только с соседним снизу.
 CLI не знает про LLM — он вызывает Agent. Agent не знает про JSON-хранилище —
 он вызывает MemoryStore. Это позволяет менять реализации без каскадных правок.
+
+> **MCP-интеграция (`mcp/`)** — внешний слой: Agent/CLI вызывает `McpClient` (stdio transport →
+> subprocess MCP-сервер). MCP-сервер запускается по команде из `AppConfig.mcpCommand`
+> (env/local.properties). В Week 04 подключение per-invocation; persistent-соединение и `callTool` —
+> Day 17+.
 
 ---
 
@@ -122,6 +128,11 @@ src/main/kotlin/com/cliagent/
 │   ├── StateMachine.kt               #   Стейт-машина с переходами
 │   └── InvariantChecker.kt           #   Программная проверка инвариантов
 │
+├── mcp/                              # ── MCP Integration Layer (день 16) ──
+│   ├── McpClient.kt                 #   Обёртка над MCP SDK: stdio transport, connect/listTools/close
+│   ├── McpTool.kt                   #   Доменная модель инструмента (name, description, inputSchema)
+│   └── McpException.kt              #   Ошибка MCP-соединения/handshake
+│
 └── config/                           # ── Infrastructure ──
     ├── AppConfig.kt                  #   Data class конфигурации
     └── ConfigRepository.kt           #   Загрузка/сохранение конфига
@@ -137,6 +148,7 @@ src/main/kotlin/com/cliagent/
 | `context/` | Управление контекстным окном: 4 стратегии, инкрементальное сжатие | `llm/model/` (ChatMessage), `memory/` |
 | `memory/` | Персистентность: история, профиль, факты, ветки, memory layers (JSON-файлы) | — |
 | `state/` | Стейт-машина задач, инварианты | — |
+| `mcp/` | MCP-интеграция: подключение к MCP-серверу (stdio), discovery tools через `tools/list` | `config/` (mcpCommand) |
 | `config/` | Загрузка конфигурации из env/файлов | — |
 
 ---
@@ -353,6 +365,24 @@ sealed class InvariantResult {
 }
 ```
 
+### McpClient (день 16)
+
+```kotlin
+class McpClient(command: List<String>) {
+    suspend fun connect()                    // запуск subprocess + handshake (withTimeout 30s)
+    suspend fun listTools(): List<McpTool>   // tools/list → доменная McpTool
+    suspend fun close()                      // graceful JSON-RPC close + stopProcess
+}
+```
+
+> **Реализация:** stdio transport (`StdioClientTransport`): subprocess запускается через
+> `ProcessBuilder(command)`, JSON-RPC идёт по stdin/stdout, stderr drained отдельно (иначе
+> pipe-deadlock). **Не `AutoCloseable`** — `close()` suspend, поэтому вызывается явно в `finally`
+> (без `use{}`). `inputSchema` хранится как JSON-строка (`McpTool.inputSchema`), рендер схемы
+> отложен (Day 17). `stopProcess` = `destroy → waitFor(2s) → destroyForcibly` (паттерн SDK).
+> Команда сервера — из `AppConfig.mcpCommand` (env `CLI_AGENT_MCP_COMMAND` / `local.properties`
+> `mcp.command`) либо inline override `/mcp list-tools <cmd…>`.
+
 ---
 
 ## 5. План реализации по фазам
@@ -497,6 +527,35 @@ $ ./cli-agent
 
 ---
 
+### Фаза 5: MCP (Неделя 4 = Дни 16–20)
+
+| Шаг | Что делаем | День курса | Артефакт |
+|---|---|---|---|
+| 5.1 | MCP-соединение + `tools/list` (local stdio, subprocess) | День 16 ✅ | `mcp/McpClient.kt`, `mcp/McpTool.kt`, `mcp/McpException.kt`, `/mcp` в `ChatCommand`, `mcpCommand` в `AppConfig` |
+| 5.2 | Собственный MCP-сервер вокруг API + `callTool` из агента | День 17 ✅ | `:mcp-server` субпроект (`GitHubMcpServer`, `get_repo`), `McpClient.callTool`+`McpToolResult`, `ToolExecutor`/`McpToolExecutor`, function-calling (`ToolDefinition`/`ToolCall`, `ChatRequest.tools`), agent tool-use loop в `ContextAwareAgent` |
+| 5.3 | Оркестрация нескольких tools в агенте | День 18 | (планируется) |
+| 5.4 | MCP в реальной рабочей задаче | День 19 | (планируется) |
+| 5.5 | Сравнение MCP vs Skill+CLI (token flow) | День 20 | (планируется) |
+
+**Результат дня 16:** `/mcp list-tools` подключается к subprocess MCP-серверу (reference
+`@modelcontextprotocol/server-filesystem` через `npx`), выводит mordant-таблицу инструментов;
+`/mcp` показывает статус конфигурации. Без вызова tools, без LLM API.
+
+```
+$ ./gradlew run --args="chat"
+cli-agent> /mcp
+MCP: no command configured (set CLI_AGENT_MCP_COMMAND or mcp.command)
+cli-agent> /mcp list-tools npx -y @modelcontextprotocol/server-filesystem /tmp
+Connecting to MCP server…
+┌─ 🔌 MCP Tools (8) ──────────────────────┐
+│ # │ Name              │ Description      │
+│ 1 │ read_file         │ …                │
+│ … │ list_directory    │ …                │
+└──────────────────────────────────────────┘
+```
+
+---
+
 ## 6. LLM API Details
 
 ### Провайдер
@@ -572,6 +631,8 @@ $ ./cli-agent
 | `CLI_AGENT_API_KEY` | z.ai API ключ | — (обязательная) |
 | `CLI_AGENT_MODEL` | Имя модели | `glm-5.1` |
 | `CLI_AGENT_BASE_URL` | API base URL | `https://api.z.ai/api/coding/paas/v4` |
+| `CLI_AGENT_MCP_COMMAND` | Команда запуска MCP-сервера (subprocess, stdio) | — (опциональная; иначе `/mcp list-tools <cmd…>` inline) |
+| `CLI_AGENT_GITHUB_TOKEN` | GitHub PAT для `:mcp-server` (`get_repo`); наследуется subprocess'ом | — (опциональная; без неё `get_repo` возвращает tool-error) |
 | `XDG_DATA_HOME` | Каталог данных (чаты + long-term память) | `~/.local/share` (→ `cli-agent/chats/*.json`, `cli-agent/longterm/memory.json`) |
 | `XDG_CONFIG_HOME` | Каталог конфигурации | `~/.config` |
 
@@ -589,54 +650,3 @@ $ ./cli-agent
 | **Тестирование** | JUnit 5 + MockK для unit-тестов |
 | **Логирование** | kotlin.io или kotlinx-logging при необходимости |
 | **Git** | Conventional commits: `feat:`, `fix:`, `refactor:`, `chore:` |
-
----
-
-## 9. Отличия от Android-реализации
-
-> Подробное сравнение: `plan/changelog-android-diff.md`
-
-При проектировании CLI-агента использовался референс Android-проекта
-[llm-chat-demo-app](https://github.com/sukhoikms27/llm-chat-demo-app).
-Ключевые отличия, учтённые в плане:
-
-| Компонент | Android | CLI (этот проект) |
-|---|---|---|
-| HTTP-клиент | Retrofit + OkHttp | Ktor CIO |
-| Хранилище | Room (ORM, SQLite) | JSON-файлы (без SQLite) |
-| DI | Hilt | Без DI (ручное создание) |
-| Сериализация хранения | Room annotations | kotlinx.serialization JSON (один файл на чат + global long-term) |
-| Обработка ошибок | try/catch | `LlmResult<T>` sealed class |
-| UI | Jetpack Compose | clikt REPL |
-| Модели | Конкретные IDs (glm-5.1, glm-5...) | То же + тир-система (WEAK/MEDIUM/STRONG) |
-| Бенчмарк | Нет | `BenchmarkRunner` |
-| Стриминг | SSE через OkHttp | Phase 2 (интерфейс заложен) |
-| Количество стратегий | 4 (SlidingWindow, StickyFacts, Summary, Branching) | 4 (то же) |
-| Ветвление | Персистентное (Room) | Персистентное (JSON в `ChatData.branches`) |
-| Миграции хранилища | 7 Room-миграций | Без миграций — эволюция схемы через defaults в data class (`ignoreUnknownKeys=true`) |
-
-**Что позаимствовано из Android (принято):**
-- `GenerationPresets` — объединённые пресеты (без GenerationConfig)
-- `parentId` в ChatMessage — дерево сообщений для ветвления
-- `Pricing` объект — расчёт стоимости по моделям
-- Инкрементальная суммаризация — предыдущий summary + новые сообщения
-- `SummaryStrategy` — суммаризация как полноценная стратегия
-- `needsCompression()` + `getDescription()` — в интерфейсе ContextStrategy
-- Персистентное ветвление — таблица dialog_branches
-- `cachedTokens` — учёт кешированных токенов
-- Эволюция схемы через defaults — без миграций БД (вместо инкрементальных SQLite-миграций Android)
-- Конкретные z.ai model IDs и тир-система
-
-**Что отвергнуто (не подходит CLI):**
-- ~~`GenerationConfig`~~ — в CLI флаги → ChatRequest напрямую, отдельный слой без потребителя
-- ~~`AgentFactory`~~ — без DI фабрика = обёртка над конструктором
-- ~~`MessageUsage` встроенный в ChatMessage~~ — ломает API-сериализацию, CLI не отображает per-message токены
-- ~~`ContextStrategyType` @Serializable~~ — CLI получает стратегию из флага, сериализация не нужна
-- ~~`DialogBranch` отдельная доменная модель~~ — с JSON-хранилищем `BranchData` внутри `BranchingStrategy` достаточен
-
-**Что CLI делает лучше:**
-- `LlmResult<T>` — строгая обработка ошибок
-- Тир-система моделей (WEAK/MEDIUM/STRONG)
-- `BenchmarkRunner` — утилита сравнения моделей
-- Больше LLM-параметров (seed, frequencyPenalty, presencePenalty)
-- Поэтапное наращивание (каждый день — минимальная дельта)

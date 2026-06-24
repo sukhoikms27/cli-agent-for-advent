@@ -23,6 +23,9 @@ class OpenAiCompatibleClient(
         ignoreUnknownKeys = true
         encodeDefaults = true
         explicitNulls = false
+        // День 17: при tool_calls ответ LLM может содержать "content": null. content — non-null
+        // (String = "") → coerceInputValues превращает null в default ("") вместо ошибки парсинга.
+        coerceInputValues = true
     }
 
     private val httpClient = HttpClient(CIO) {
