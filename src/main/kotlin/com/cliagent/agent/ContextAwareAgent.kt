@@ -14,6 +14,7 @@ import com.cliagent.llm.model.PromptTemplates
 import com.cliagent.llm.model.ReasoningStrategy
 import com.cliagent.llm.model.StagePromptTemplates
 import com.cliagent.llm.model.SystemPrompts
+import com.cliagent.llm.model.ToolDefinition
 import com.cliagent.llm.token.ArtifactLimits
 import com.cliagent.llm.token.OutputBudget
 import com.cliagent.llm.token.TokenCounter
@@ -28,6 +29,12 @@ import com.cliagent.state.TaskStateMachine
 import com.cliagent.state.TaskStage
 import com.cliagent.state.TransitionGuard
 import com.cliagent.state.TransitionOutcome
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 
 class ContextAwareAgent(
     private val llmClient: LlmClient,
@@ -41,7 +48,8 @@ class ContextAwareAgent(
     private val historyCompressor: HistoryCompressor? = null,
     private val contextManager: ContextManager? = null,
     private val profileExtractor: ProfileExtractor? = null,
-    private val autoProfileEvery: Int = 0   // 0 = авто-извлечение профиля выключено
+    private val autoProfileEvery: Int = 0,   // 0 = авто-извлечение профиля выключено
+    private val toolExecutor: ToolExecutor? = null   // день 17: null = tools отключены (поведение дней 1–16)
 ) : Agent {
 
     /** Доступ к [TokenCounter] для stage-агентов (мера C: bounded-усечение межартефактных передач). */
@@ -53,6 +61,8 @@ class ContextAwareAgent(
     private var workingMemory: WorkingMemory? = null
     private var longTermMemory: LongTermMemory? = null
     private var turnCount = 0   // день 12: счётчик ходов для авто-извлечения профиля
+    // День 17: парсер JSON-аргументов tool_calls от LLM.
+    private val toolArgsJson = Json { ignoreUnknownKeys = true }
 
     private suspend fun ensureLoaded() {
         if (!loaded) {
@@ -105,63 +115,153 @@ class ContextAwareAgent(
             println("⚠️ Warning: estimated $estimatedTokens tokens exceeds context limit ($contextLimit)")
         }
 
-        val request = ChatRequest(
-            model = model,
-            messages = messagesToSend,
-            maxTokens = OutputBudget.maxTokensFor(estimatedTokens)   // мера A: бюджет под completion
-        )
-        val result = llmClient.chat(request)
+        // День 17: tool-use loop. tools = null (нет toolExecutor / MCP недоступен) → один shot,
+        // поведение дней 1–16. Иначе LLM может вернуть tool_calls → исполняем → feed-back → финал.
+        val tools = loadToolsOrNull()
+        return runToolLoop(messagesToSend, OutputBudget.maxTokensFor(estimatedTokens), tools, userMsg)
+    }
 
-        return when (result) {
-            is LlmResult.Success -> {
-                val usage = result.data.usage
-                tokenCounter.recordUsage(chatId, usage)
-
-                val choice = result.data.choices.first()
-                // Мера B: обрыв ответа по длине — НЕ сохраняем частичный ответ в history/артефакт,
-                // бросаем типизированный сигнал (isTruncated) для auto-continue в оркестраторе.
-                if (choice.finishReason == "length") {
-                    throw LlmCallException.truncated(choice.message.content)
+    /**
+     * День 17: tool-use loop. Отправляет запрос (с tools, если есть); если LLM просит tool_calls —
+     * исполняет каждый через [toolExecutor], дописывает assistant(c tool_calls) + tool-result
+     * сообщения в in-memory scratch (БЕЗ persist в history — иначе ломаем сериализацию/контекст и
+     * раздуваем окно) и зовёт LLM снова. Финальный ответ (без tool_calls или при исчерпании
+     * [MAX_TOOL_ROUNDS]) persist'ится через [finalizeAssistant].
+     */
+    private suspend fun runToolLoop(
+        initialMessages: List<ChatMessage>,
+        maxTokens: Int?,
+        tools: List<ToolDefinition>?,
+        userMsg: ChatMessage,
+    ): String {
+        val scratch = initialMessages.toMutableList()
+        var rounds = 0
+        while (true) {
+            val request = ChatRequest(
+                model = model,
+                messages = scratch.toList(),
+                maxTokens = maxTokens,
+                tools = tools,
+                toolChoice = tools?.let { "auto" },
+            )
+            val result = llmClient.chat(request)
+            when (result) {
+                is LlmResult.Error -> throw LlmCallException(result.code, result.message)
+                is LlmResult.Success -> {
+                    tokenCounter.recordUsage(chatId, result.data.usage)
+                    val choice = result.data.choices.first()
+                    // Мера B: обрыв по длине — бросаем типизированный сигнал (частичный ответ не persist).
+                    if (choice.finishReason == "length") {
+                        throw LlmCallException.truncated(choice.message.content)
+                    }
+                    val calls = choice.message.toolCalls
+                    if (calls.isNullOrEmpty() || rounds >= MAX_TOOL_ROUNDS) {
+                        return finalizeAssistant(choice.message, userMsg)
+                    }
+                    // исполняем tool_calls; промежуточные сообщения — только в scratch (не в history)
+                    scratch.add(choice.message)
+                    for (tc in calls) {
+                        val args = parseToolArgs(tc.function.arguments)
+                        val toolResult = execTool(tc.function.name, args)
+                        scratch.add(ChatMessage(role = "tool", content = toolResult, toolCallId = tc.id))
+                    }
+                    rounds++
                 }
-
-                val assistantContent = choice.message.content
-                // Мера D1: при активной задаче артефакт уже лежит (будет лежать) в TaskState и явно
-                // инжектируется следующей стадией через StageContext. В history достаточно усечённой
-                // копии — убираем дублирование, раздувавшее контекст (полный implementation в history
-                // съедал окно → обрыв). Полный assistantContent возвращается как артефакт стадии.
-                val taskActive = getTaskState() != null
-                val forHistory = if (taskActive) {
-                    truncateToTokens(assistantContent, ArtifactLimits.HISTORY_STAGE_MSG_TOKENS)
-                } else {
-                    assistantContent
-                }
-                val assistantMsg = ChatMessage(
-                    role = "assistant",
-                    content = forHistory,
-                    parentId = userMsg.id
-                )
-                history.add(assistantMsg)
-                memoryStore.saveMessage(chatId, assistantMsg)
-
-                // Let strategy process the response (e.g., update facts)
-                contextManager?.onAssistantResponse(assistantMsg)
-                // Persist facts after strategy update
-                (contextManager?.getStrategy() as? StickyFactsStrategy)?.let {
-                    memoryStore.saveFacts(chatId, it.getFacts())
-                }
-
-                // День 12: авто-извлечение профиля каждые N ходов (opt-in)
-                turnCount++
-                if (profileExtractor != null && autoProfileEvery > 0 && turnCount % autoProfileEvery == 0) {
-                    val current = getProfile()
-                    val inferred = profileExtractor.extract(history, current)
-                    setProfile(profileExtractor.mergeProfile(current, inferred))
-                }
-
-                assistantContent
             }
-            is LlmResult.Error -> throw LlmCallException(result.code, result.message)
         }
+    }
+
+    /** Persist'ит финальный assistant-ответ + post-processing (strategies, profile). День 17: extracted. */
+    private suspend fun finalizeAssistant(message: ChatMessage, userMsg: ChatMessage): String {
+        val assistantContent = message.content
+        // Мера D1: при активной задаче артефакт уже лежит в TaskState и инжектируется следующей
+        // стадией; в history — усечённая копия (полный ответ съедал окно → обрыв).
+        val taskActive = getTaskState() != null
+        val forHistory = if (taskActive) {
+            truncateToTokens(assistantContent, ArtifactLimits.HISTORY_STAGE_MSG_TOKENS)
+        } else {
+            assistantContent
+        }
+        val assistantMsg = ChatMessage(
+            role = "assistant",
+            content = forHistory,
+            parentId = userMsg.id
+        )
+        history.add(assistantMsg)
+        memoryStore.saveMessage(chatId, assistantMsg)
+
+        // Let strategy process the response (e.g., update facts)
+        contextManager?.onAssistantResponse(assistantMsg)
+        // Persist facts after strategy update
+        (contextManager?.getStrategy() as? StickyFactsStrategy)?.let {
+            memoryStore.saveFacts(chatId, it.getFacts())
+        }
+
+        // День 12: авто-извлечение профиля каждые N ходов (opt-in)
+        turnCount++
+        if (profileExtractor != null && autoProfileEvery > 0 && turnCount % autoProfileEvery == 0) {
+            val current = getProfile()
+            val inferred = profileExtractor.extract(history, current)
+            setProfile(profileExtractor.mergeProfile(current, inferred))
+        }
+
+        return assistantContent
+    }
+
+    /** Schemas tools для запроса; null если toolExecutor нет/недоступен (graceful — без tools). */
+    private suspend fun loadToolsOrNull(): List<ToolDefinition>? {
+        val executor = toolExecutor ?: return null
+        return try {
+            executor.definitions().ifEmpty { null }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            println("⚠️ MCP tools unavailable: ${e.message}; proceeding without tools.")
+            null
+        }
+    }
+
+    /** Исполняет tool; при ошибке возвращает строку-описание (LLM может самокорректироваться). */
+    private suspend fun execTool(name: String, args: Map<String, Any?>): String {
+        val executor = toolExecutor ?: return "Tool '$name' unavailable: no tool executor."
+        return try {
+            executor.call(name, args)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            "Tool '$name' failed: ${e.message}"
+        }
+    }
+
+    /** Парсит JSON-строку аргументов от LLM в map примитивов (для McpClient.callTool). */
+    private fun parseToolArgs(raw: String): Map<String, Any?> {
+        if (raw.isBlank()) return emptyMap()
+        val element = try {
+            toolArgsJson.parseToJsonElement(raw)
+        } catch (_: Throwable) {
+            return emptyMap()
+        }
+        val obj = element as? JsonObject ?: return emptyMap()
+        return obj.entries.associate { (k, v) -> k to jsonElementToAny(v) }
+    }
+
+    private fun jsonElementToAny(el: JsonElement): Any? = when (el) {
+        is JsonNull -> null
+        is JsonPrimitive -> when {
+            el.isString -> el.content
+            el.content == "true" -> true
+            el.content == "false" -> false
+            el.content.toIntOrNull() != null -> el.content.toInt()
+            el.content.toLongOrNull() != null -> el.content.toLong()
+            el.content.toDoubleOrNull() != null -> el.content.toDouble()
+            else -> el.content
+        }
+        is JsonObject -> el.entries.associate { (k, v) -> k to jsonElementToAny(v) }
+        is JsonArray -> el.map { jsonElementToAny(it) }
+    }
+
+    private companion object {
+        const val MAX_TOOL_ROUNDS = 4
     }
 
     private suspend fun buildMessagesToSend(userMsg: ChatMessage): List<ChatMessage> {

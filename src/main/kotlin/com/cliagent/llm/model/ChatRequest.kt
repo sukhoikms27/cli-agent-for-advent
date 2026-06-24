@@ -17,5 +17,8 @@ data class ChatRequest(
     val frequencyPenalty: Double? = null,
     @SerialName("presence_penalty")
     val presencePenalty: Double? = null,
-    val seed: Long? = null
+    val seed: Long? = null,
+    val tools: List<ToolDefinition>? = null,
+    @SerialName("tool_choice")
+    val toolChoice: String? = null
 )
