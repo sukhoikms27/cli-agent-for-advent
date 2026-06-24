@@ -182,8 +182,13 @@ class ContextAwareAgent(
             val summaryMessage = summary?.let {
                 ChatMessage(role = "system", content = "[Previous conversation summary]\n$it")
             }
+            // Контракт стратегий: newMessage НЕ входит в history (все 4 стратегии делают
+            // `history + newMessage`). Но chat() уже добавил userMsg в history (нужно legacy-пути
+            // без contextManager + ранний persist) → убираем его, иначе user-сообщение уезжает в
+            // LLM дважды (Day 17: замечено в debug-дампе Request body как дублированный user msg).
+            val historyForStrategy = history.filterNot { it.id == userMsg.id }
             // Strategy builds messages; summary is added if present
-            val strategyMessages = contextManager.buildMessages(history, userMsg, system)
+            val strategyMessages = contextManager.buildMessages(historyForStrategy, userMsg, system)
             return if (summaryMessage != null) {
                 listOf(system, summaryMessage) + strategyMessages.drop(1) // drop duplicate system
             } else {
