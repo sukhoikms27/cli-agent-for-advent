@@ -121,6 +121,16 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         // День 12: авто-извлечение профиля (opt-in)
         val profileExtractor = if (autoProfile) ProfileExtractor(client, model) else null
 
+        // День 17: ToolExecutor поверх MCP-сервера (если задан mcpCommand). Persistent в рамках
+        // сессии REPL (lazy-connect при первом tool-вызове), закрывается в finally при выходе.
+        // null → tools отключены, поведение дней 1–16 не меняется.
+        val toolExecutor: com.cliagent.agent.ToolExecutor? = config.mcpCommand
+            ?.takeIf { it.isNotBlank() }
+            ?.trim()
+            ?.split("\\s+".toRegex())
+            ?.takeIf { it.isNotEmpty() }
+            ?.let { com.cliagent.mcp.McpToolExecutor(it) }
+
         val agent = ContextAwareAgent(
             llmClient = client,
             memoryStore = memoryStore,
@@ -130,7 +140,8 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             historyCompressor = historyCompressor,
             contextManager = contextManager,
             profileExtractor = profileExtractor,
-            autoProfileEvery = if (autoProfile) 5 else 0
+            autoProfileEvery = if (autoProfile) 5 else 0,
+            toolExecutor = toolExecutor
         )
 
         // День 13 (авто-поток стадий): оркестратор автоматизирует /task start → артефакт стадии →
@@ -163,11 +174,12 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
 
         val repl = ReplEngine()
 
-        while (true) {
-            val input = repl.readLine() ?: break   // null = Ctrl+D
-            if (input.isBlank()) continue
+        try {
+            while (true) {
+                val input = repl.readLine() ?: break   // null = Ctrl+D
+                if (input.isBlank()) continue
 
-            when {
+                when {
                 input == "/exit" -> break
                 input == "/help" -> printHelp()
                 input == "/history" -> printHistory(agent)
@@ -203,6 +215,10 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                     )
                 }
             }
+            }
+        } finally {
+            // День 17: закрываем persistent MCP-соединение при выходе из REPL (Ctrl+D / /exit).
+            toolExecutor?.close()
         }
     }
 
