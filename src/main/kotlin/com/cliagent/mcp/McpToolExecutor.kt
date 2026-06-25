@@ -4,12 +4,12 @@ import com.cliagent.agent.ToolExecutor
 import com.cliagent.llm.model.ToolDefinition
 
 /**
- * Реализация [ToolExecutor] над [McpClient] (день 17).
+ * Реализация [ToolExecutor] над [McpClient] (день 17, день 18 — remote).
  *
- * **Lazy-connect:** первое обращение ([definitions]/[call]) поднимает subprocess + MCP handshake;
- * соединение persistent в рамках сессии REPL и закрывается в `ChatCommand` при выходе (закрывает
- * брешь `day16-deferred.md §3` — раньше `client` не закрывался). Это avoids per-message cold-start
- * subprocess'а в agent tool-use loop.
+ * **Lazy-connect:** первое обращение ([definitions]/[call]) поднимает соединение (subprocess для
+ * stdio / HttpClient для remote Streamable HTTP) + MCP handshake; соединение persistent в рамках
+ * сессии REPL и закрывается в `ChatCommand` при выходе. Это avoids per-message cold-start в agent
+ * tool-use loop.
  *
  * **Tool-ошибки** (`McpToolResult.isError`) не бросаются — возвращаются строкой-описанием, чтобы
  * LLM могла самокорректироваться (соответствует стандарту MCP: tool-ошибка видна модели).
@@ -17,8 +17,8 @@ import com.cliagent.llm.model.ToolDefinition
  * [factory] — DI-шов для тестов (как `handleMcp`): позволяет подсунуть фейк `McpClient`.
  */
 class McpToolExecutor(
-    private val command: List<String>,
-    private val factory: (List<String>) -> McpClient = ::McpClient,
+    private val transport: McpTransportConfig,
+    private val factory: (McpTransportConfig) -> McpClient = ::McpClient,
 ) : ToolExecutor {
 
     @Volatile
@@ -26,7 +26,7 @@ class McpToolExecutor(
 
     private suspend fun ensureConnected() {
         if (client == null) {
-            val c = factory(command)
+            val c = factory(transport)
             c.connect()
             client = c
         }

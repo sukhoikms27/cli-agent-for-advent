@@ -26,7 +26,17 @@ class ConfigRepository {
         val mcpCommand = System.getenv("CLI_AGENT_MCP_COMMAND")
             ?: localProps.getProperty("mcp.command")
 
-        return AppConfig(apiKey = apiKey, model = model, baseUrl = baseUrl, mcpCommand = mcpCommand)
+        // День 18: remote Streamable HTTP. Приоритет URL > command — если задан mcpUrl, клиент
+        // подключается к remote-серверу; GitHub-токен клиенту НЕ нужен (он держится на сервере).
+        val mcpUrl = System.getenv("CLI_AGENT_MCP_URL")
+            ?: localProps.getProperty("mcp.url")
+        val mcpToken = System.getenv("CLI_AGENT_MCP_TOKEN")
+            ?: localProps.getProperty("mcp.token")
+
+        return AppConfig(
+            apiKey = apiKey, model = model, baseUrl = baseUrl,
+            mcpCommand = mcpCommand, mcpUrl = mcpUrl, mcpToken = mcpToken,
+        )
     }
 
     private fun loadLocalProperties(): Properties {

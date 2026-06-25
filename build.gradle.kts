@@ -61,6 +61,14 @@ kotlin {
 
 tasks.withType<Test> {
     useJUnitPlatform()
+    // Проброс опциональных E2E-флагов/путей в test JVM (день 18): по умолчанию Gradle изолирует
+    // test-JVM и не передаёт -D. E2E-тесты (McpClientHttpE2ETest, интеграционный stdio-тест) явно
+    // gated — без флага они skipped, обычный `./gradlew test` их не запускает.
+    listOf("cli-agent.e2e.http", "cli-agent.mcp.jar", "CLI_AGENT_MCP_INTEGRATION", "CLI_AGENT_MCP_BIN")
+        .forEach { key ->
+            System.getProperty(key)?.let { systemProperty(key, it) }
+            System.getenv(key)?.let { environment(key, it) }
+        }
 }
 
 application {
