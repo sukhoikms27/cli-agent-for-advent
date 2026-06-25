@@ -159,10 +159,12 @@ private fun runHttp(githubToken: String?) {
 
         mcpStreamableHttp(
             path = path,
-            // Отключаем DNS-rebinding-allowlist: на VPS запросы идут по домену/IP, дефолтный
-            // [localhost, 127.0.0.1, ::1] их отшьёт. Доступ регламентирует bearer-auth + ufw/nginx.
-            allowedHosts = null,
-            allowedOrigins = null,
+            // DNS-rebinding protection SDK по умолчанию пускает только localhost/127.0.0.1/::1 —
+            // на VPS запросы идут по реальному домену (Host: mcp.sukhoi27.ru) и отшиваются JSON-RPC
+            // ошибкой "Invalid Host". `allowedHosts = null` НЕ отключает проверку, а даёт дефолт;
+            // единственный способ пропустить произвольный домен — enableDnsRebindingProtection=false.
+            // Доступ всё равно ограничен: bearer-auth (interceptor выше) + ufw + nginx TLS-terminator.
+            enableDnsRebindingProtection = false,
         ) {
             // Фабрика свежего Server для этого соединения (extension создаёт session под него).
             buildServer(githubToken)
