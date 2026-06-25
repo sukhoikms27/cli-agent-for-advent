@@ -121,14 +121,24 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         // День 12: авто-извлечение профиля (opt-in)
         val profileExtractor = if (autoProfile) ProfileExtractor(client, model) else null
 
-        // День 17: ToolExecutor поверх MCP-сервера (если задан mcpCommand). Persistent в рамках
-        // сессии REPL (lazy-connect при первом tool-вызове), закрывается в finally при выходе.
+        // День 17–18: ToolExecutor поверх MCP-сервера. Транспорт выбирается из конфига:
+        // remote (mcpUrl) имеет приоритет над stdio (mcpCommand). Persistent в рамках сессии REPL
+        // (lazy-connect при первом tool-вызове), закрывается в finally при выходе.
         // null → tools отключены, поведение дней 1–16 не меняется.
-        val toolExecutor: com.cliagent.agent.ToolExecutor? = config.mcpCommand
-            ?.takeIf { it.isNotBlank() }
-            ?.trim()
-            ?.split("\\s+".toRegex())
-            ?.takeIf { it.isNotEmpty() }
+        val mcpTransport: com.cliagent.mcp.McpTransportConfig? = run {
+            val url = config.mcpUrl?.takeIf { it.isNotBlank() }
+            if (url != null) {
+                com.cliagent.mcp.McpTransportConfig.Http(url = url, token = config.mcpToken.orEmpty())
+            } else {
+                config.mcpCommand
+                    ?.takeIf { it.isNotBlank() }
+                    ?.trim()
+                    ?.split("\\s+".toRegex())
+                    ?.takeIf { it.isNotEmpty() }
+                    ?.let { com.cliagent.mcp.McpTransportConfig.Stdio(it) }
+            }
+        }
+        val toolExecutor: com.cliagent.agent.ToolExecutor? = mcpTransport
             ?.let { com.cliagent.mcp.McpToolExecutor(it) }
 
         val agent = ContextAwareAgent(
@@ -196,7 +206,7 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                 input.startsWith("/invariants") -> handleInvariants(input, agent)
                 input.startsWith("/task") -> handleTask(input, agent, orchestrator)
                 input.startsWith("/mode") -> handleMode(input, agent)
-                input.startsWith("/mcp") -> handleMcp(input, config.mcpCommand, ::McpClient)
+                input.startsWith("/mcp") -> handleMcp(input, mcpTransport, ::McpClient)
                 input == "/reset" -> {
                     agent.reset()
                     AppTerminal.ok("History, summary, facts, branches, working memory cleared.")
@@ -892,50 +902,62 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
     /**
      * `internal` для юнит-тестов (шов, как [dispatchFreeText]): конфиг-ветки и путь исключений
      * покрываются без реального MCP-сервера. [mcpClientFactory] — DI-шов: в тестах подменяется
-     * фабрикой, бросающей [McpException], чтобы проверить, что REPL не падает при сбое subprocess.
+     * фабрикой, бросающей [McpException], чтобы проверить, что REPL не падает при сбое соединения.
+     *
+     * День 18: [transport] — sealed [com.cliagent.mcp.McpTransportConfig] (Stdio | Http). Для remote
+     * (Http) `/mcp` показывает URL; `/mcp list-tools` подключается по нему (bearer из конфига).
      */
     internal suspend fun handleMcp(
         input: String,
-        mcpCommand: String?,
-        mcpClientFactory: (List<String>) -> McpClient = ::McpClient
+        transport: com.cliagent.mcp.McpTransportConfig?,
+        mcpClientFactory: (com.cliagent.mcp.McpTransportConfig) -> McpClient = ::McpClient
     ) {
         val parts = input.trim().split("\\s+".toRegex())
         if (parts.size < 2) {
             // /mcp — статус конфигурации
-            val src = when {
-                System.getenv("CLI_AGENT_MCP_COMMAND") != null -> "env CLI_AGENT_MCP_COMMAND"
-                mcpCommand != null -> "local.properties mcp.command"
-                else -> null
-            }
-            if (src != null) {
-                AppTerminal.println("🔌 MCP: command configured ($src).")
-                AppTerminal.println("   /mcp list-tools         — connect & list server tools")
-                AppTerminal.println("   /mcp list-tools <cmd…>  — override server command for this call")
-            } else {
-                AppTerminal.println("🔌 MCP: no command configured.")
-                AppTerminal.println("   Set CLI_AGENT_MCP_COMMAND env or mcp.command in local.properties,")
-                AppTerminal.println("   or pass inline: /mcp list-tools npx -y @modelcontextprotocol/server-filesystem <dir>")
+            when (transport) {
+                is com.cliagent.mcp.McpTransportConfig.Http -> {
+                    AppTerminal.println("🔌 MCP: remote server configured (${transport.url}).")
+                    AppTerminal.println("   /mcp list-tools  — connect & list server tools")
+                }
+                is com.cliagent.mcp.McpTransportConfig.Stdio -> {
+                    val src = if (System.getenv("CLI_AGENT_MCP_COMMAND") != null) "env CLI_AGENT_MCP_COMMAND"
+                    else "local.properties mcp.command"
+                    AppTerminal.println("🔌 MCP: command configured ($src).")
+                    AppTerminal.println("   /mcp list-tools         — connect & list server tools")
+                    AppTerminal.println("   /mcp list-tools <cmd…>  — override server command for this call")
+                }
+                null -> {
+                    AppTerminal.println("🔌 MCP: no server configured.")
+                    AppTerminal.println("   Remote: set CLI_AGENT_MCP_URL (+ CLI_AGENT_MCP_TOKEN) env.")
+                    AppTerminal.println("   Stdio : set CLI_AGENT_MCP_COMMAND env or mcp.command in local.properties,")
+                    AppTerminal.println("           or pass inline: /mcp list-tools npx -y @modelcontextprotocol/server-filesystem <dir>")
+                }
             }
             return
         }
 
         when (parts[1]) {
             "list-tools" -> {
-                // Override (parts.drop(2)) имеет приоритет; иначе — mcp.command из конфига.
-                val command: List<String> = if (parts.size >= 3) {
-                    parts.drop(2)
-                } else {
-                    mcpCommand?.takeIf { it.isNotBlank() }?.trim()?.split("\\s+".toRegex())
-                } ?: run {
-                    AppTerminal.warn("No MCP command. Configure mcp.command or pass inline:")
-                    AppTerminal.println("  /mcp list-tools npx -y @modelcontextprotocol/server-filesystem <dir>")
+                // Транспорт для этого вызова: override (parts.drop(2)) — только stdio-инлайн;
+                // иначе — transport из конфига.
+                val effective: com.cliagent.mcp.McpTransportConfig = if (parts.size >= 3) {
+                    com.cliagent.mcp.McpTransportConfig.Stdio(parts.drop(2))
+                } else transport ?: run {
+                    AppTerminal.warn("No MCP server configured. Configure remote (CLI_AGENT_MCP_URL) or stdio (mcp.command),")
+                    AppTerminal.println("  or pass inline: /mcp list-tools npx -y @modelcontextprotocol/server-filesystem <dir>")
                     return
+                }
+
+                val endpoint = when (effective) {
+                    is com.cliagent.mcp.McpTransportConfig.Http -> effective.url
+                    is com.cliagent.mcp.McpTransportConfig.Stdio -> effective.command.joinToString(" ")
                 }
 
                 var client: McpClient? = null
                 try {
-                    client = mcpClientFactory(command)
-                    AppTerminal.println("🔌 Connecting to MCP server: ${command.joinToString(" ")}")
+                    client = mcpClientFactory(effective)
+                    AppTerminal.println("🔌 Connecting to MCP server: $endpoint")
                     AppTerminal.withSpinner("Connecting to MCP server…") { client.connect() }
                     val tools = client.listTools()
                     if (tools.isEmpty()) {

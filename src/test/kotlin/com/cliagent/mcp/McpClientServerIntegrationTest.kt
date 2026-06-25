@@ -1,5 +1,6 @@
 package com.cliagent.mcp
 
+import com.cliagent.mcp.McpTransportConfig
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlin.time.Duration.Companion.seconds
@@ -26,7 +27,7 @@ class McpClientServerIntegrationTest {
     @Test
     fun `connect listTools and callTool against github mcp server`() {
         val bin = System.getenv("CLI_AGENT_MCP_BIN") ?: error("set CLI_AGENT_MCP_BIN to the mcp-server launch script")
-        val client = McpClient(listOf(bin))
+        val client = McpClient(McpTransportConfig.Stdio(listOf(bin)))
         runBlocking {
             // Внешний hard-timeout:哪怕 McpClient.close() зависнет на join транспортного scope,
             // тест упадёт за 60с, а не повесит gradle-worker.

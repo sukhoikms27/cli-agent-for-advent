@@ -2,6 +2,9 @@ plugins {
     kotlin("jvm") version "2.3.21"
     kotlin("plugin.serialization") version "2.3.21"
     application
+    // Shadow — fat-jar для деплоя на VPS (один переносимый `java -jar` артефакт).
+    // 8.3.9 совместим с Gradle 9 (см. gradleup.com/shadow/changes).
+    id("com.gradleup.shadow") version "8.3.9"
 }
 
 group = "com.cliagent"
@@ -35,6 +38,11 @@ dependencies {
     implementation("io.ktor:ktor-client-content-negotiation:$ktorVersion")
     implementation("io.ktor:ktor-serialization-kotlinx-json:$ktorVersion")
 
+    // Ktor HTTP server — движок для embeddedServer в http-режиме (remote Streamable HTTP, день 18).
+    // Остальные ktor-server артефакты (core/sse/content-negotiation/websockets) kotlin-sdk-server
+    // 0.13.0 уже тянет транзитивно; движок нужно объявить явно — extension его не подтягивает.
+    implementation("io.ktor:ktor-server-cio:$ktorVersion")
+
     // kotlinx.serialization
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:$kotlinxSerializationVersion")
 
@@ -51,4 +59,12 @@ kotlin {
 
 application {
     mainClass.set("com.cliagent.mcp.server.GitHubMcpServerKt")
+}
+
+// Fat-jar (день 18): один переносимый артефакт `java -jar mcp-server-*-all.jar` для деплоя на VPS.
+// mergeServiceFiles — схлопывает META-INF/services (Ktor/SLF4J/MCP обнаруживают реализации через
+// ServiceLoader; без мержа в fat-jar часть плагинов не поднимется).
+tasks.withType<com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar> {
+    mergeServiceFiles()
+    archiveClassifier.set("all")
 }
