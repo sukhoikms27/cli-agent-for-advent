@@ -162,6 +162,7 @@ class ContextAwareAgent(
                     scratch.add(choice.message)
                     for (tc in calls) {
                         val args = parseToolArgs(tc.function.arguments)
+                        println("🔧 Tool call: ${tc.function.name}${formatToolArgs(args)}")
                         val toolResult = execTool(tc.function.name, args)
                         scratch.add(ChatMessage(role = "tool", content = toolResult, toolCallId = tc.id))
                     }
@@ -260,8 +261,32 @@ class ContextAwareAgent(
         is JsonArray -> el.map { jsonElementToAny(it) }
     }
 
+    /**
+     * Компактная сводка аргументов tool-call'а для лога: `key=value` через запятую. Длинные строковые
+     * значения обрезаются до [MAX_ARG_LEN] символов (`…`-суффикс), чтобы не спамить вывод при больших
+     * payload (например, содержимое отчёта в format_report/save_to_file). Null/пустые args → пустая строка.
+     */
+    private fun formatToolArgs(args: Map<String, Any?>): String {
+        if (args.isEmpty()) return ""
+        return args.entries.joinToString(
+            separator = ", ",
+            prefix = "(",
+            postfix = ")",
+        ) { (k, v) ->
+            val raw = when (v) {
+                is String -> "\"${v.take(MAX_ARG_LEN)}${if (v.length > MAX_ARG_LEN) "…" else ""}\""
+                is List<*> -> "[${v.size} item${if (v.size == 1) "" else "s"}]"
+                is Map<*, *> -> "{${v.size} field${if (v.size == 1) "" else "s"}}"
+                null -> "null"
+                else -> v.toString()
+            }
+            "$k=$raw"
+        }
+    }
+
     private companion object {
         const val MAX_TOOL_ROUNDS = 4
+        const val MAX_ARG_LEN = 40   // обрезка длинных строковых аргументов в логе tool-call'а
     }
 
     private suspend fun buildMessagesToSend(userMsg: ChatMessage): List<ChatMessage> {

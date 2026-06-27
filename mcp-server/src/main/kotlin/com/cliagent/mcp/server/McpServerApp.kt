@@ -19,9 +19,11 @@ import kotlinx.io.asSource
 import kotlinx.io.buffered
 import java.io.FileInputStream
 import java.util.Properties
+import com.cliagent.mcp.server.notes.NotesStore
 import com.cliagent.mcp.server.weather.WeatherClient
 import com.cliagent.mcp.server.weather.WeatherScheduler
 import com.cliagent.mcp.server.weather.WeatherStore
+import com.cliagent.mcp.server.wikipedia.WikipediaClient
 
 /**
  * Точка входа MCP-сервера (Day 18 — вынесено из мономолита GitHubMcpServer.kt, pure refactor).
@@ -77,10 +79,19 @@ fun main() {
         val schedulerScope = CoroutineScope(SupervisorJob())
         val scheduler = WeatherScheduler(weatherClient, weatherStore, schedulerScope)
 
+        // ── Day 19 (композиция tools): Wikipedia + Notes для пайплайна tech-дайджеста ────────
+        // read-only Wikipedia (без ключа) + NotesStore (atomic write в notes/). Singleton'ы на процесс.
+        val wikipediaClient = WikipediaClient()
+        val notesStore = NotesStore()
+
         val mode = System.getenv("CLI_AGENT_MCP_MODE")?.trim()?.lowercase() ?: "stdio"
         when (mode) {
-            "http", "streamable", "streamable-http" -> runHttp(githubToken, weatherClient, weatherStore, scheduler)
-            else -> runStdio(githubToken, weatherClient, weatherStore, scheduler)
+            "http", "streamable", "streamable-http" -> runHttp(
+                githubToken, weatherClient, weatherStore, scheduler, wikipediaClient, notesStore,
+            )
+            else -> runStdio(
+                githubToken, weatherClient, weatherStore, scheduler, wikipediaClient, notesStore,
+            )
         }
     }
 }
@@ -93,8 +104,10 @@ private suspend fun runStdio(
     weatherClient: WeatherClient,
     weatherStore: WeatherStore,
     scheduler: WeatherScheduler,
+    wikipediaClient: WikipediaClient,
+    notesStore: NotesStore,
 ) {
-    val server = buildServer(githubToken, weatherClient, weatherStore, scheduler)
+    val server = buildServer(githubToken, weatherClient, weatherStore, scheduler, wikipediaClient, notesStore)
     val transport = StdioServerTransport(
         input = System.`in`.asSource().buffered(),
         output = System.out.asSink().buffered(),
@@ -125,6 +138,8 @@ private fun runHttp(
     weatherClient: WeatherClient,
     weatherStore: WeatherStore,
     scheduler: WeatherScheduler,
+    wikipediaClient: WikipediaClient,
+    notesStore: NotesStore,
 ) {
     val host = System.getenv("CLI_AGENT_MCP_HOST")?.trim()?.takeIf { it.isNotEmpty() } ?: "0.0.0.0"
     val port = System.getenv("CLI_AGENT_MCP_PORT")?.trim()?.toIntOrNull() ?: 8080
@@ -169,7 +184,7 @@ private fun runHttp(
         ) {
             // Фабрика свежего Server для этого соединения (extension создаёт session под него).
             // Погодные компоненты + scheduler — shared singleton'ы модуля (один реестр подписок на процесс).
-            buildServer(githubToken, weatherClient, weatherStore, scheduler)
+            buildServer(githubToken, weatherClient, weatherStore, scheduler, wikipediaClient, notesStore)
         }
     }.start(wait = true)
 }

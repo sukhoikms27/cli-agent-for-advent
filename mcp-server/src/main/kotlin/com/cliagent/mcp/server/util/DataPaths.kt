@@ -8,6 +8,7 @@ import java.nio.file.Path
  * (systemd `User=mcp`).
  *
  * $XDG_DATA_HOME/cli-agent/weather/{city-slug}.json — накопленные снапшоты по городам.
+ * $XDG_DATA_HOME/cli-agent/notes/{name-slug}.md — сохранённые заметки/отчёты (Day 19).
  */
 internal object DataPaths {
     val dataDir: Path = System.getenv("XDG_DATA_HOME")?.let { Path.of(it) }
@@ -16,4 +17,7 @@ internal object DataPaths {
 
     /** Один JSON-файл на город: {snapshots:[WeatherSnapshot,...]}. */
     val weatherDir: Path get() = dataDir.resolve("weather")
+
+    /** Markdown-заметки/отчёты из пайплайна (Day 19 — save_to_file). */
+    val notesDir: Path get() = dataDir.resolve("notes")
 }
