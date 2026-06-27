@@ -51,6 +51,19 @@ dependencies {
 
     // SLF4J-бэкенд для MCP SDK (io.github.oshai:kotlin-logging); runtime-only — не утекает в API
     runtimeOnly("org.slf4j:slf4j-simple:2.0.18")
+
+    // Testing (Day 18) — выровнено с корневым проектом (день 11 gate) + ktor-client-mock для
+    // WeatherClientTest (MockEngine — мок geocoding/forecast без сети).
+    testImplementation(platform("org.junit:junit-bom:5.12.2"))
+    testImplementation("org.junit.jupiter:junit-jupiter")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+    testImplementation("io.mockk:mockk:1.13.16")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:$kotlinxCoroutinesVersion")
+    testImplementation("io.ktor:ktor-client-mock:$ktorVersion")
+}
+
+tasks.withType<Test> {
+    useJUnitPlatform()
 }
 
 kotlin {
@@ -58,7 +71,9 @@ kotlin {
 }
 
 application {
-    mainClass.set("com.cliagent.mcp.server.GitHubMcpServerKt")
+    // Day 18 (задача 01): мономолит GitHubMcpServer.kt разбит по пакетам; main class переименован
+    // в нейтральный McpServerAppKt (сервер стал мульти-tool: GitHub + погода). Behavior Day 17 не меняется.
+    mainClass.set("com.cliagent.mcp.server.McpServerAppKt")
 }
 
 // Fat-jar (день 18): один переносимый артефакт `java -jar mcp-server-*-all.jar` для деплоя на VPS.
