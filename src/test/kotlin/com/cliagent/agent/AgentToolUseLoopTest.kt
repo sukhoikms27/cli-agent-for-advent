@@ -92,8 +92,9 @@ class AgentToolUseLoopTest {
     }
 
     @Test
-    fun `loop terminates at MAX_TOOL_ROUNDS when model keeps requesting tools`() = runTest {
-        // Модель бесконечно просит tool_calls — цикл обязан оборваться по guard (MAX_TOOL_ROUNDS=4).
+    fun `loop terminates at maxToolRounds when model keeps requesting tools`() = runTest {
+        // Модель бесконечно просит tool_calls — цикл обязан оборваться по guard. Явный maxToolRounds=4
+        // (день 20: параметр конфигурируем, default 8) — тест детерминирован от значения конструктора.
         val llm = mockk<LlmClient> {
             coEvery { chat(any()) } returns LlmResult.Success(toolCallResp())
         }
@@ -101,12 +102,30 @@ class AgentToolUseLoopTest {
             coEvery { definitions() } returns listOf(repoToolDef())
             coEvery { call(any(), any()) } returns "result"
         }
-        val agent = ContextAwareAgent(llm, storeMock(), "m", "chat-1", toolExecutor = exec)
+        val agent = ContextAwareAgent(llm, storeMock(), "m", "chat-1", toolExecutor = exec, maxToolRounds = 4)
 
         val answer = agent.chat("q")   // не должно зависнуть
 
         assertEquals("", answer)   // финализация последнего tool_call-сообщения (content="")
         coVerify(exactly = 4) { exec.call(any(), any()) }
+    }
+
+    @Test
+    fun `maxToolRounds is configurable - default 8`() = runTest {
+        // День 20: дефолт maxToolRounds=8 (вместо прежнего const 4). Проверяем, что конфигурация
+        // пробрасывается — при maxToolRounds=3 цикл рвётся ровно после 3 tool-вызовов.
+        val llm = mockk<LlmClient> {
+            coEvery { chat(any()) } returns LlmResult.Success(toolCallResp())
+        }
+        val exec = mockk<ToolExecutor> {
+            coEvery { definitions() } returns listOf(repoToolDef())
+            coEvery { call(any(), any()) } returns "result"
+        }
+        val agent = ContextAwareAgent(llm, storeMock(), "m", "chat-1", toolExecutor = exec, maxToolRounds = 3)
+
+        agent.chat("q")
+
+        coVerify(exactly = 3) { exec.call(any(), any()) }
     }
 
     @Test

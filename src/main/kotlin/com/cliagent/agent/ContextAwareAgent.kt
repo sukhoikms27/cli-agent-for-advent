@@ -51,6 +51,12 @@ class ContextAwareAgent(
     private val autoProfileEvery: Int = 0,   // 0 = авто-извлечение профиля выключено
     private val toolExecutor: ToolExecutor? = null,   // день 17: null = tools отключены (поведение дней 1–16)
     /**
+     * День 20: лимит раундов tool-use loop. Default **8** (вместо прежнего `const 4`) — для
+     * «длинного флоу» оркестрации нескольких MCP-серверов (search→read→format→save + повторы).
+     * Конфигурируется через [com.cliagent.config.AppConfig.maxToolRounds] (config.json / env).
+     */
+    private val maxToolRounds: Int = 8,
+    /**
      * День 19: sink для статусного вывода (compress-warnings, tool-call-лог). **Default `::println`**
      * сохраняет поведение вне REPL (тесты, batch). В REPL подключается к [com.cliagent.cli.AppTerminal.println] —
      * критично: спиннер крутится **во время** chat(), и сырой `println` (stdout) затирается анимацией
@@ -134,7 +140,7 @@ class ContextAwareAgent(
      * исполняет каждый через [toolExecutor], дописывает assistant(c tool_calls) + tool-result
      * сообщения в in-memory scratch (БЕЗ persist в history — иначе ломаем сериализацию/контекст и
      * раздуваем окно) и зовёт LLM снова. Финальный ответ (без tool_calls или при исчерпании
-     * [MAX_TOOL_ROUNDS]) persist'ится через [finalizeAssistant].
+     * [maxToolRounds], день 20 — default 8) persist'ится через [finalizeAssistant].
      */
     private suspend fun runToolLoop(
         initialMessages: List<ChatMessage>,
@@ -163,7 +169,7 @@ class ContextAwareAgent(
                         throw LlmCallException.truncated(choice.message.content)
                     }
                     val calls = choice.message.toolCalls
-                    if (calls.isNullOrEmpty() || rounds >= MAX_TOOL_ROUNDS) {
+                    if (calls.isNullOrEmpty() || rounds >= maxToolRounds) {
                         return finalizeAssistant(choice.message, userMsg)
                     }
                     // исполняем tool_calls; промежуточные сообщения — только в scratch (не в history)
@@ -293,7 +299,6 @@ class ContextAwareAgent(
     }
 
     private companion object {
-        const val MAX_TOOL_ROUNDS = 4
         const val MAX_ARG_LEN = 40   // обрезка длинных строковых аргументов в логе tool-call'а
     }
 
