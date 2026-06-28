@@ -34,7 +34,8 @@ internal class NotesStore(
         dir.createDirectories()
         val target = fileFor(filename)
         val tmp = target.resolveSibling(".${target.fileName}.tmp")
-        tmp.writeText(content)
+        // UTF-8 явно: markdown-отчёты содержат эмодзи/кириллицу; на Windows дефолтный charset ≠ UTF-8.
+        tmp.writeText(content, Charsets.UTF_8)
         Files.move(tmp, target, ATOMIC_MOVE, REPLACE_EXISTING)
         target
     }
@@ -56,7 +57,7 @@ internal class NotesStore(
     /** Прочитать содержимое заметки по имени файла (без расширения или с ним); null если нет. */
     fun read(filename: String): String? = synchronized(LOCK) {
         val candidates = listOf(fileFor(filename), dir.resolve(filename))
-        candidates.firstOrNull { it.exists() }?.readText()
+        candidates.firstOrNull { it.exists() }?.readText(Charsets.UTF_8)
     }
 
     // ── internals ──────────────────────────────────────────────────────────────
