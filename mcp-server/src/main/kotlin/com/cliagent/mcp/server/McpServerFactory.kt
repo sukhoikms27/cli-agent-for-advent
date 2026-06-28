@@ -4,11 +4,15 @@ import io.modelcontextprotocol.kotlin.sdk.server.Server
 import io.modelcontextprotocol.kotlin.sdk.server.ServerOptions
 import io.modelcontextprotocol.kotlin.sdk.types.Implementation
 import io.modelcontextprotocol.kotlin.sdk.types.ServerCapabilities
+import com.cliagent.mcp.server.notes.NotesStore
 import com.cliagent.mcp.server.tools.registerGitHubTools
+import com.cliagent.mcp.server.tools.registerNotesTools
 import com.cliagent.mcp.server.tools.registerWeatherTools
+import com.cliagent.mcp.server.tools.registerWikipediaTools
 import com.cliagent.mcp.server.weather.WeatherClient
 import com.cliagent.mcp.server.weather.WeatherScheduler
 import com.cliagent.mcp.server.weather.WeatherStore
+import com.cliagent.mcp.server.wikipedia.WikipediaClient
 
 /**
  * Фабрика MCP-сервера (Day 18 — точка расширения): создаёт Server и регистрирует ВСЕ tools.
@@ -21,12 +25,16 @@ import com.cliagent.mcp.server.weather.WeatherStore
  * @param weatherClient источник погодных данных (Open-Meteo, Day 18)
  * @param weatherStore персистентное хранилище снапшотов (Day 18)
  * @param weatherScheduler динамический реестр подписок на periodic-сбор (Day 18 redesign, R1)
+ * @param wikipediaClient энциклопедический источник (Day 19 — search-этап пайплайна)
+ * @param notesStore каталог заметок/отчётов (Day 19 — save-этап пайплайна)
  */
 internal fun buildServer(
     githubToken: String?,
     weatherClient: WeatherClient,
     weatherStore: WeatherStore,
     weatherScheduler: WeatherScheduler,
+    wikipediaClient: WikipediaClient,
+    notesStore: NotesStore,
 ): Server {
     val server = Server(
         serverInfo = Implementation(name = "cli-agent-mcp", version = "0.1.0"),
@@ -36,5 +44,7 @@ internal fun buildServer(
     )
     registerGitHubTools(server, githubToken)
     registerWeatherTools(server, weatherClient, weatherStore, weatherScheduler)
+    registerWikipediaTools(server, wikipediaClient)
+    registerNotesTools(server, notesStore)
     return server
 }

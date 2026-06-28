@@ -151,7 +151,10 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             contextManager = contextManager,
             profileExtractor = profileExtractor,
             autoProfileEvery = if (autoProfile) 5 else 0,
-            toolExecutor = toolExecutor
+            toolExecutor = toolExecutor,
+            // День 19: статусный вывод агента — через mordant-терминал, чтобы печать шла «поверх»
+            // активного спиннера (chat() крутит его в withSpinner). Сырой println затирается анимацией.
+            logger = AppTerminal::println
         )
 
         // День 13 (авто-поток стадий): оркестратор автоматизирует /task start → артефакт стадии →

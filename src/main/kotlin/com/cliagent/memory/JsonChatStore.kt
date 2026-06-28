@@ -112,7 +112,7 @@ class JsonChatStore(
                     .filter { it.toString().endsWith(".json") }
                     .map { path ->
                         runCatching {
-                            json.decodeFromString<ChatData>(Files.readString(path))
+                            json.decodeFromString<ChatData>(Files.readString(path, Charsets.UTF_8))
                         }.getOrNull()
                     }
                     .toList()
@@ -250,7 +250,7 @@ class JsonChatStore(
         val file = chatFile(chatId)
         if (!Files.exists(file)) return null
         return runCatching {
-            json.decodeFromString<ChatData>(Files.readString(file))
+            json.decodeFromString<ChatData>(Files.readString(file, Charsets.UTF_8))
         }.getOrNull()
     }
 
@@ -260,8 +260,12 @@ class JsonChatStore(
         // Уникальный tmp-файл на вызов — защита от остаточной гонки, если когда-либо
         // появится несериализованный путь записи (напрямую atomicWrite не зовётся снаружи,
         // но дешёвый страховочный слой).
+        //
+        // Фикс краша (Day 19): Files.writeString БЕЗ явного charset берёт системную кодировку — на
+        // Windows это Cp1251, не мапит эмодзи/кириллицу из LLM-ответов → UnmappableCharacterException.
+        // JSON хранится в UTF-8, поэтому фиксируем явно (как и чтение ниже). См. audit Day 19.
         val tmp = target.resolveSibling(".${target.fileName}.${UUID.randomUUID()}.tmp")
-        Files.writeString(tmp, content)
+        Files.writeString(tmp, content, Charsets.UTF_8)
         try {
             Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
         } catch (e: Throwable) {

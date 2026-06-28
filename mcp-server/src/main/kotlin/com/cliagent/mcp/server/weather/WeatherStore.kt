@@ -52,14 +52,15 @@ internal class WeatherStore(
     private fun readInternal(file: Path): FileData {
         if (!file.exists()) return FileData(emptyList())
         // Битый/пустой файл → начинаем с чистого (не падаем; сбор продолжится).
-        return runCatching { json.decodeFromString<FileData>(file.readText()) }
+        // UTF-8 явно: city-name и описания Open-Meteo содержат не-ASCII (Москва, Göttingen).
+        return runCatching { json.decodeFromString<FileData>(file.readText(Charsets.UTF_8)) }
             .getOrDefault(FileData(emptyList()))
     }
 
     /** Atomic write: temp-файл рядом + rename. Прерывание на любом шаге не калечит рабочий файл. */
     private fun writeAtomic(target: Path, data: FileData) {
         val tmp = target.resolveSibling(".${target.fileName}.tmp")
-        tmp.writeText(json.encodeToString(FileData.serializer(), data))
+        tmp.writeText(json.encodeToString(FileData.serializer(), data), Charsets.UTF_8)
         Files.move(tmp, target, ATOMIC_MOVE, REPLACE_EXISTING)
     }
 

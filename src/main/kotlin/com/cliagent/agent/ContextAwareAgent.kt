@@ -49,7 +49,15 @@ class ContextAwareAgent(
     private val contextManager: ContextManager? = null,
     private val profileExtractor: ProfileExtractor? = null,
     private val autoProfileEvery: Int = 0,   // 0 = авто-извлечение профиля выключено
-    private val toolExecutor: ToolExecutor? = null   // день 17: null = tools отключены (поведение дней 1–16)
+    private val toolExecutor: ToolExecutor? = null,   // день 17: null = tools отключены (поведение дней 1–16)
+    /**
+     * День 19: sink для статусного вывода (compress-warnings, tool-call-лог). **Default `::println`**
+     * сохраняет поведение вне REPL (тесты, batch). В REPL подключается к [com.cliagent.cli.AppTerminal.println] —
+     * критично: спиннер крутится **во время** chat(), и сырой `println` (stdout) затирается анимацией
+     * mordant. `AppTerminal.println` печатает «поверх» активного спиннера (как stage-блоки через onEmit).
+     * Агент не зависит от CLI-слоя — только от типа `(String) -> Unit`.
+     */
+    private val logger: (String) -> Unit = { msg -> println(msg) }
 ) : Agent {
 
     /** Доступ к [TokenCounter] для stage-агентов (мера C: bounded-усечение межартефактных передач). */
@@ -98,12 +106,12 @@ class ContextAwareAgent(
             val shouldCompress = history.size > historyCompressor.compressThreshold &&
                 history.size % historyCompressor.compressThreshold == 0
             if (shouldCompress) {
-                println("🔄 Compressing history...")
+                logger("🔄 Compressing history...")
                 val existingSummary = memoryStore.loadSummary(chatId)
                 val result = historyCompressor.compress(history, existingSummary)
                 if (result.wasCompressed && result.summary != null) {
                     memoryStore.saveSummary(chatId, result.summary)
-                    println("✓ Compressed ${result.summarizedCount} messages (~${result.tokenEstimate} tokens in summary)")
+                    logger("✓ Compressed ${result.summarizedCount} messages (~${result.tokenEstimate} tokens in summary)")
                 }
             }
         }
@@ -112,7 +120,7 @@ class ContextAwareAgent(
         val messagesToSend = buildMessagesToSend(userMsg)
         val estimatedTokens = tokenCounter.estimateHistoryTokens(messagesToSend)
         if (estimatedTokens > contextLimit) {
-            println("⚠️ Warning: estimated $estimatedTokens tokens exceeds context limit ($contextLimit)")
+            logger("⚠️ Warning: estimated $estimatedTokens tokens exceeds context limit ($contextLimit)")
         }
 
         // День 17: tool-use loop. tools = null (нет toolExecutor / MCP недоступен) → один shot,
@@ -162,6 +170,7 @@ class ContextAwareAgent(
                     scratch.add(choice.message)
                     for (tc in calls) {
                         val args = parseToolArgs(tc.function.arguments)
+                        logger("🔧 Tool call: ${tc.function.name}${formatToolArgs(args)}")
                         val toolResult = execTool(tc.function.name, args)
                         scratch.add(ChatMessage(role = "tool", content = toolResult, toolCallId = tc.id))
                     }
@@ -216,7 +225,7 @@ class ContextAwareAgent(
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Throwable) {
-            println("⚠️ MCP tools unavailable: ${e.message}; proceeding without tools.")
+            logger("⚠️ MCP tools unavailable: ${e.message}; proceeding without tools.")
             null
         }
     }
@@ -260,8 +269,32 @@ class ContextAwareAgent(
         is JsonArray -> el.map { jsonElementToAny(it) }
     }
 
+    /**
+     * Компактная сводка аргументов tool-call'а для лога: `key=value` через запятую. Длинные строковые
+     * значения обрезаются до [MAX_ARG_LEN] символов (`…`-суффикс), чтобы не спамить вывод при больших
+     * payload (например, содержимое отчёта в format_report/save_to_file). Null/пустые args → пустая строка.
+     */
+    private fun formatToolArgs(args: Map<String, Any?>): String {
+        if (args.isEmpty()) return ""
+        return args.entries.joinToString(
+            separator = ", ",
+            prefix = "(",
+            postfix = ")",
+        ) { (k, v) ->
+            val raw = when (v) {
+                is String -> "\"${v.take(MAX_ARG_LEN)}${if (v.length > MAX_ARG_LEN) "…" else ""}\""
+                is List<*> -> "[${v.size} item${if (v.size == 1) "" else "s"}]"
+                is Map<*, *> -> "{${v.size} field${if (v.size == 1) "" else "s"}}"
+                null -> "null"
+                else -> v.toString()
+            }
+            "$k=$raw"
+        }
+    }
+
     private companion object {
         const val MAX_TOOL_ROUNDS = 4
+        const val MAX_ARG_LEN = 40   // обрезка длинных строковых аргументов в логе tool-call'а
     }
 
     private suspend fun buildMessagesToSend(userMsg: ChatMessage): List<ChatMessage> {

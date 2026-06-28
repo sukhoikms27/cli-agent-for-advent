@@ -31,7 +31,7 @@ class JsonLongTermStore(
     suspend fun load(): LongTermMemory = withContext(Dispatchers.IO) {
         if (!Files.exists(file)) return@withContext LongTermMemory()
         runCatching {
-            json.decodeFromString<LongTermMemory>(Files.readString(file))
+            json.decodeFromString<LongTermMemory>(Files.readString(file, Charsets.UTF_8))
         }.getOrNull() ?: LongTermMemory()
     }
 
@@ -51,7 +51,8 @@ class JsonLongTermStore(
 
     private fun atomicWrite(target: Path, content: String) {
         val tmp = target.resolveSibling(".${target.fileName}.${java.util.UUID.randomUUID()}.tmp")
-        Files.writeString(tmp, content)
+        // Фикс краша (Day 19): UTF-8 явно — иначе на Windows Cp1251 валит на эмодзи/кириллице.
+        Files.writeString(tmp, content, Charsets.UTF_8)
         try {
             Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
         } catch (e: Throwable) {

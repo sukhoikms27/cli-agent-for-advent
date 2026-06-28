@@ -69,6 +69,16 @@ class TaskOrchestrator(
     private val agents: Map<TaskStage, StageAgent> = agents
 
     /**
+     * День 19 (debug): текущая стадия для дампа raw-ответов в [chatWithContinue]. Ставится в
+     * [runOneStage] перед вызовом stage-агента (как currentSpinnerStage в ChatCommand). null вне
+     * stage-потока (свободный чат не дампится через этот шов — он идёт в обход chatWithContinue).
+     */
+    private var debugStage: TaskStage? = null
+
+    /** Включён ли debug-дамп stage-LLM-вызовов (env `CLI_AGENT_DEBUG`). */
+    private val debugEnabled: Boolean = System.getenv("CLI_AGENT_DEBUG") != null
+
+    /**
      * Старт задачи: классификатор entry-стадии + тип задачи → стартовое состояние → drive.
      * Особый случай: старт на CLARIFY с немедленным `[CLEAR]` — обрабатывается в [drive]
      * (clarify→planning в одном ходе, далее в AUTO — чейн до DONE).
@@ -265,6 +275,7 @@ class TaskOrchestrator(
         // Мера B: chat-делегат обёрнут в [chatWithContinue] — обрыв по finish_reason=length
         // сшивается auto-continue; сюда попадает только исчерпание продолжений или иной сбой.
         return try {
+            debugStage = stage   // для дампа raw-ответов в chatWithContinue (CLI_AGENT_DEBUG)
             val result = agentImpl.run(ctx) { userMsg -> chatWithContinue(userMsg) }
 
             // Сохраняем артефакт в соответствующее поле + awaitingAdvance
@@ -300,6 +311,7 @@ class TaskOrchestrator(
         var prompt = userMsg
         var continuations = 0
         while (true) {
+            if (debugEnabled) debugDumpPrompt(debugStage, prompt, continuations)
             val chunk: String = try {
                 chat(prompt)
             } catch (e: LlmCallException) {
@@ -310,8 +322,28 @@ class TaskOrchestrator(
                 prompt = continuePrompt(userMsg, accumulated)
                 continue
             }
+            if (debugEnabled) debugDumpResponse(debugStage, chunk)
             return accumulated + chunk   // полный (или финальный) ответ
         }
+    }
+
+    /**
+     * День 19 (debug): дамплы raw-промпта/ответа stage-LLM-вызовов в **stderr** (env `CLI_AGENT_DEBUG`).
+     * stderr отделён от REPL-вывода/stdout — не перемешивается со stage-блоками и не затирается
+     * спиннером mordant. Видно, что реально уходит/приходит на каждой стадии — диагноз пустых
+     * артефактов (как verdict с REWORK без текста), обрывов, tool-call'ов во время валидации.
+     */
+    private fun debugDumpPrompt(stage: TaskStage?, prompt: String, continuation: Int) {
+        val tag = stage?.name?.lowercase() ?: "stage"
+        val suf = if (continuation > 0) " (continue #$continuation)" else ""
+        System.err.println("\n[DEBUG][$tag] >>> PROMPT$suf (${prompt.length} chars):\n${prompt.take(MAX_DEBUG_CHARS)}")
+        if (prompt.length > MAX_DEBUG_CHARS) System.err.println("[DEBUG][$tag] ... (${prompt.length - MAX_DEBUG_CHARS} chars truncated)")
+    }
+
+    private fun debugDumpResponse(stage: TaskStage?, response: String) {
+        val tag = stage?.name?.lowercase() ?: "stage"
+        System.err.println("\n[DEBUG][$tag] <<< RESPONSE (${response.length} chars):\n${response.take(MAX_DEBUG_CHARS)}")
+        if (response.length > MAX_DEBUG_CHARS) System.err.println("[DEBUG][$tag] ... (${response.length - MAX_DEBUG_CHARS} chars truncated)")
     }
 
     private fun continuePrompt(originalMessage: String, accumulated: String): String = buildString {
@@ -349,6 +381,8 @@ class TaskOrchestrator(
         private const val MAX_CONTINUATIONS = 2
         private const val ORIGINAL_MSG_CHARS = 4000
         private const val ACCUMULATED_CHARS = 8000
+        /** День 19 (debug): потолок дампа промпта/ответа в stderr (чтобы не затапливать терминал). */
+        private const val MAX_DEBUG_CHARS = 2000
 
         /**
          * Реестр стадийных агентов по умолчанию. [swarm]=true → [SwarmStageAgent] на каждую стадию
