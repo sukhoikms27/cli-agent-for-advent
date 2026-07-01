@@ -53,6 +53,9 @@ dependencies {
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
     testImplementation("io.mockk:mockk:1.13.16")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:$kotlinxCoroutinesVersion")
+    // День 21: ktor-client-mock для MockEngine-тестов OllamaEmbeddingClient (без реальной Ollama).
+    // Выровнено с mcp-server модулем (день 18, WeatherClientTest). testImplementation → не в prod JAR.
+    testImplementation("io.ktor:ktor-client-mock:$ktorVersion")
 }
 
 kotlin {

@@ -67,12 +67,25 @@ class ConfigRepository(
         // 3. mcp-серверы: ТОЛЬКО из config.json. Legacy fallback, если файл пуст.
         val mcpServers = fileConfig.mcp.ifEmpty { legacyMcpServers(localProps) }
 
+        // 4. День 21 (RAG): config.json как base; env override одиночных полей (как для model/baseUrl).
+        //    corpusRoots/defaultStrategy через env НЕ задаётся — только через config.json (как mcp).
+        val rag = fileConfig.rag.let { base ->
+            base.copy(
+                embeddingProvider = System.getenv("CLI_AGENT_RAG_PROVIDER") ?: base.embeddingProvider,
+                embeddingModel = System.getenv("CLI_AGENT_RAG_EMBEDDING_MODEL") ?: base.embeddingModel,
+                embeddingBaseUrl = System.getenv("CLI_AGENT_RAG_EMBEDDING_URL") ?: base.embeddingBaseUrl,
+                chunkSizeTokens = System.getenv("CLI_AGENT_RAG_CHUNK_SIZE")?.toIntOrNull() ?: base.chunkSizeTokens,
+                chunkOverlapTokens = System.getenv("CLI_AGENT_RAG_CHUNK_OVERLAP")?.toIntOrNull() ?: base.chunkOverlapTokens,
+            )
+        }
+
         return AppConfig(
             apiKey = apiKey,
             model = model,
             baseUrl = baseUrl,
             maxToolRounds = maxToolRounds,
             mcp = mcpServers,
+            rag = rag,
         )
     }
 

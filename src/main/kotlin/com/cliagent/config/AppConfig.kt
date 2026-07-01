@@ -1,6 +1,7 @@
 package com.cliagent.config
 
 import com.cliagent.mcp.McpServerConfig
+import com.cliagent.rag.RagConfig
 import kotlinx.serialization.Serializable
 
 /**
@@ -29,4 +30,10 @@ data class AppConfig(
     val baseUrl: String = "https://api.z.ai/api/coding/paas/v4",
     val maxToolRounds: Int = 8,
     val mcp: List<McpServerConfig> = emptyList(),
+    /**
+     * День 21 (RAG): конфиг индексации документов. Default `RagConfig()` → старые config.json
+     * грузятся без ошибок (RAG off, как дней 1–20). env override `CLI_AGENT_RAG_*` в
+     * [ConfigRepository]. Инъекция в промпт — день 22; пока только индексация + `/rag`-команды.
+     */
+    val rag: RagConfig = RagConfig(),
 )

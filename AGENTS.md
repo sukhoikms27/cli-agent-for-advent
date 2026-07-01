@@ -254,10 +254,19 @@ src/main/kotlin/com/cliagent/
 │   ├── TaskState.kt            # task states enum
 │   ├── StateMachine.kt         # state machine with transitions
 │   └── InvariantChecker.kt     # invariant validation
+├── rag/                        # RAG indexing pipeline (day 21)
+│   ├── RagModels.kt            # RagDocument, RagChunk, RagIndex, ScoredChunk, RagConfig
+│   ├── DocumentLoader.kt       # corpus scan (.md/.kt → RagDocument)
+│   ├── chunk/                  # ChunkingStrategy + FixedSizeChunker + StructuralChunker
+│   ├── embedding/              # EmbeddingClient + OllamaEmbeddingClient (/api/embed)
+│   ├── VectorMath.kt           # cosine similarity + topK
+│   ├── JsonRagStore.kt         # JSON index persistence (atomicWrite)
+│   ├── RagIndexer.kt           # chunk → embed → save orchestrator
+│   └── ChunkingComparison.kt   # 2-strategy stats + probe retrieval
 └── config/                     # Configuration
-    ├── AppConfig.kt            # config data class
+    ├── AppConfig.kt            # config data class (+rag: RagConfig)
     ├── ConfigRepository.kt     # config load/save (env + JSON)
-    └── AppPaths.kt             # XDG-compliant paths
+    └── AppPaths.kt             # XDG-compliant paths (+ragDir)
 ```
 
 ## Implementation Phases

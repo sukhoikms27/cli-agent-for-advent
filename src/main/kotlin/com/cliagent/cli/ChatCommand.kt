@@ -196,7 +196,10 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         val swarmLabel = if (noSwarm) "OFF" else swarmMode.label.uppercase()
         val modeLabel = (agent.getWorkingMemory()?.interactionMode ?: InteractionMode.PLAN).name.lowercase()
         val mcpLabel = if (mcpServerCount == 0) "OFF" else "$mcpServerCount server(s)"
-        AppTerminal.println("CLI Agent v0.8 | Chat: $chatId | Model: $model | Context: ${contextManager.getStrategy().getName()} | MCP: $mcpLabel | MaxToolRounds: ${config.maxToolRounds} | Compress: $compressLabel | Invariants: $invariantsLabel | Swarm: $swarmLabel | Mode: $modeLabel")
+        // День 21 (RAG): индексация документов. Injection в промпт — день 22; пока команды /rag.
+        val ragCommands = RagCommands(config.rag)
+        val ragLabel = if (config.rag.enabled) "ON" else "OFF"
+        AppTerminal.println("CLI Agent v0.8 | Chat: $chatId | Model: $model | Context: ${contextManager.getStrategy().getName()} | MCP: $mcpLabel | RAG: $ragLabel | MaxToolRounds: ${config.maxToolRounds} | Compress: $compressLabel | Invariants: $invariantsLabel | Swarm: $swarmLabel | Mode: $modeLabel")
         AppTerminal.println("Type /help for commands, /exit to quit")
 
         val repl = ReplEngine()
@@ -224,6 +227,7 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                 input.startsWith("/task") -> handleTask(input, agent, orchestrator)
                 input.startsWith("/mode") -> handleMode(input, agent)
                 input.startsWith("/mcp") -> handleMcp(input, mcpServers)
+                input.startsWith("/rag") -> ragCommands.handle(input)
                 input.startsWith("/config") -> handleConfig(input)
                 input == "/reset" -> {
                     agent.reset()
@@ -416,6 +420,13 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             |  /mcp add <name> -- <cmd> <args…>     — Add stdio server to config.json
             |  /mcp add <name> --url <u> [--token]  — Add remote HTTP server to config.json
             |  /mcp remove <name>    — Remove server from config.json
+            |  /rag                  — Show RAG status (embeddings model, current index)
+            |  /rag index [fixed|structural] — Index document corpus (chunking + embeddings)
+            |  /rag stats            — Show index statistics (chunks, tokens, dimension)
+            |  /rag compare          — Build both strategies + compare stats + probe retrieval
+            |  /rag search <query>   — Probe retrieval: top-5 chunks (smoke test, no agent)
+            |  /rag config           — Show RAG configuration
+            |  Note: RAG indexing requires Ollama running locally (ollama serve + pull nomic-embed-text).
             |  /config init          — Generate config.json from env/local.properties
             |  /config show          — Show config file summary
             |  /config path          — Print config file path

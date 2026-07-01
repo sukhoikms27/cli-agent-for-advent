@@ -20,6 +20,16 @@ object AppPaths {
     val longTermDir: Path get() = dataDir.resolve("longterm")
     val longTermFile: Path get() = longTermDir.resolve("memory.json")
 
+    /**
+     * Каталог RAG-индексов (день 21). Один JSON-файл на стратегию chunking — для сравнения
+     * (`/rag compare`): [ragIndexFixed] для fixed-size, [ragIndexStructural] для structural.
+     * [ragIndexFile] — текущий/дефолтный индекс (alias для удобства CLI `/rag stats`).
+     */
+    val ragDir: Path get() = dataDir.resolve("rag")
+    val ragIndexFile: Path get() = ragDir.resolve("index.json")
+    val ragIndexFixed: Path get() = ragDir.resolve("index-fixed.json")
+    val ragIndexStructural: Path get() = ragDir.resolve("index-structural.json")
+
     /** Персистентная история JLine3 REPL (между сессиями, TUI). */
     val replHistoryFile: Path get() = dataDir.resolve("repl-history")
 }
