@@ -44,6 +44,12 @@ class ContextAwareAgent(
     private val systemPrompt: ChatMessage = SystemPrompts.default,
     private val reasoningStrategy: ReasoningStrategy? = null,
     private val tokenCounter: TokenCounter = TokenCounter(),
+    /**
+     * День 21 (волна W6.3): температура LLM основного цикла. Передаётся в [ChatRequest.temperature].
+     * Default `null` (провайдерский дефолт ~0.7-1.0) — сохраняет прежнее поведение для дней 1-20.
+     * CLI `--temperature` прокидывается сюда; классификаторы/экстракторы остаются на `0.0` (детерминизм).
+     */
+    private val temperature: Double? = null,
     private val contextLimit: Int = 128000,
     private val historyCompressor: HistoryCompressor? = null,
     private val contextManager: ContextManager? = null,
@@ -154,6 +160,7 @@ class ContextAwareAgent(
             val request = ChatRequest(
                 model = model,
                 messages = scratch.toList(),
+                temperature = temperature,
                 maxTokens = maxTokens,
                 tools = tools,
                 toolChoice = tools?.let { "auto" },
@@ -223,9 +230,20 @@ class ContextAwareAgent(
         return assistantContent
     }
 
-    /** Schemas tools для запроса; null если toolExecutor нет/недоступен (graceful — без tools). */
+    /**
+     * Schemas tools для запроса; null если toolExecutor нет/недоступен (graceful — без tools).
+     *
+     * День 21 (волна W3.2): per-stage tool-scoping. Tools (схемы ~1100 токенов) подключаются только
+     * на стадиях, где они полезны — [TaskStage.EXECUTION] (основная работа) и [TaskStage.VALIDATION]
+     * (read_file для проверки артефакта). На CLARIFY/PLANNING/DONE — `tools=null` (экономия токенов).
+     * При отсутствии активной задачи (свободный чат, taskState==null) — старое поведение (tools
+     * подключаются), 0 регрессий для дней 17–20.
+     */
     private suspend fun loadToolsOrNull(): List<ToolDefinition>? {
         val executor = toolExecutor ?: return null
+        // W3.2: tool-scoping по стадии активной задачи.
+        val stage = getTaskState()?.stage
+        if (stage != null && stage !in TOOL_SCOPED_STAGES) return null
         return try {
             executor.definitions().ifEmpty { null }
         } catch (e: kotlinx.coroutines.CancellationException) {
@@ -300,6 +318,11 @@ class ContextAwareAgent(
 
     private companion object {
         const val MAX_ARG_LEN = 40   // обрезка длинных строковых аргументов в логе tool-call'а
+        /** W3.2: стадии, где tools окупаются (схемы ~1100 токенов тянутся только тут). */
+        val TOOL_SCOPED_STAGES: Set<com.cliagent.state.TaskStage> = setOf(
+            com.cliagent.state.TaskStage.EXECUTION,
+            com.cliagent.state.TaskStage.VALIDATION,
+        )
     }
 
     private suspend fun buildMessagesToSend(userMsg: ChatMessage): List<ChatMessage> {

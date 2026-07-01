@@ -35,6 +35,7 @@ import com.cliagent.state.invariant.Invariant
 import com.cliagent.state.invariant.InvariantCategory
 import com.cliagent.state.invariant.LlmInvariantChecker
 import com.github.ajalt.clikt.core.CliktCommand
+import com.github.ajalt.clikt.parameters.options.convert
 import com.github.ajalt.clikt.parameters.options.default
 import com.github.ajalt.clikt.parameters.options.flag
 import com.github.ajalt.clikt.parameters.options.option
@@ -58,10 +59,21 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         help = "Enforce project invariants: refuse violating requests, retry violating responses"
     ).flag("--no-invariants")
     private val noColor by option("--no-color", help = "Disable colored output").flag()
-    private val noSwarm by option(
-        "--no-swarm",
-        help = "Disable swarm agents (V4 lead+workers+integrate) on each stage; use simple sequential agents"
-    ).flag()
+    /**
+     * День 21 (волна W1): режим роя. Заменяет прежний бинарный `--no-swarm`.
+     * - `auto` (default) — адаптивный гейт: рой только на стадиях, где он окупается (PLANNING/
+     *   EXECUTION/VALIDATION); CLARIFY/DONE — single-agent; TRIVIAL-задачи — весь пайплайн single.
+     * - `on` — рой на всех стадиях (прежний дефолт; для дебага/сравнения).
+     * - `off` — простые агенты везде (эквивалент прежнего `--no-swarm`).
+     * Backward-compat: `--no-swarm` по-прежнему работает (→ off). env: `CLI_AGENT_SWARM_MODE`.
+     */
+    private val swarmMode: com.cliagent.agent.swarm.SwarmMode by option(
+        "--swarm-mode",
+        envvar = "CLI_AGENT_SWARM_MODE",
+        help = "Swarm mode: auto (adaptive gate, default) | on (swarm everywhere) | off (simple agents)"
+    ).convert { com.cliagent.agent.swarm.SwarmMode.fromString(it) }.default(com.cliagent.agent.swarm.SwarmMode.AUTO)
+    /** Legacy alias `--no-swarm` → вынуждает [swarmMode] = OFF (0 регрессий CLI). */
+    private val noSwarm by option("--no-swarm", help = "Disable swarm (alias for --swarm-mode off)").flag()
 
     /**
      * День 15 (п.4): кэшированная стадия для динамического лейбла спиннера.
@@ -150,6 +162,8 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             toolExecutor = toolExecutor,
             // День 20: лимит раундов tool-loop (default 8) — для «длинного флоу» multi-server оркестрации.
             maxToolRounds = config.maxToolRounds,
+            // День 21 (W6.3): температура основного цикла. --temperature ранее был мёртвым флагом.
+            temperature = temperature,
             // День 19: статусный вывод агента — через mordant-терминал, чтобы печать шла «поверх»
             // активного спиннера (chat() крутит его в withSpinner). Сырой println затирается анимацией.
             logger = AppTerminal::println
@@ -168,7 +182,8 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         // печати блока → гарблинга нет. Блоки стадий печатаются progressive через onEmit.
         val orchestrator = TaskOrchestrator(
             agent, client, model,
-            swarm = !noSwarm,
+            // День 21: --swarm-mode auto|on|off. --no-swarm (legacy) форсирует OFF.
+            swarmMode = if (noSwarm) com.cliagent.agent.swarm.SwarmMode.OFF else swarmMode,
             chat = { msg -> AppTerminal.withSpinner({ spinnerLabel() }) { statefulAgent.chat(msg) } }
         )
 
@@ -178,7 +193,7 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
 
         val invariantsLabel = if (invariantsEnabled) "ON" else "OFF"
         val compressLabel = if (compress) "ON" else "OFF"
-        val swarmLabel = if (noSwarm) "OFF" else "ON"
+        val swarmLabel = if (noSwarm) "OFF" else swarmMode.label.uppercase()
         val modeLabel = (agent.getWorkingMemory()?.interactionMode ?: InteractionMode.PLAN).name.lowercase()
         val mcpLabel = if (mcpServerCount == 0) "OFF" else "$mcpServerCount server(s)"
         AppTerminal.println("CLI Agent v0.8 | Chat: $chatId | Model: $model | Context: ${contextManager.getStrategy().getName()} | MCP: $mcpLabel | MaxToolRounds: ${config.maxToolRounds} | Compress: $compressLabel | Invariants: $invariantsLabel | Swarm: $swarmLabel | Mode: $modeLabel")

@@ -14,7 +14,60 @@ import com.cliagent.state.TaskStage
  */
 object SwarmPrompts {
 
-    // ── Контекст задачи для worker'ов (общая часть, bounded) ──
+    /**
+     * Slim-контекст для worker'а (день 21, волна W3.1). В отличие от полного [boundedContext],
+     * НЕ содержит полные артефакты предшествующих стадий (approvedPlan/implementation/verdict целиком) —
+     * только рамку: задача + короткая подсказка стадии + профиль. Worker'у не нужно перечитывать весь
+     * план/реализацию — его фокус на своём сабтаске. Экономит ~50-60% токенов на каждом worker-вызове.
+     *
+     * Полный контекст остаётся в [leadPrompt] (для декомпозиции) и [integratePrompt] (для сборки).
+     *
+     * День 21 (волна W5.1): [sharedResearch] — результат единого research-вызова (собранные общие
+     * данные/факты через tools). Передаётся всем workers как `[Shared research]`, чтобы каждый не
+     * дублировал одни и те же tool-вызовы (напр. 5× search_wikipedia). null — без research (MODERATE/TRIVIAL).
+     */
+    private fun StageContext.workerContext(
+        stage: TaskStage,
+        sharedResearch: String? = null,
+    ): String = buildString {
+        append("Задача: ").append(taskDescription)
+        // Короткая рамка стадии без полных артефактов (worker действует в рамках своего сабтаска).
+        when (stage) {
+            TaskStage.EXECUTION -> approvedPlan?.let {
+                append("\nКонтекст: следуй утверждённому плану (тебе передана твоя часть).")
+            }
+            TaskStage.VALIDATION -> append("\nКонтекст: проверь свою часть реализации против плана.")
+            else -> {}   // CLARIFY/PLANNING/DONE — рамка не нужна (worker работает с сабтаском lead'а)
+        }
+        // W5.1: shared research — общие данные, собранные до fan-out (убирает дублирующие tool-вызовы).
+        if (!sharedResearch.isNullOrBlank()) {
+            append("\n\n[Shared research — используй эти данные, не повторяй tool-вызовы для них]:\n")
+                .append(sharedResearch)
+        }
+        profileBlock?.let { append("\n").append(it) }
+    }
+
+    /**
+     * W5.1: промпт единого research-вызова перед fan-out workers (только EXECUTION+COMPLEX). Просит
+     * собрать актуальные данные/факты через доступные tools, чтобы workers не дублировали одни и те же
+     * tool-вызовы. Результат передаётся всем workers через [workerContext] как `[Shared research]`.
+     */
+    fun researchPrompt(ctx: StageContext): String = buildString {
+        append("Ты — research-агент. Перед раздачей задач worker'ам собери общие данные для задачи: ")
+        append("актуальные факты, контекст, справки — используя доступные tools (search, file read/write). ")
+        append("Это общий контекст для всех worker'ов; не дублируй его в каждом worker-вызове.\n\n")
+        append(ctx.boundedContext(TaskStage.EXECUTION))
+        append("\n\nДай собранные общие данные (факты/справки/контекст). Если tools не нужны — верни пустой ответ.")
+    }
+
+    /**
+     * W5.1: отдаёт worker-контекст (slim) с опциональным shared research. Используется [SwarmStageAgent]
+     * для построения worker-промпта, передавая результат research-этапа всем workers.
+     */
+    fun workerContextFor(stage: TaskStage, ctx: StageContext, sharedResearch: String?): String =
+        ctx.workerContext(stage, sharedResearch)
+
+    // ── Контекст задачи (общая часть, bounded) ──
 
     private fun StageContext.boundedContext(stage: TaskStage): String = buildString {
         append("Задача: ").append(taskDescription)
@@ -62,6 +115,10 @@ object SwarmPrompts {
             SwarmStrategy.PARTITION -> {
                 append("Разбей работу на ≤${spec.maxWorkers} независимых частей: ${decompositionSubject(stage)}. ")
                 append("Каждая часть должна быть самодостаточной для исполнения отдельным worker'ом. ")
+                // W4.3: покрытие и интерфейсы между частями — убирает дыры в декомпозиции и рассинхрон workers.
+                append("Покрытие должно быть ПОЛНЫМ: сумма частей = вся задача, без пробелов и пересечений. ")
+                append("Если части взаимосвязаны (напр. модули кода), кратко опиши общие контракты/интерфейсы ")
+                append("между ними, чтобы workers не рассинхронизировались. ")
             }
             SwarmStrategy.SPECIALISTS -> {
                 append("Назначь ≤${spec.maxWorkers} ролей-специалистов по граням: ${decompositionSubject(stage)}. ")
@@ -77,20 +134,26 @@ object SwarmPrompts {
 
     // ── Worker ──
 
-    fun workerPrompt(stage: TaskStage, spec: SwarmStrategy, ctx: StageContext, subtask: String, index: Int): String =
-        buildString {
-            append("Ты — worker $index роя. ")
-            when (spec) {
-                SwarmStrategy.PARTITION -> append("Выполни ТОЛЬКО свою часть, не делай чужую: ")
-                    .append(truncateToTokens(subtask, ArtifactLimits.PLAN_IN_STEP_TOKENS))
-                SwarmStrategy.SPECIALISTS -> append("Ты — специалист по грани: ")
-                    .append(truncateToTokens(subtask, ArtifactLimits.PLAN_IN_STEP_TOKENS))
-                    .append(". Проанализируй задачу с этой стороны и дай находки по своей грани. ")
-                SwarmStrategy.REDUNDANCY -> append("Независимо сгенерируй полный ${artifactName(stage)} (вариант $index). ")
-            }
-            append("\n\n").append(ctx.boundedContext(stage))
-            append("\n\nДай результат своей части.")
+    fun workerPrompt(
+        stage: TaskStage,
+        spec: SwarmStrategy,
+        ctx: StageContext,
+        subtask: String,
+        index: Int,
+        sharedResearch: String? = null,
+    ): String = buildString {
+        append("Ты — worker $index роя. ")
+        when (spec) {
+            SwarmStrategy.PARTITION -> append("Выполни ТОЛЬКО свою часть, не делай чужую: ")
+                .append(truncateToTokens(subtask, ArtifactLimits.PLAN_IN_STEP_TOKENS))
+            SwarmStrategy.SPECIALISTS -> append("Ты — специалист по грани: ")
+                .append(truncateToTokens(subtask, ArtifactLimits.PLAN_IN_STEP_TOKENS))
+                .append(". Проанализируй задачу с этой стороны и дай находки по своей грани. ")
+            SwarmStrategy.REDUNDANCY -> append("Независимо сгенерируй полный ${artifactName(stage)} (вариант $index). ")
         }
+        append("\n\n").append(workerContextFor(stage, ctx, sharedResearch))   // W3.1+W5.1: slim + shared research
+        append("\n\nДай результат своей части.")
+    }
 
     // ── Integrate ──
 
