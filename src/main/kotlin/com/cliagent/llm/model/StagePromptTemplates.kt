@@ -54,6 +54,8 @@ object StagePromptTemplates {
                 Verify the produced result against the plan and constraints.
                 Do NOT add new features or code unless fixing a found defect.
                 End with a clear verdict: PASS or REWORK (with reasons).
+                If file-reading tools are available, read the actual artifact file to verify it
+                rather than relying on memory of what was written.
             """.trimIndent()
         )
         TaskStage.DONE -> ChatMessage(
@@ -70,38 +72,53 @@ object StagePromptTemplates {
      * EXECUTION-промпт по [TaskKind] (день 15, фикс #1). Код — только для [TaskKind.CODE];
      * для остальных — ответ/решение/рассуждение/текст. `null` → универсальный промпт, где LLM
      * сама решает, нужен ли код (защита от сбоя классификации — не форсируем код).
+     *
+     * День 21 (волна W3.3): к каждой ветке добавляется [toolAwareHint] — поощрение использовать
+     * доступные tools (search/read) для актуальных данных вместо опоры на память. Агент
+     * универсальный — намёк обобщённый (категории tools), без хардкода домена.
      */
-    private fun executionPrompt(taskKind: TaskKind?): String = when (taskKind) {
-        TaskKind.CODE -> """
-            You are a senior software assistant in the EXECUTION stage.
-            Implement the task following the approved plan: write working code, make decisions,
-            and record them.
-            Do not re-plan unless the plan is demonstrably broken.
-        """.trimIndent()
-        TaskKind.REASONING -> """
-            You are a senior assistant in the EXECUTION stage of a reasoning/analytical task.
-            Work through the task following the approved plan and produce the concrete answer,
-            solution or conclusion for each step. Reason explicitly and record key decisions.
-            Do NOT write code unless a step explicitly requires runnable code.
-            Do not re-plan unless the plan is demonstrably broken.
-        """.trimIndent()
-        TaskKind.WRITING -> """
-            You are a senior assistant in the EXECUTION stage of a writing task.
-            Produce the requested text/document following the approved plan, step by step.
-            Do NOT write code. Do not re-plan unless the plan is demonstrably broken.
-        """.trimIndent()
-        TaskKind.EXPLANATION -> """
-            You are a senior assistant in the EXECUTION stage of an explanation task.
-            Explain the topic clearly and concretely, following the approved plan.
-            Do NOT write code unless illustrating a concept is explicitly required.
-            Do not re-plan unless the plan is demonstrably broken.
-        """.trimIndent()
-        null -> """
-            You are a senior software assistant in the EXECUTION stage.
-            Execute the task following the approved plan and produce the concrete result:
-            working code if the task is programming, otherwise the answer, solution or reasoning.
-            Record key decisions.
-            Do not re-plan unless the plan is demonstrably broken.
-        """.trimIndent()
+    private fun executionPrompt(taskKind: TaskKind?): String {
+        val base = when (taskKind) {
+            TaskKind.CODE -> """
+                You are a senior software assistant in the EXECUTION stage.
+                Implement the task following the approved plan: write working code, make decisions,
+                and record them.
+                Do not re-plan unless the plan is demonstrably broken.
+            """.trimIndent()
+            TaskKind.REASONING -> """
+                You are a senior assistant in the EXECUTION stage of a reasoning/analytical task.
+                Work through the task following the approved plan and produce the concrete answer,
+                solution or conclusion for each step. Reason explicitly and record key decisions.
+                Do NOT write code unless a step explicitly requires runnable code.
+                Do not re-plan unless the plan is demonstrably broken.
+            """.trimIndent()
+            TaskKind.WRITING -> """
+                You are a senior assistant in the EXECUTION stage of a writing task.
+                Produce the requested text/document following the approved plan, step by step.
+                Do NOT write code. Do not re-plan unless the plan is demonstrably broken.
+            """.trimIndent()
+            TaskKind.EXPLANATION -> """
+                You are a senior assistant in the EXECUTION stage of an explanation task.
+                Explain the topic clearly and concretely, following the approved plan.
+                Do NOT write code unless illustrating a concept is explicitly required.
+                Do not re-plan unless the plan is demonstrably broken.
+            """.trimIndent()
+            null -> """
+                You are a senior software assistant in the EXECUTION stage.
+                Execute the task following the approved plan and produce the concrete result:
+                working code if the task is programming, otherwise the answer, solution or reasoning.
+                Record key decisions.
+                Do not re-plan unless the plan is demonstrably broken.
+            """.trimIndent()
+        }
+        return "$base\n\n$toolAwareHint"
     }
+
+    /**
+     * W3.3: намёк использовать доступные tools (search/read/write) для актуальных данных/фактов.
+     * Обобщённый — без хардкода доменных tools по именам (агент универсальный).
+     */
+    private const val toolAwareHint =
+        "If the task needs up-to-date data or facts, prefer available tools (search, file read/write) " +
+            "over relying on your memory."
 }

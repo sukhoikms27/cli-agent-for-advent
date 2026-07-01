@@ -40,6 +40,7 @@ interface StageAgent {
  * @param profile          профиль пользователя (style/constraints) — контекст для всех стадий
  * @param feedback         текст-уточнение от пользователя (перегенерация артефакта); null при первом запуске
  * @param taskKind         тип задачи (Day 15 фикс #1) — ветвит EXECUTION/StepAgent-промпты; null — неизвестен
+ * @param complexity       сложность задачи (день 21, W2): TRIVIAL/MODERATE/COMPLEX — гейтит shared pre-fetch (W5)
  * @param tokenCounter     оценка токенов для bounded-усечения межартефактных передач (мера C); null — агент не усекает
  */
 data class StageContext(
@@ -51,6 +52,7 @@ data class StageContext(
     val profile: UserProfile? = null,
     val feedback: String? = null,
     val taskKind: TaskKind? = null,
+    val complexity: com.cliagent.state.TaskComplexity? = null,
     val tokenCounter: TokenCounter? = null
 ) {
     /** Профиль в виде блока для промпта (constraints/style), если задан и не пуст. */

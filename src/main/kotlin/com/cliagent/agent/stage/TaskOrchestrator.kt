@@ -51,14 +51,27 @@ class TaskOrchestrator(
     private val classifier: EntryStageClassifier = EntryStageClassifier(llmClient, model),
     private val taskKindClassifier: TaskKindClassifier = TaskKindClassifier(llmClient, model),
     private val confirmationClassifier: ConfirmationClassifier = ConfirmationClassifier(llmClient, model),
+    /** День 21 (W2): классификатор сложности задачи — определяет, где рой окупается. */
+    private val complexityClassifier: TaskComplexityClassifier = TaskComplexityClassifier(llmClient, model),
     /**
-     * Часть 3: рой V4 на всех стадиях (true → [SwarmStageAgent]; false → простые stage-агенты).
-     * Default false — сохраняет простое поведение в тестах; ChatCommand включает рой (true),
-     * `--no-swarm` отключает. Рой дробит работу → bounded-контекст на worker → структурно убирает
-     * обрыв длинных артефактов.
+     * День 21 (волна W1): режим роя. [com.cliagent.agent.swarm.SwarmMode.AUTO] — адаптивный гейт
+     * (рой только на PLANNING/EXECUTION/VALIDATION; CLARIFY/DONE — single; TRIVIAL → все single).
+     * [SwarmMode.ON] — рой на всех стадиях (дебаг). [SwarmMode.OFF] — простые агенты везде.
+     *
+     * **Дефолт OFF** — сохраняет детерминизм в тестах (где оркестратор часто строится без явного
+     * режима). ChatCommand прокидывает реальный режим из `--swarm-mode` (AUTO по умолчанию в CLI).
+     *
+     * **Важно:** complexity (волна W2) определяется в [startTask] и может переопределить выбор
+     * агентов: TRIVIAL → все single-agent даже при AUTO. Поэтому [agents] пересобирается в
+     * [startTask], если не задан явно.
+     */
+    private val swarmMode: com.cliagent.agent.swarm.SwarmMode = com.cliagent.agent.swarm.SwarmMode.OFF,
+    /**
+     * Legacy boolean (backward-compat с тестами). Если [swarmMode] не задан явно (AUTO), `swarm=true`
+     * форсирует [SwarmMode.ON]. Новый код должен использовать [swarmMode].
      */
     swarm: Boolean = false,
-    agents: Map<TaskStage, StageAgent> = defaultAgents(swarm),
+    agents: Map<TaskStage, StageAgent>? = null,
     /**
      * День 15 (gap №6): провайдер LLM-чата для stage-вызовов. Default — agent.chat (текущее
      * поведение). Wiring (ChatCommand) подставляет StatefulAgent.chat → инварианты покрывают
@@ -66,7 +79,12 @@ class TaskOrchestrator(
      */
     private val chat: suspend (String) -> String = { userMsg -> agent.chat(userMsg) }
 ) {
-    private val agents: Map<TaskStage, StageAgent> = agents
+    // effective swarm mode: swarmMode имеет приоритет; legacy swarm=true → ON только если swarmMode=OFF.
+    private val effectiveSwarmMode: com.cliagent.agent.swarm.SwarmMode =
+        if (swarm && swarmMode == com.cliagent.agent.swarm.SwarmMode.OFF) com.cliagent.agent.swarm.SwarmMode.ON
+        else swarmMode
+    private val agentsExplicitlySet: Boolean = agents != null
+    private var agents: Map<TaskStage, StageAgent> = agents ?: defaultAgents(effectiveSwarmMode)
 
     /**
      * День 19 (debug): текущая стадия для дампа raw-ответов в [chatWithContinue]. Ставится в
@@ -93,12 +111,19 @@ class TaskOrchestrator(
     ): String {
         val startStage = classifier.classify(taskDescription)
         val kind = taskKindClassifier.classify(taskDescription)
+        // День 21 (W2): сложность задачи → пересобираем реестр агентов (если AUTO и не задан явно).
+        // TRIVIAL → все single-agent; MODERATE/COMPLEX → применяем AUTO-гейт. OFF/ON игнорируют complexity.
+        val complexity = complexityClassifier.classify(taskDescription)
+        if (effectiveSwarmMode == com.cliagent.agent.swarm.SwarmMode.AUTO && !agentsExplicitlySet) {
+            agents = defaultAgents(effectiveSwarmMode, complexity)
+        }
         agent.setTaskState(
             TaskState(
                 stage = startStage,
                 currentStep = taskDescription,
                 awaitingAdvance = false,
-                taskKind = kind
+                taskKind = kind,
+                complexity = complexity
             )
         )
         return drive(startStage, taskDescription, feedback = null, mode = mode, onEmit = onEmit, onStageStart = onStageStart)
@@ -259,6 +284,7 @@ class TaskOrchestrator(
             profile = profile,
             feedback = feedback,
             taskKind = current.taskKind,
+            complexity = current.complexity,
             tokenCounter = agent.tokenCounter()
         )
 
@@ -385,20 +411,55 @@ class TaskOrchestrator(
         private const val MAX_DEBUG_CHARS = 2000
 
         /**
-         * Реестр стадийных агентов по умолчанию. [swarm]=true → [SwarmStageAgent] на каждую стадию
-         * (рой V4); false → простые последовательные агенты (fallback/тесты).
+         * Реестр стадийных агентов по умолчанию.
+         *
+         * День 21 (волна W1): вместо бинарного `swarm` принимается [SwarmMode].
+         * - [SwarmMode.OFF]  — простые агенты на всех стадиях (бывший swarm=false).
+         * - [SwarmMode.ON]   — рой на всех стадиях (бывший swarm=true; для дебага).
+         * - [SwarmMode.AUTO] — адаптивный гейт: рой только на PLANNING/EXECUTION/VALIDATION;
+         *   CLARIFY/DONE — простые агенты (фан-аут на уточнении/суммаризации неоправдан → экономия
+         *   ~5 LLM-вызовов на задачу).
+         *
+         * [complexity] (волна W2): при TRIVIAL — простые агенты на ВСЕХ стадиях (рой не окупается);
+         *   учитывается только в AUTO. null трактуется как MODERATE.
+         */
+        fun defaultAgents(
+            swarmMode: com.cliagent.agent.swarm.SwarmMode,
+            complexity: com.cliagent.state.TaskComplexity? = null,
+        ): Map<TaskStage, StageAgent> {
+            // Stage→swarm decision. ON = рой везде; OFF = нигде; AUTO = адаптивно.
+            val swarmStages: Set<TaskStage> = when (swarmMode) {
+                com.cliagent.agent.swarm.SwarmMode.OFF -> emptySet()
+                com.cliagent.agent.swarm.SwarmMode.ON -> TaskStage.entries.toSet()
+                com.cliagent.agent.swarm.SwarmMode.AUTO -> {
+                    // W2: TRIVIAL → рой нигде (весь пайплайн single-agent).
+                    if (complexity == com.cliagent.state.TaskComplexity.TRIVIAL) {
+                        emptySet()
+                    } else {
+                        // W1.1+W1.2: CLARIFY/DONE — простые; PLANNING/EXECUTION/VALIDATION — рой.
+                        setOf(TaskStage.PLANNING, TaskStage.EXECUTION, TaskStage.VALIDATION)
+                    }
+                }
+            }
+            return TaskStage.entries.associateWith { stage ->
+                if (stage in swarmStages) SwarmStageAgent(stage) else simpleAgent(stage)
+            }
+        }
+
+        /** Простые (single-pass) агенты по стадии — для [SwarmMode.OFF] и AUTO-гейтов (CLARIFY/DONE). */
+        private fun simpleAgent(stage: TaskStage): StageAgent = when (stage) {
+            TaskStage.CLARIFY -> ClarifyStageAgent()
+            TaskStage.PLANNING -> PlanningStageAgent()
+            TaskStage.EXECUTION -> ExecutionStageAgent()
+            TaskStage.VALIDATION -> ValidationStageAgent()
+            TaskStage.DONE -> DoneStageAgent()
+        }
+
+        /**
+         * Legacy-перегрузка (boolean) — backward-compat для тестов и внешних вызовов. Не удалять.
+         * swarm=true → [SwarmMode.ON]; false → [SwarmMode.OFF].
          */
         fun defaultAgents(swarm: Boolean = false): Map<TaskStage, StageAgent> =
-            if (swarm) {
-                TaskStage.entries.associateWith { SwarmStageAgent(it) }
-            } else {
-                mapOf(
-                    TaskStage.CLARIFY to ClarifyStageAgent(),
-                    TaskStage.PLANNING to PlanningStageAgent(),
-                    TaskStage.EXECUTION to ExecutionStageAgent(),
-                    TaskStage.VALIDATION to ValidationStageAgent(),
-                    TaskStage.DONE to DoneStageAgent()
-                )
-            }
+            defaultAgents(if (swarm) com.cliagent.agent.swarm.SwarmMode.ON else com.cliagent.agent.swarm.SwarmMode.OFF)
     }
 }

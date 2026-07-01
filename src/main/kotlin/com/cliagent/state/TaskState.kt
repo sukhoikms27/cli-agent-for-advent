@@ -52,5 +52,6 @@ data class TaskState(
     val stageHistory: List<StageTransition> = emptyList(),
     val awaitingAdvance: Boolean = false,   // ждёт подтверждения перехода (авто-поток, Day 13)
     val requirements: String? = null,       // артефакт clarify (сводка требований, Day 13)
-    val taskKind: TaskKind? = null          // тип задачи (Day 15 фикс #1): ветвит EXECUTION-промпт
+    val taskKind: TaskKind? = null,         // тип задачи (Day 15 фикс #1): ветвит EXECUTION-промпт
+    val complexity: TaskComplexity? = null  // день 21 (W2): TRIVIAL/MODERATE/COMPLEX → где рой окупается
 )
