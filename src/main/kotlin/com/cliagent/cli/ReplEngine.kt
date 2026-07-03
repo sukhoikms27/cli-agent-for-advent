@@ -95,7 +95,9 @@ class ReplEngine {
         )
         val rag = ArgumentCompleter(
             StringsCompleter("/rag"),
-            StringsCompleter("index", "stats", "compare", "search", "config", "on", "off", "eval")
+            StringsCompleter("index", "stats", "compare", "compare-modes", "search", "config", "on", "off", "eval", "rewrite", "rerank"),
+            // День 23: подсказки значений для rewrite/rerank (3-й аргумент).
+            StringsCompleter("identity", "heuristic", "llm", "none", "threshold", "fixed", "structural")
         )
         val mcp = ArgumentCompleter(
             StringsCompleter("/mcp"),

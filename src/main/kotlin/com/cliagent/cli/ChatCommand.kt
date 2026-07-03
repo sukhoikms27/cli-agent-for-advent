@@ -166,6 +166,12 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             embedder = ragEmbedder,
             topK = config.rag.topK,
             fallbackStore = ragFallbackStore,
+            // День 23: query rewrite + реранкинг/фильтрация (null при none/identity → поведение дня 22).
+            // LLM-варианты используют общий `client` (z.ai GLM), а не embedder. Фабрики — в rag/RagFactories.kt.
+            rewriter = if (config.rag.queryRewriter.lowercase() == "identity") null
+                else com.cliagent.rag.queryRewriterOf(config.rag.queryRewriter, client, model),
+            reranker = com.cliagent.rag.rerankerOf(config.rag.reranker, config.rag, client, model),
+            candidatePoolSize = config.rag.candidatePoolSize,
         )
 
         val agent = ContextAwareAgent(
@@ -220,9 +226,12 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         val mcpLabel = if (mcpServerCount == 0) "OFF" else "$mcpServerCount server(s)"
         // День 22 (RAG): команды /rag + инъекция retrieved-чанков в промпт. chat() — для /rag eval
         // (прогон контрольных вопросов в обоих режимах); agent — для toggle on|off.
-        val ragCommands = RagCommands(config.rag, ragEmbedder, agent) { msg ->
-            AppTerminal.withSpinner({ "RAG eval…" }) { statefulAgent.chat(msg) }
-        }
+        val ragCommands = RagCommands(config.rag, ragEmbedder, agent,
+            chat = { msg -> AppTerminal.withSpinner({ "RAG eval…" }) { statefulAgent.chat(msg) } },
+            ragRetriever = ragRetriever,
+            llmClient = client,
+            model = model,
+        )
         val ragLabel = if (agent.isRagEnabled()) "ON" else "OFF"
         AppTerminal.println("CLI Agent v0.8 | Chat: $chatId | Model: $model | Context: ${contextManager.getStrategy().getName()} | MCP: $mcpLabel | RAG: $ragLabel | MaxToolRounds: ${config.maxToolRounds} | Compress: $compressLabel | Invariants: $invariantsLabel | Swarm: $swarmLabel | Mode: $modeLabel")
         AppTerminal.println("Type /help for commands, /exit to quit")

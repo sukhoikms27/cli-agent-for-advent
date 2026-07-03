@@ -101,9 +101,20 @@ data class ScoredChunk(
  * @param chunkSizeTokens  целевой размер чанка (500–1000, рекомендация лекции)
  * @param chunkOverlapTokens перекрытие границ (overlap решает потерю контекста на стыках)
  * @param defaultStrategy  "fixed" | "structural"
- * @param topK             сколько чанков извлекать и инжектить в промпт (день 22)
+ * @param topK             сколько чанков извлекать и инжектить в промпт (день 22; день 23 —
+ *                       финальное число ПОСЛЕ реранкинга/фильтрации)
  * @param injectIntoPrompt собирать ли блок `[Retrieved context]` (false = только retrieval-команды,
  *                       как в день 21; удобно для A/B-сравнения без инъекции)
+ * @param candidatePoolSize топ-K ДО фильтрации (день 23, лекция недели 5: «ищем топ-20 кандидатов,
+ *                       затем реранкер переоценивает»). Candidate-pool ≥ topK; из него реранкер/фильтр
+ *                       отбирают финальные [topK]. При reranker=none этот параметр не используется.
+ * @param similarityThreshold порог отсечения нерелевантных чанков по косинусному сходству (день 23).
+ *                       `0.0` = без отсечения; чанки со score ≥ threshold сохраняются. Используется
+ *                       `threshold`-реранкером. Задел под день 24 (режим «не знаю» при слабом контексте).
+ * @param queryRewriter   тип query rewrite (день 23): "identity" | "heuristic" | "llm". Переформулирует
+ *                       запрос до эмбеддинга (синонимы, расширение аббревиатур, нормализация).
+ * @param reranker        тип реранкера/фильтра (день 23): "none" | "threshold" | "heuristic" | "llm".
+ *                       Второй этап после topK-поиска (лекция недели 5: CrossEncoder/оценка релевантности).
  */
 @Serializable
 data class RagConfig(
@@ -116,5 +127,11 @@ data class RagConfig(
     val chunkOverlapTokens: Int = 100,
     val defaultStrategy: String = "structural",
     val topK: Int = 5,
-    val injectIntoPrompt: Boolean = true
+    val injectIntoPrompt: Boolean = true,
+    // День 23: реранкинг и фильтрация (лекция недели 5). Все поля с defaults — старые config.json
+    // грузятся без правок (schema evolution, AGENTS.md); дефолты воспроизводят поведение дня 22.
+    val candidatePoolSize: Int = 20,
+    val similarityThreshold: Float = 0.0f,
+    val queryRewriter: String = "identity",
+    val reranker: String = "none"
 )
