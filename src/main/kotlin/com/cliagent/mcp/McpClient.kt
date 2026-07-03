@@ -61,7 +61,15 @@ class McpClient(private val transport: McpTransportConfig) {
             when (val t = transport) {
                 is McpTransportConfig.Stdio -> {
                     require(t.command.isNotEmpty()) { "MCP command is empty" }
-                    val proc = ProcessBuilder(t.command)
+                    // Windows: 'npx', 'npm' и др. — это .cmd/.bat batch-файлы; Java ProcessBuilder
+                    // не резолвит эти расширения по имени → CreateProcess error=2. Оборачиваем в
+                    // `cmd.exe /c`, чтобы Windows command processor сам нашёл и запустил batch-файл.
+                    val fullCommand = if (System.getProperty("os.name").startsWith("Windows", ignoreCase = true)) {
+                        listOf("cmd.exe", "/c") + t.command
+                    } else {
+                        t.command
+                    }
+                    val proc = ProcessBuilder(fullCommand)
                         .redirectErrorStream(false)   // stdout несёт JSON-RPC — не смешивать с stderr
                         .start()
                     process = proc

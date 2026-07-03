@@ -44,7 +44,7 @@ while (true) {
 ### Цветной вывод: mordant
 
 [mordant](https://github.com/ajalt/mordant) — от того же автора, что clikt. Даёт:
-- ANSI-цвета с auto-detect и `--no-color` fallback
+- ANSI-цвета с auto-ddoskey cli-agent="%CD%\build\install\cli-agent\bin\cli-agent.bat" $*etect и `--no-color` fallback
 - Таблицы для `/stats`
 - Спиннеры для загрузки
 
@@ -262,6 +262,7 @@ src/main/kotlin/com/cliagent/
 │   ├── VectorMath.kt           # cosine similarity + topK
 │   ├── JsonRagStore.kt         # JSON index persistence (atomicWrite)
 │   ├── RagIndexer.kt           # chunk → embed → save orchestrator
+│   ├── RagRetriever.kt         # query → embed → topK retrieval (day 22, инъекция в промпт)
 │   └── ChunkingComparison.kt   # 2-strategy stats + probe retrieval
 └── config/                     # Configuration
     ├── AppConfig.kt            # config data class (+rag: RagConfig)

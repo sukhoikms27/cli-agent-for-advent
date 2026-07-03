@@ -25,11 +25,19 @@ class ReplEngine {
         .dumb(true)   // fallback для non-TTY (piped stdin) — без editing, но читает строки
         .build()
 
-    private val reader: LineReader = LineReaderBuilder.builder()
-        .terminal(terminal)
-        .completer(buildCompleter())
-        .variable(LineReader.HISTORY_FILE, AppPaths.replHistoryFile.toString())
-        .build()
+    private val reader: LineReader = run {
+        // Windows: пути содержат '\' (C:\Users\...). DefaultParser JLine3 трактует '\' как escape —
+        // '\U','\s','\D' проглатываются → путь ломается (C:Userssukhoi27...). Отключаем escape-режим
+        // (пустой массив = нет escape-символов), чтобы '\' передавался как обычный символ.
+        val parser = org.jline.reader.impl.DefaultParser()
+        parser.escapeChars = CharArray(0)
+        LineReaderBuilder.builder()
+            .terminal(terminal)
+            .completer(buildCompleter())
+            .variable(LineReader.HISTORY_FILE, AppPaths.replHistoryFile.toString())
+            .parser(parser)
+            .build()
+    }
 
     init {
         Files.createDirectories(AppPaths.replHistoryFile.parent)
@@ -85,6 +93,14 @@ class ReplEngine {
             StringsCompleter("/mode"),
             StringsCompleter("manual", "plan", "auto", "show")
         )
-        return AggregateCompleter(top, strategy, branch, memory, profile, task, invariants, mode)
+        val rag = ArgumentCompleter(
+            StringsCompleter("/rag"),
+            StringsCompleter("index", "stats", "compare", "search", "config", "on", "off", "eval")
+        )
+        val mcp = ArgumentCompleter(
+            StringsCompleter("/mcp"),
+            StringsCompleter("add", "remove", "enable", "disable", "on", "off", "list-tools")
+        )
+        return AggregateCompleter(top, strategy, branch, memory, profile, task, invariants, mode, rag, mcp)
     }
 }

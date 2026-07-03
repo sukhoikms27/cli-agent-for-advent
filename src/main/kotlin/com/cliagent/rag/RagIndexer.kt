@@ -66,7 +66,11 @@ class RagIndexer(
                     return null
                 }
                 @Suppress("UNCHECKED_CAST")
-                allVectors.addAll((batchResult as com.cliagent.llm.LlmResult.Success).data)
+                val batchVectors = (batchResult as com.cliagent.llm.LlmResult.Success).data
+                // Защита: embedder вернул успех, но 0 векторов на ненулевой batch → silent failure
+                // (напр. старый баг OllamaEmbeddingClient, или кривой mock). Не сохраняем «битый» индекс.
+                if (batchVectors.size != batch.size) return null
+                allVectors.addAll(batchVectors)
                 onProgress(start + batch.size, total)
             }
             rawChunks.zip(allVectors) { chunk, vec -> chunk.copy(embedding = vec, tokenCount = chunk.tokenCount) }

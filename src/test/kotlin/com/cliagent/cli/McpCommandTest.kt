@@ -58,6 +58,20 @@ class McpCommandTest {
     }
 
     @Test
+    fun `mcp disable without name prints usage`() = runTest {
+        assertDoesNotThrow {
+            cmd.handleMcp("/mcp disable", servers = emptyList())
+        }
+    }
+
+    @Test
+    fun `mcp enable without name prints usage`() = runTest {
+        assertDoesNotThrow {
+            cmd.handleMcp("/mcp enable", servers = emptyList())
+        }
+    }
+
+    @Test
     fun `mcpServerConfig toTransport sanity`() {
         // косвенная проверка модели через репозитарный тест; здесь — только smoke
         val s = McpServerConfig(name = "x", command = "java", args = listOf("-jar", "y"))

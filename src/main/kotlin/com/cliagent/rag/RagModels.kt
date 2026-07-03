@@ -91,7 +91,9 @@ data class ScoredChunk(
  * Конфигурация RAG (часть [com.cliagent.config.AppConfig.rag]). Все поля с defaults — старые
  * config.json грузятся без ошибок; новые поля добавляются только с defaults (AGENTS.md).
  *
- * @param enabled          включён ли RAG (статус-строка, день 22 — инъекция в промпт)
+ * @param enabled          включён ли RAG-режим агента по умолчанию (инъекция в промпт, день 22).
+ *                       В CLI переопределяется в рантайме через `/rag on|off`. Дни 1–21 поле
+ *                       влияло только на статус-строку.
  * @param embeddingProvider "ollama" (пока единственный; interface готов к облаку)
  * @param embeddingModel   "nomic-embed-text" (768 dim, из лекции недели 5)
  * @param embeddingBaseUrl "http://localhost:11434" — Ollama; на VPS заменить адрес
@@ -99,6 +101,9 @@ data class ScoredChunk(
  * @param chunkSizeTokens  целевой размер чанка (500–1000, рекомендация лекции)
  * @param chunkOverlapTokens перекрытие границ (overlap решает потерю контекста на стыках)
  * @param defaultStrategy  "fixed" | "structural"
+ * @param topK             сколько чанков извлекать и инжектить в промпт (день 22)
+ * @param injectIntoPrompt собирать ли блок `[Retrieved context]` (false = только retrieval-команды,
+ *                       как в день 21; удобно для A/B-сравнения без инъекции)
  */
 @Serializable
 data class RagConfig(
@@ -109,5 +114,7 @@ data class RagConfig(
     val corpusRoots: List<String> = listOf("plan", "docs", "README.md"),
     val chunkSizeTokens: Int = 500,
     val chunkOverlapTokens: Int = 100,
-    val defaultStrategy: String = "structural"
+    val defaultStrategy: String = "structural",
+    val topK: Int = 5,
+    val injectIntoPrompt: Boolean = true
 )

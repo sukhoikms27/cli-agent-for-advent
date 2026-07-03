@@ -1,0 +1,62 @@
+[
+  {
+    "id": "q1",
+    "question": "Какие четыре стратегии управления контекстом реализованы в проекте?",
+    "expectedKeywords": ["sliding", "facts", "summary", "branch"],
+    "expectedSources": ["global-plan.md", "AGENTS.md"]
+  },
+  {
+    "id": "q2",
+    "question": "Какие слои памяти есть у агента и в чём разница между working и long-term memory?",
+    "expectedKeywords": ["working", "long", "task", "knowledge"],
+    "expectedSources": ["AGENTS.md"]
+  },
+  {
+    "id": "q3",
+    "question": "Как работает tool-use loop в агенте и сколько раундов по умолчанию?",
+    "expectedKeywords": ["tool", "rounds", "8"],
+    "expectedSources": ["AGENTS.md"]
+  },
+  {
+    "id": "q4",
+    "question": "Какие две стратегии чанкинга поддерживает RAG и чем они отличаются?",
+    "expectedKeywords": ["fixed", "structural"],
+    "expectedSources": ["global-plan.md"]
+  },
+  {
+    "id": "q5",
+    "question": "Зачем нужны project invariants и какие категории инвариантов есть?",
+    "expectedKeywords": ["invariant", "STACK", "BAN", "ARCH"],
+    "expectedSources": ["global-plan.md", "AGENTS.md"]
+  },
+  {
+    "id": "q6",
+    "question": "Что хранит профиль пользователя и какие у него поля?",
+    "expectedKeywords": ["style", "format", "about", "constraints"],
+    "expectedSources": ["global-plan.md"]
+  },
+  {
+    "id": "q7",
+    "question": "Какие стадии проходит задача в task state machine?",
+    "expectedKeywords": ["clarify", "planning", "execution", "validation"],
+    "expectedSources": ["global-plan.md", "AGENTS.md"]
+  },
+  {
+    "id": "q8",
+    "question": "Какой LLM-провайдер и модель используются в проекте по умолчанию?",
+    "expectedKeywords": ["z.ai", "glm"],
+    "expectedSources": ["AGENTS.md"]
+  },
+  {
+    "id": "q9",
+    "question": "Как эмбеддинг-модель сравнивает тексты и что означает косинусное сходство равное 1?",
+    "expectedKeywords": ["cosine", "embedding", "1"],
+    "expectedSources": ["global-plan.md"]
+  },
+  {
+    "id": "q10",
+    "question": "Какие паттерны корутин применяются в проекте для REPL и IO-операций?",
+    "expectedKeywords": ["runBlocking", "Dispatchers", "SupervisorJob"],
+    "expectedSources": ["AGENTS.md"]
+  }
+]

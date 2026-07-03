@@ -173,6 +173,37 @@ class ConfigRepositoryTest {
     }
 
     @Test
+    fun `setMcpServerEnabled disables a server without removing it`() {
+        val r = repo(configJson = """{"apiKey":"k","mcp":[{"name":"fs","command":"npx","args":["server-filesystem","/tmp"]}]}""")
+        val changed = r.setMcpServerEnabled("fs", enabled = false)
+
+        assertTrue(changed)
+        val servers = r.loadConfigFile().mcp
+        assertEquals(1, servers.size, "server must remain in config")
+        assertEquals("fs", servers[0].name)
+        assertFalse(servers[0].enabled, "enabled flag must flip to false")
+        assertEquals("npx", servers[0].command, "transport fields preserved")
+    }
+
+    @Test
+    fun `setMcpServerEnabled re-enables a previously disabled server`() {
+        val r = repo(configJson = """{"apiKey":"k","mcp":[{"name":"fs","command":"npx","enabled":false}]}""")
+        assertTrue(r.setMcpServerEnabled("fs", enabled = true))
+        assertTrue(r.loadConfigFile().mcp[0].enabled)
+    }
+
+    @Test
+    fun `setMcpServerEnabled returns false when server absent or flag unchanged`() {
+        val r = repo(configJson = """{"apiKey":"k","mcp":[{"name":"fs","command":"npx","enabled":true}]}""")
+        // сервера нет
+        assertFalse(r.setMcpServerEnabled("ghost", enabled = false))
+        // флаг уже в нужном состоянии (true)
+        assertFalse(r.setMcpServerEnabled("fs", enabled = true))
+        // файл не должен был измениться
+        assertTrue(r.loadConfigFile().mcp[0].enabled)
+    }
+
+    @Test
     fun `initFromLegacy creates file from local properties`() {
         val r = repo(localProps = "api.key=legacykey\nmodel=glm-4.7")
         val created = r.initFromLegacy()

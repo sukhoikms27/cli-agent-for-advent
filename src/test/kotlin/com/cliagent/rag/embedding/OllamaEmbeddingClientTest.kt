@@ -100,6 +100,34 @@ class OllamaEmbeddingClientTest {
         client.close()
     }
 
+    @Test
+    fun `embed detects Ollama error field instead of masking as empty success`() = runTest {
+        // РЕГРЕССИЯ: Ollama при краше модели (CUDA error и т.п.) возвращает HTTP 200 с телом
+        // {"error":"..."} и без поля embeddings. До фикса это маскировалось как Success с 0 векторами
+        // → индекс сохранялся пустым, retrieval тихо падал. Теперь должно быть явной ошибкой.
+        val client = clientWith(
+            """{"error":"llama-server process has terminated: CUDA error"}""",
+            status = HttpStatusCode.OK,
+        )
+        val result = client.embed(listOf("hello", "world"))
+        assertTrue(result is LlmResult.Error, "error-field response must NOT be masked as success; got $result")
+        val err = result as LlmResult.Error
+        assertTrue(err.message.contains("CUDA") || err.message.contains("Ollama error"),
+            "expected error message surfaced, got: ${err.message}")
+        client.close()
+    }
+
+    @Test
+    fun `embed detects vector-count mismatch as error`() = runTest {
+        // Защита: запросили 2 эмбеддинга, Ollama вернула 1 → silent failure, индекс бы обрезался.
+        val client = clientWith(
+            """{"model":"nomic-embed-text","embeddings":[[0.1,0.2,0.3]]}""",
+        )
+        val result = client.embed(listOf("hello", "world"))
+        assertTrue(result is LlmResult.Error, "vector-count mismatch must be an error; got $result")
+        client.close()
+    }
+
     // ── helpers ─────────────────────────────────────────────────────────────────
 
     private fun clientWith(body: String, status: HttpStatusCode = HttpStatusCode.OK): OllamaEmbeddingClient {
