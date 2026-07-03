@@ -18,31 +18,39 @@ import com.cliagent.rag.embedding.OllamaEmbeddingClient
 import com.cliagent.rag.topK
 import com.github.ajalt.mordant.table.table
 import kotlinx.coroutines.CancellationException
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
 
 /**
- * День 21: обработчик slash-команды `/rag` (индексация документов). Зеркалирует структуру
- * `handleMcp` в [ChatCommand]: разбор частей → dispatch по подкоманде.
+ * День 21–22: обработчик slash-команды `/rag`. Зеркалирует структуру `handleMcp` в [ChatCommand]:
+ * разбор частей → dispatch по подкоманде.
  *
- * **Важно:** RAG опционален. Без установленной Ollama команды индексации деградируют с понятным
- * сообщением; остальной агент не страдает. День 22 добавит инъекцию retrieved-чанков в промпт.
+ * **Важно:** RAG опционален. Без установленной Ollama команды индексации/eval деградируют с
+ * понятным сообщением; остальной агент не страдает.
  *
  * Команды:
- * - `/rag` — сводка (статус Ollama + текущий индекс)
+ * - `/rag` — сводка (статус RAG-режима + Ollama + текущий индекс)
  * - `/rag index [fixed|structural]` — переиндексация корпуса выбранной стратегией
  * - `/rag stats` — статистика текущего индекса (mordant-таблица)
  * - `/rag compare` — построить оба индекса + сравнительная таблица + пробный retrieval
  * - `/rag search <query>` — пробный retrieval top-5 (без агента; smoke-test)
+ * - `/rag on` / `/rag off` — toggle RAG-режима агента (инъекция в промпт, день 22)
+ * - `/rag eval` — прогон 10 контрольных вопросов с/без RAG + сравнительный отчёт (день 22)
  * - `/rag config` — показать RagConfig
+ *
+ * @param agent агент для toggle on|off и eval-прогона
+ * @param chat  chat-функция (statefulAgent.chat под спиннером) — для eval, чтобы RAG-инъекция
+ *              шла через защищённый StatefulAgent (инварианты покрывают RAG-ответы)
  */
 internal class RagCommands(
     private val config: RagConfig,
+    private val sharedEmbedder: OllamaEmbeddingClient,
+    private val agent: com.cliagent.agent.ContextAwareAgent,
+    private val chat: suspend (String) -> String,
 ) {
 
-    /** Ленивый embedder — создаётся только при первом индексирующем запросе (не на старте REPL). */
-    private fun embedder(): OllamaEmbeddingClient = OllamaEmbeddingClient(
-        baseUrl = config.embeddingBaseUrl,
-        model = config.embeddingModel,
-    )
+    /** Ленивый embedder для index/compare — переиспользует shared-инстанс сессии. */
+    private fun embedder(): OllamaEmbeddingClient = sharedEmbedder
 
     suspend fun handle(input: String) {
         val parts = input.trim().split("\\s+".toRegex())
@@ -55,29 +63,32 @@ internal class RagCommands(
             "stats" -> handleStats(parts)
             "compare" -> handleCompare(parts)
             "search" -> handleSearch(parts)
+            "on" -> { agent.setRagEnabled(true); AppTerminal.ok("RAG injection: ON") }
+            "off" -> { agent.setRagEnabled(false); AppTerminal.ok("RAG injection: OFF") }
+            "eval" -> handleEval(parts)
             "config" -> printConfig()
             else -> AppTerminal.println(
-                "Unknown /rag command: ${parts[1]}. Use: index, stats, compare, search, config"
+                "Unknown /rag command: ${parts[1]}. Use: index, stats, compare, search, on, off, eval, config"
             )
         }
     }
 
     // ── /rag — сводка ──────────────────────────────────────────────────────────
 
-    /** Сводка: статус RAG, модель эмбеддинга, текущий индекс. */
+    /** Сводка: runtime-режим агента (день 22), модель эмбеддинга, текущий индекс. */
     private suspend fun printSummary() {
-        AppTerminal.println("📚 RAG: ${if (config.enabled) "ON" else "OFF (indexing-only; agent injection = day 22)"}")
+        val runtimeState = if (agent.isRagEnabled()) "ON" else "OFF"
+        AppTerminal.println("📚 RAG injection: $runtimeState  (config default: ${if (config.enabled) "ON" else "OFF"})")
         AppTerminal.println("   Embeddings: ${config.embeddingProvider} / ${config.embeddingModel} (${config.embeddingBaseUrl})")
         AppTerminal.println("   Corpus: ${config.corpusRoots.joinToString(", ")}")
-        AppTerminal.println("   Chunking: size=${config.chunkSizeTokens} overlap=${config.chunkOverlapTokens}")
-        val store = JsonRagStore(AppPaths.ragIndexFile)
-        val idx = store.load()
+        AppTerminal.println("   Chunking: size=${config.chunkSizeTokens} overlap=${config.chunkOverlapTokens}, topK=${config.topK}")
+        val idx = loadActiveIndex()
         if (idx.chunks.isEmpty()) {
             AppTerminal.println("   Index: empty. Use: /rag index")
         } else {
             AppTerminal.println("   Index: ${idx.chunks.size} chunks (${idx.embeddedChunks.size} embedded), strategy=${idx.strategy}, model=${idx.embeddingModel}")
         }
-        AppTerminal.println("   /rag index [fixed|structural] | stats | compare | search <q> | config")
+        AppTerminal.println("   /rag index [fixed|structural] | stats | compare | search <q> | on | off | eval | config")
     }
 
     // ── /rag index [fixed|structural] ──────────────────────────────────────────
@@ -106,6 +117,11 @@ internal class RagCommands(
                 return
             }
             AppTerminal.ok("Indexed ${index.chunks.size} chunks (${index.embeddedChunks.size} embedded) → ${store.path()}")
+            // День 22 (баг-фикс дня 21): дополнительно сохраняем в основной index.json — его читают
+            // агент (RagRetriever), /rag search и /rag eval. Иначе index.json остаётся пустым, хотя
+            // per-strategy файл (index-structural.json) создан → «не проиндексирован» при retrieval.
+            val mainStore = JsonRagStore(AppPaths.ragIndexFile)
+            mainStore.save(index)
             printStatsTable(index)
         } catch (e: CancellationException) {
             throw e
@@ -169,7 +185,7 @@ internal class RagCommands(
             AppTerminal.println("Usage: /rag search <query>")
             return
         }
-        val index = JsonRagStore(AppPaths.ragIndexFile).load()
+        val index = loadActiveIndex()
         if (index.embeddedChunks.isEmpty()) {
             AppTerminal.println("No embedded index. Use: /rag index first.")
             return
@@ -206,10 +222,105 @@ internal class RagCommands(
         AppTerminal.println("  chunkSizeTokens: ${config.chunkSizeTokens}")
         AppTerminal.println("  chunkOverlapTokens: ${config.chunkOverlapTokens}")
         AppTerminal.println("  defaultStrategy: ${config.defaultStrategy}")
+        AppTerminal.println("  topK: ${config.topK}")
+        AppTerminal.println("  injectIntoPrompt: ${config.injectIntoPrompt}")
         AppTerminal.println("  indexDir: ${AppPaths.ragDir}")
     }
 
+    // ── /rag eval — прогон 10 контрольных вопросов (день 22) ───────────────────
+
+    /**
+     * Прогоняет контрольные вопросы (classpath: `rag/eval-questions.json`) в двух режимах — без RAG
+     * и с RAG — и печатает сравнительный отчёт по покрытию expectedKeywords. Лекция недели 5:
+     * метрика качества RAG — правдивость ответов (извлечение фактов из чанков, не из «общей памяти»).
+     *
+     * Требует собранного индекса (`/rag index`) и доступной Ollama для запроса ответов у LLM.
+     */
+    private suspend fun handleEval(parts: List<String>) {
+        val index = loadActiveIndex()
+        if (index.embeddedChunks.isEmpty()) {
+            AppTerminal.warn("No embedded index. Use: /rag index first.")
+            return
+        }
+        val questions = loadEvalQuestions()
+        if (questions.isEmpty()) {
+            AppTerminal.warn("No eval questions found (rag/eval-questions.json).")
+            return
+        }
+        AppTerminal.println("📊 Running ${questions.size} control questions (RAG off vs on)…")
+        val originalState = agent.isRagEnabled()
+
+        val results = mutableListOf<EvalRow>()
+        questions.forEachIndexed { i, q ->
+            AppTerminal.println("\n[${i + 1}/${questions.size}] ${q.id}: ${q.question}")
+            // Без RAG
+            agent.setRagEnabled(false)
+            val answerNoRag = runCatching { chat(q.question) }
+                .getOrElse { "(error: ${it.message})" }
+            // С RAG
+            agent.setRagEnabled(true)
+            val answerRag = runCatching { chat(q.question) }
+                .getOrElse { "(error: ${it.message})" }
+            val row = EvalRow(
+                q,
+                answerNoRag,
+                answerRag,
+                noRagHits = q.expectedKeywords.count { kw -> answerNoRag.contains(kw, ignoreCase = true) },
+                ragHits = q.expectedKeywords.count { kw -> answerRag.contains(kw, ignoreCase = true) },
+            )
+            results.add(row)
+            AppTerminal.println("  no-RAG keywords: ${row.noRagHits}/${q.expectedKeywords.size}  |  RAG keywords: ${row.ragHits}/${q.expectedKeywords.size}")
+        }
+
+        agent.setRagEnabled(originalState)
+        printEvalReport(results)
+    }
+
+    private fun loadEvalQuestions(): List<EvalQuestion> {
+        val json = Json { ignoreUnknownKeys = true }
+        val raw = runCatching {
+            javaClass.getResourceAsStream("/rag/eval-questions.json")?.use { it.readBytes() }
+        }.getOrNull() ?: return emptyList()
+        return runCatching {
+            json.decodeFromString<List<EvalQuestion>>(String(raw, Charsets.UTF_8))
+        }.getOrDefault(emptyList())
+    }
+
+    private fun printEvalReport(results: List<EvalRow>) {
+        AppTerminal.println("\n${"─".repeat(60)}")
+        AppTerminal.println("📊 RAG eval summary (${results.size} questions)")
+        AppTerminal.println("${"─".repeat(60)}")
+        val tbl = table {
+            header { style(bold = true); row("Q", "no-RAG kw", "RAG kw", "Δ") }
+            body {
+                results.forEach { r ->
+                    val delta = r.ragHits - r.noRagHits
+                    val deltaStr = (if (delta >= 0) "+" else "") + delta
+                    row(r.question.id, "${r.noRagHits}/${r.expectedKeywords.size}", "${r.ragHits}/${r.expectedKeywords.size}", deltaStr)
+                }
+            }
+        }
+        AppTerminal.println(tbl)
+        val noRagTotal = results.sumOf { it.noRagHits }
+        val ragTotal = results.sumOf { it.ragHits }
+        val totalKw = results.sumOf { it.expectedKeywords.size }
+        AppTerminal.println("Total keyword coverage: no-RAG $noRagTotal/$totalKw  |  RAG $ragTotal/$totalKw")
+        AppTerminal.println("Δ total: ${if (ragTotal - noRagTotal >= 0) "+" else ""}${ragTotal - noRagTotal}")
+        AppTerminal.println("\nInspect full answers per question with /rag on then asking directly.")
+    }
+
     // ── helpers ────────────────────────────────────────────────────────────────
+
+    /**
+     * Грузит «активный» индекс для retrieval-команд (search, eval, summary). День 22 (баг-фикс дня 21):
+     * сначала основной [AppPaths.ragIndexFile], при пустоте — per-strategy файл дефолтной стратегии
+     * (старые индексы, созданные до фикса, лежат только там).
+     */
+    private suspend fun loadActiveIndex(): RagIndex {
+        val primary = JsonRagStore(AppPaths.ragIndexFile).load()
+        if (primary.embeddedChunks.isNotEmpty()) return primary
+        return storeFor(ChunkingStrategyType.fromString(config.defaultStrategy)).load()
+    }
 
     private fun chunkerFor(type: ChunkingStrategyType): ChunkingStrategy = when (type) {
         ChunkingStrategyType.FIXED -> FixedSizeChunker(config.chunkSizeTokens, config.chunkOverlapTokens)
@@ -286,4 +397,24 @@ internal class RagCommands(
     private fun fmtScore(sc: ScoredChunk): String = String.format("%.3f", sc.score)
 
     private fun fmtChunk(chunk: RagChunk): String = "[${chunk.title} › ${chunk.section}] (${chunk.tokenCount} tok)"
+}
+
+/** Контрольный вопрос для `/rag eval` (classpath: `rag/eval-questions.json`). День 22. */
+@Serializable
+private data class EvalQuestion(
+    val id: String,
+    val question: String,
+    val expectedKeywords: List<String> = emptyList(),
+    val expectedSources: List<String> = emptyList(),
+)
+
+/** Результат прогона одного вопроса в двух режимах (без RAG / с RAG). */
+private data class EvalRow(
+    val question: EvalQuestion,
+    val answerNoRag: String,
+    val answerRag: String,
+    val noRagHits: Int,
+    val ragHits: Int,
+) {
+    val expectedKeywords: List<String> get() = question.expectedKeywords
 }

@@ -4,6 +4,7 @@ import com.cliagent.llm.model.ChatMessage
 import com.cliagent.memory.LongTermMemory
 import com.cliagent.memory.UserProfile
 import com.cliagent.memory.WorkingMemory
+import com.cliagent.rag.ScoredChunk
 
 /**
  * Сборка слоёного system prompt (день 11 — prompt builder из лекции недели 3).
@@ -12,24 +13,29 @@ import com.cliagent.memory.WorkingMemory
  * Пустые слои элизируются → при отсутствии памяти контент system-сообщения
  * байт-идентичен дням 1–10 (поведение не меняется).
  *
- * Порядок блоков: base → long-term → working
- * (долговременный контекст «весомее», рабочая задача — ближе к запросу).
+ * Порядок блоков: base → long-term → working → retrieved → invariants
+ * (долговременный контекст «весомее», рабочая задача — ближе к запросу; retrieved-контекст RAG —
+ * между working и invariants: задача задаёт фрейм, чанки дают факты, инварианты — последними
+ * для recency; день 22).
  *
  * Точки расширения:
  *  - Day 12: [LongTermMemory.profile] рендерится автоматически (см. [UserProfile.renderBlock]).
  *  - Day 13: [WorkingMemory.taskState] рендерится в [WorkingMemory.renderBlock] (блок Task state).
+ *  - Day 22: [retrievedContext] рендерится в [renderRetrievedBlock] (блок `[Retrieved context]`).
  */
 class PromptBuilder(
     private val baseSystem: ChatMessage,
     private val longTerm: LongTermMemory?,
-    private val working: WorkingMemory?
+    private val working: WorkingMemory?,
+    private val retrievedContext: List<ScoredChunk>? = null,
 ) {
     fun build(): ChatMessage {
         val parts = mutableListOf(baseSystem.content)
         longTerm?.takeIf { !it.isEmpty() }?.let { parts.add(it.renderBlock()) }
         working?.takeIf { !it.isEmpty() }?.let { parts.add(it.renderBlock()) }
+        retrievedContext?.takeIf { it.isNotEmpty() }?.let { parts.add(it.renderRetrievedBlock()) } // день 22
         longTerm?.renderInvariantsBlock()?.let { parts.add(it) }   // день 14: блок инвариантов
-        // Все слои пусты  parts == [baseSystem.content]  контент неизменен
+        // Все слои пусты  parts == [baseSystem.content]  контент неизменен
         return baseSystem.copy(content = parts.joinToString("\n\n"))
     }
 }
@@ -102,6 +108,23 @@ internal fun UserProfile.renderBlock(): String {
     if (constraints.isNotEmpty()) {
         lines.add("  Constraints:")
         constraints.forEach { lines.add("    - $it") }
+    }
+    return lines.joinToString("\n")
+}
+
+/**
+ * Секция retrieved-контекста RAG (день 22): топ-K чанков, найденных по запросу в индексе корпуса.
+ * Лекция недели 5: чанки **комбинируются с промптом** — модель отвечает из них, а не из общей
+ * тренировочной базы (анти-галлюцинации). Метаданные source/section/chunk_id/score кладутся явно —
+ * задел под день 24 (обязательные цитаты + источники в ответе).
+ */
+internal fun List<ScoredChunk>.renderRetrievedBlock(): String {
+    val lines = mutableListOf<String>()
+    lines.add("[Retrieved context — answer using these sources; cite source › section]")
+    forEachIndexed { i, sc ->
+        val chunk = sc.chunk
+        lines.add("${i + 1}. ${chunk.text}")
+        lines.add("   — Source: ${chunk.source} › ${chunk.section} (${chunk.chunkId}, score ${String.format("%.3f", sc.score)})")
     }
     return lines.joinToString("\n")
 }

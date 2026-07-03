@@ -31,9 +31,11 @@ data class AppConfig(
     val maxToolRounds: Int = 8,
     val mcp: List<McpServerConfig> = emptyList(),
     /**
-     * День 21 (RAG): конфиг индексации документов. Default `RagConfig()` → старые config.json
-     * грузятся без ошибок (RAG off, как дней 1–20). env override `CLI_AGENT_RAG_*` в
-     * [ConfigRepository]. Инъекция в промпт — день 22; пока только индексация + `/rag`-команды.
+     * День 21–22 (RAG): конфиг индексации + инъекции документов. Default `RagConfig()` → старые
+     * config.json грузятся без ошибок (RAG off, как дней 1–20). env override `CLI_AGENT_RAG_*` в
+     * [ConfigRepository]. День 21: индексация + `/rag`-команды. День 22: инъекция retrieved-чанков
+     * в промпт ([com.cliagent.agent.ContextAwareAgent] + [com.cliagent.agent.PromptBuilder]),
+     * toggle `/rag on|off`, eval `/rag eval`.
      */
     val rag: RagConfig = RagConfig(),
 )

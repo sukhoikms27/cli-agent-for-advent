@@ -123,6 +123,26 @@ class ConfigRepository(
     }
 
     /**
+     * Включает/отключает сервер по имени (REPL `/mcp enable|disable <name>`). Сервер остаётся в
+     * config.json, но `enabled=false` → skip'ается при сборке [toolExecutor] (как при `remove`,
+     * но без потери записи — быстрое отключение/включение без пере-добавления). Возвращает `true`
+     * если сервер найден и флаг изменён; `false` если сервера нет ИЛИ флаг уже в нужном состоянии.
+     */
+    fun setMcpServerEnabled(name: String, enabled: Boolean): Boolean {
+        val current = loadConfigFile()
+        var changed = false
+        val updatedMcp = current.mcp.map { server ->
+            if (server.name == name && server.enabled != enabled) {
+                changed = true
+                server.copy(enabled = enabled)
+            } else server
+        }
+        if (changed) save(current.copy(mcp = updatedMcp))
+        return changed
+    }
+
+
+    /**
      * Генерирует стартовый config.json из текущих env/properties (REPL `/config init`, день 20).
      * Помогает миграции с legacy. НЕ перезаписывает существующий файл (возвращает false) — явное
      * удаление/переименование лежит на пользователе.

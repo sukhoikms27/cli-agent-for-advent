@@ -122,7 +122,18 @@ class OllamaEmbeddingClient(
         val text = response.bodyAsText()
         return try {
             val parsed = json.decodeFromString<EmbedResponse>(text)
-            LlmResult.Success(parsed.embeddings)
+            // КРИТИЧНО: Ollama при ошибке модели (CUDA crash, модель не загружена) возвращает HTTP 200
+            // с телом {"error":"..."}. Без этой проверки поле error игнорируется (ignoreUnknownKeys=true),
+            // embeddings=default emptyList → код трактовал краш как «успех с 0 векторами» → индекс
+            // сохранялся пустым, retrieval ничего не находил. Теперь это явная ошибка.
+            val err = parsed.error
+            if (!err.isNullOrBlank()) {
+                LlmResult.Error(69, "Ollama error: $err")
+            } else if (parsed.embeddings.size != batch.size) {
+                LlmResult.Error(69, "Ollama вернула ${parsed.embeddings.size} векторов, ожидалось ${batch.size}")
+            } else {
+                LlmResult.Success(parsed.embeddings)
+            }
         } catch (e: Exception) {
             LlmResult.Error(response.status.value, "Failed to parse Ollama response: ${e.message}")
         }
@@ -152,6 +163,7 @@ class OllamaEmbeddingClient(
         val model: String = "",
         val embeddings: List<List<Float>> = emptyList(),
         @SerialName("total_duration") val totalDuration: Long? = null,
+        val error: String? = null,
     )
 
     private companion object {

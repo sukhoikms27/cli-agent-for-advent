@@ -149,6 +149,25 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         }
         val mcpServerCount = mcpServers.size
 
+        // День 22: единый RAG-embedder на сессию (переиспользуется retrieval-агентом и командами /rag).
+        // Lifecycle — внешний: закрывается в finally при выходе из REPL. OllamaEmbeddingClient лёгкий
+        // (HttpClient без активного соединения до первого запроса), поэтому создаём заранее.
+        val ragEmbedder = com.cliagent.rag.embedding.OllamaEmbeddingClient(
+            baseUrl = config.rag.embeddingBaseUrl,
+            model = config.rag.embeddingModel,
+        )
+        // Fallback: per-strategy файл дефолтной стратегии — если основной index.json пуст (баг дня 21:
+        // /rag index писал только в index-structural.json, а не в index.json).
+        val ragFallbackStore = when (config.rag.defaultStrategy) {
+            "fixed" -> com.cliagent.rag.JsonRagStore(com.cliagent.config.AppPaths.ragIndexFixed)
+            else -> com.cliagent.rag.JsonRagStore(com.cliagent.config.AppPaths.ragIndexStructural)
+        }
+        val ragRetriever = com.cliagent.rag.RagRetriever(
+            embedder = ragEmbedder,
+            topK = config.rag.topK,
+            fallbackStore = ragFallbackStore,
+        )
+
         val agent = ContextAwareAgent(
             llmClient = client,
             memoryStore = memoryStore,
@@ -166,7 +185,10 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             temperature = temperature,
             // День 19: статусный вывод агента — через mordant-терминал, чтобы печать шла «поверх»
             // активного спиннера (chat() крутит его в withSpinner). Сырой println затирается анимацией.
-            logger = AppTerminal::println
+            logger = AppTerminal::println,
+            // День 22: RAG-retrieval в промпт. Дефолт режима — из config.rag.enabled; toggle `/rag on|off`.
+            ragRetriever = ragRetriever,
+            ragEnabled = config.rag.enabled,
         )
 
         // День 13 (авто-поток стадий): оркестратор автоматизирует /task start → артефакт стадии →
@@ -196,9 +218,12 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         val swarmLabel = if (noSwarm) "OFF" else swarmMode.label.uppercase()
         val modeLabel = (agent.getWorkingMemory()?.interactionMode ?: InteractionMode.PLAN).name.lowercase()
         val mcpLabel = if (mcpServerCount == 0) "OFF" else "$mcpServerCount server(s)"
-        // День 21 (RAG): индексация документов. Injection в промпт — день 22; пока команды /rag.
-        val ragCommands = RagCommands(config.rag)
-        val ragLabel = if (config.rag.enabled) "ON" else "OFF"
+        // День 22 (RAG): команды /rag + инъекция retrieved-чанков в промпт. chat() — для /rag eval
+        // (прогон контрольных вопросов в обоих режимах); agent — для toggle on|off.
+        val ragCommands = RagCommands(config.rag, ragEmbedder, agent) { msg ->
+            AppTerminal.withSpinner({ "RAG eval…" }) { statefulAgent.chat(msg) }
+        }
+        val ragLabel = if (agent.isRagEnabled()) "ON" else "OFF"
         AppTerminal.println("CLI Agent v0.8 | Chat: $chatId | Model: $model | Context: ${contextManager.getStrategy().getName()} | MCP: $mcpLabel | RAG: $ragLabel | MaxToolRounds: ${config.maxToolRounds} | Compress: $compressLabel | Invariants: $invariantsLabel | Swarm: $swarmLabel | Mode: $modeLabel")
         AppTerminal.println("Type /help for commands, /exit to quit")
 
@@ -251,6 +276,8 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         } finally {
             // День 17: закрываем persistent MCP-соединение при выходе из REPL (Ctrl+D / /exit).
             toolExecutor?.close()
+            // День 22: закрываем RAG-embedder (shared HttpClient) при выходе из REPL.
+            runCatching { ragEmbedder.close() }
         }
     }
 
@@ -420,6 +447,7 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             |  /mcp add <name> -- <cmd> <args…>     — Add stdio server to config.json
             |  /mcp add <name> --url <u> [--token]  — Add remote HTTP server to config.json
             |  /mcp remove <name>    — Remove server from config.json
+            |  /mcp enable|disable <name> — Toggle server without removing (needs REPL restart)
             |  /rag                  — Show RAG status (embeddings model, current index)
             |  /rag index [fixed|structural] — Index document corpus (chunking + embeddings)
             |  /rag stats            — Show index statistics (chunks, tokens, dimension)
@@ -957,9 +985,11 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         when (parts[1]) {
             "add" -> handleMcpAdd(parts)
             "remove", "rm", "delete" -> handleMcpRemove(parts)
+            "enable", "on" -> handleMcpToggle(parts, enabled = true)
+            "disable", "off" -> handleMcpToggle(parts, enabled = false)
             "list-tools" -> handleMcpListTools(parts, servers)
             else -> AppTerminal.println(
-                "Unknown /mcp command: ${parts[1]}. Use: add, remove, list-tools"
+                "Unknown /mcp command: ${parts[1]}. Use: add, remove, enable, disable, list-tools"
             )
         }
     }
@@ -995,6 +1025,7 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         }
         AppTerminal.println("   /mcp list-tools <name> — list a server's tools")
         AppTerminal.println("   /mcp add/remove <name> — manage servers in config.json")
+        AppTerminal.println("   /mcp enable|disable <name> — toggle without removing")
     }
 
     /** `/mcp add` — stdio (`-- <cmd> <args…>`) или remote (`--url <u> [--token <t>]`). */
@@ -1052,6 +1083,26 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             }
         } catch (e: Throwable) {
             AppTerminal.err("Failed to remove server: ${e.message}")
+        }
+    }
+
+    /** `/mcp enable <name>` / `/mcp disable <name>` — toggle без удаления записи. */
+    private fun handleMcpToggle(parts: List<String>, enabled: Boolean) {
+        val action = if (enabled) "enable" else "disable"
+        if (parts.size < 3) {
+            AppTerminal.err("Usage: /mcp $action <name>")
+            return
+        }
+        val name = parts[2]
+        try {
+            val changed = ConfigRepository().setMcpServerEnabled(name, enabled)
+            val state = if (enabled) "enabled" else "disabled"
+            when {
+                changed -> AppTerminal.ok("Server '$name' $state in ${com.cliagent.config.AppPaths.configFile}. Restart REPL to apply.")
+                else -> AppTerminal.warn("Server '$name' not found (or already $state) in config.json.")
+            }
+        } catch (e: Throwable) {
+            AppTerminal.err("Failed to $action server: ${e.message}")
         }
     }
 

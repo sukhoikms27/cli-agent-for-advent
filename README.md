@@ -24,7 +24,7 @@
 - **Markdown-рендер** и цветной вывод (mordant, `--no-color`).
 
 ---
-
+doskey cli-agent="%CD%\build\install\cli-agent\bin\cli-agent.bat" $*
 ## Сборка и запуск
 
 ### Сборка

@@ -23,6 +23,8 @@ import com.cliagent.memory.LongTermMemory
 import com.cliagent.memory.MemoryStore
 import com.cliagent.memory.UserProfile
 import com.cliagent.memory.WorkingMemory
+import com.cliagent.rag.RagRetriever
+import com.cliagent.rag.ScoredChunk
 import com.cliagent.state.invariant.Invariant
 import com.cliagent.state.TaskState
 import com.cliagent.state.TaskStateMachine
@@ -69,7 +71,19 @@ class ContextAwareAgent(
      * mordant. `AppTerminal.println` печатает «поверх» активного спиннера (как stage-блоки через onEmit).
      * Агент не зависит от CLI-слоя — только от типа `(String) -> Unit`.
      */
-    private val logger: (String) -> Unit = { msg -> println(msg) }
+    private val logger: (String) -> Unit = { msg -> println(msg) },
+    /**
+     * День 22: RAG-retriever для инъекции retrieved-чанков в промпт. **null = RAG отключён**
+     * (поведение дней 1–21). Как и [toolExecutor], опциональная nullable-зависимость — агент не
+     * зависит от CLI/Ollama, пока retrieval не запрошен через [ragEnabled].
+     */
+    private val ragRetriever: RagRetriever? = null,
+    /**
+     * День 22: runtime-флаг RAG-режима (toggle через `/rag on|off`). Дефолт — из
+     * [com.cliagent.rag.RagConfig.enabled]. Когда true И [ragRetriever] != null, каждый ход
+     * берёт top-K чанков по запросу и кладёт в `[Retrieved context]`-блок промпта.
+     */
+    private var ragEnabled: Boolean = false,
 ) : Agent {
 
     /** Доступ к [TokenCounter] для stage-агентов (мера C: bounded-усечение межартефактных передач). */
@@ -128,8 +142,21 @@ class ContextAwareAgent(
             }
         }
 
+        // День 22: RAG-retrieval. Каждый ход — свежий поиск top-K чанков по запросу (лекция недели 5:
+        // инференс-тайм подгрузка). ragEnabled=false или нет retriever'а → null → без [Retrieved context].
+        // Мягкая деградация: ошибка эмбеддинга/пустой индекс → ragContext=null → агент отвечает без RAG.
+        val ragContext = if (isRagEnabled()) {
+            val hits = ragRetriever?.retrieve(userMessage)
+            when {
+                hits == null -> logger("⚠️ RAG on, but retrieve() returned null (index empty or Ollama error) — answering without context")
+                hits.isEmpty() -> logger("⚠️ RAG on, but 0 chunks matched — answering without context")
+                else -> logger("📚 RAG: retrieved ${hits.size} chunk(s) — injecting into prompt")
+            }
+            hits
+        } else null
+
         // Build messages
-        val messagesToSend = buildMessagesToSend(userMsg)
+        val messagesToSend = buildMessagesToSend(userMsg, ragContext)
         val estimatedTokens = tokenCounter.estimateHistoryTokens(messagesToSend)
         if (estimatedTokens > contextLimit) {
             logger("⚠️ Warning: estimated $estimatedTokens tokens exceeds context limit ($contextLimit)")
@@ -325,7 +352,10 @@ class ContextAwareAgent(
         )
     }
 
-    private suspend fun buildMessagesToSend(userMsg: ChatMessage): List<ChatMessage> {
+    private suspend fun buildMessagesToSend(
+        userMsg: ChatMessage,
+        ragContext: List<ScoredChunk>? = null,
+    ): List<ChatMessage> {
         // Precedence (доработка Day 13): активная задача → stage-промпт (поведение per stage);
         // иначе reasoningStrategy → иначе статический systemPrompt (поведение Day 1-13).
         val taskState = getTaskState()
@@ -334,8 +364,8 @@ class ContextAwareAgent(
             reasoningStrategy != null -> PromptTemplates.buildSystemMessage(reasoningStrategy)
             else -> systemPrompt
         }
-        // Слоёный system prompt: base + [long-term] + [working]; пустые слои элизируются
-        val system = PromptBuilder(baseSystem, longTermMemory, workingMemory).build()
+        // Слоёный system prompt: base + [long-term] + [working] + [retrieved]; пустые слои элизируются
+        val system = PromptBuilder(baseSystem, longTermMemory, workingMemory, ragContext).build()
 
         // If contextManager is set, delegate to strategy
         if (contextManager != null) {
@@ -408,6 +438,16 @@ class ContextAwareAgent(
     }
 
     fun getContextManager(): ContextManager? = contextManager
+
+    // ── День 22: RAG-режим (toggle через `/rag on|off`) ──
+
+    /** Активен ли RAG-режим агента (инъекция retrieved-чанков). null retriever → всегда false. */
+    fun isRagEnabled(): Boolean = ragEnabled && ragRetriever != null
+
+    /** Включить/выключить RAG-режим в рантайме (`/rag on|off`). Нет retriever'а — noop. */
+    fun setRagEnabled(enabled: Boolean) {
+        ragEnabled = enabled
+    }
 
     fun getCurrentStrategyName(): String =
         contextManager?.getStrategy()?.getName() ?: "full"

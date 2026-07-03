@@ -4,6 +4,8 @@ import com.cliagent.llm.model.ChatMessage
 import com.cliagent.memory.LongTermMemory
 import com.cliagent.memory.UserProfile
 import com.cliagent.memory.WorkingMemory
+import com.cliagent.rag.RagChunk
+import com.cliagent.rag.ScoredChunk
 import com.cliagent.state.TaskStage
 import com.cliagent.state.TaskState
 import com.cliagent.state.invariant.Invariant
@@ -156,4 +158,54 @@ class PromptBuilderTest {
         assertTrue(workIdx > 0)
         assertTrue(invIdx > workIdx)   // инварианты последними (recency)
     }
+
+    // ── День 22: блок [Retrieved context] ─────────────────────────────────────────
+
+    @Test
+    fun `null retrieved context produces base content — day 22 zero regression`() {
+        // Без retrievedContext контент байт-идентичен дням 11–21 (4-й параметр по умолчанию null)
+        val builtNoArg = PromptBuilder(base, null, null).build()
+        val builtExplicitNull = PromptBuilder(base, null, null, null).build()
+        assertEquals(builtNoArg.content, builtExplicitNull.content)
+        assertFalse(builtExplicitNull.content.contains("[Retrieved context"))
+    }
+
+    @Test
+    fun `empty retrieved context list does not render the block`() {
+        val built = PromptBuilder(base, null, null, emptyList()).build()
+        assertFalse(built.content.contains("[Retrieved context"))
+    }
+
+    @Test
+    fun `retrieved context renders block with source and section`() {
+        val chunks = listOf(
+            ScoredChunk(chunk("c1", "SlidingWindow", "context/SlidingWindow.kt", "keep last N"), 0.9f),
+            ScoredChunk(chunk("c2", "SummaryStrategy", "context/SummaryStrategy.kt", "auto-summarize"), 0.7f),
+        )
+        val built = PromptBuilder(base, null, null, chunks).build()
+        assertTrue(built.content.contains("[Retrieved context"))
+        assertTrue(built.content.contains("SlidingWindow.kt › SlidingWindow"))
+        assertTrue(built.content.contains("keep last N"))
+        assertTrue(built.content.contains("SummaryStrategy.kt › SummaryStrategy"))
+    }
+
+    @Test
+    fun `retrieved context block is between working and invariants — day 22 ordering`() {
+        val lt = LongTermMemory(invariants = listOf(Invariant("x", "rule")))
+        val working = WorkingMemory(currentTask = "task")
+        val chunks = listOf(ScoredChunk(chunk("c1", "S", "a.md", "text"), 0.5f))
+        val built = PromptBuilder(base, lt, working, chunks).build()
+        val workIdx = built.content.indexOf("[Working memory")
+        val ragIdx = built.content.indexOf("[Retrieved context")
+        val invIdx = built.content.indexOf("[Project invariants")
+        assertTrue(workIdx > 0)
+        assertTrue(ragIdx > workIdx, "retrieved after working")
+        assertTrue(invIdx > ragIdx, "invariants after retrieved")
+    }
+
+    private fun chunk(id: String, section: String, source: String, text: String): RagChunk =
+        RagChunk(
+            chunkId = id, documentId = "d", source = source, title = "T", section = section,
+            text = text, index = 0, tokenCount = 5,
+        )
 }
