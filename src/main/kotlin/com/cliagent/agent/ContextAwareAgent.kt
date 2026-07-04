@@ -99,8 +99,11 @@ class ContextAwareAgent(
      * диалога (`WorkingMemory.currentTask`) + последними 2 user-репликами истории (см.
      * [buildConversationQuery]). Follow-up «а сколько для этого?» находят контекст (production-like).
      * `false` (default) → для эмбеддинга берётся только `userMessage` (байт-идентично дню 24).
+     *
+     * TDD-починка: `var` + [setConversationalQuery] (симметрия с `setRagEnabled` дня 22) — чтобы
+     * `/rag scenario` мог форсировать режим в рантайме и восстанавливать в finally.
      */
-    private val conversationalQuery: Boolean = false,
+    private var conversationalQuery: Boolean = false,
     /**
      * День 24: sink для результата пост-чека цитирования ([CitationDetector.detect]). **Default
      * noop** — сам чек идёт через [logger] (warning поверх спиннера). Этот колбэк — для `/rag eval`
@@ -545,6 +548,17 @@ class ContextAwareAgent(
     fun setRagEnabled(enabled: Boolean) {
         ragEnabled = enabled
     }
+
+    /**
+     * День 25 (TDD-починка): runtime-toggle conversation-aware retrieval. Симметрия с [setRagEnabled] —
+     * `/rag scenario` форсирует `true` (follow-up должны находить контекст) и восстанавливает в `finally`.
+     */
+    fun setConversationalQuery(enabled: Boolean) {
+        conversationalQuery = enabled
+    }
+
+    /** День 25 (TDD): текущее состояние conversation-aware retrieval (для save/restore в сценарии). */
+    fun isConversationalQuery(): Boolean = conversationalQuery
 
     fun getCurrentStrategyName(): String =
         contextManager?.getStrategy()?.getName() ?: "full"
