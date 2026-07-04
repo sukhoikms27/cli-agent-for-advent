@@ -391,8 +391,22 @@ internal class RagCommands(
     ): List<ScenarioTurnRow> {
         val rows = mutableListOf<ScenarioTurnRow>()
         scenario.turns.forEach { turn ->
-            val answer = runCatching { chat(turn.user) }
-                .getOrElse { "(error: ${it.message})" }
+            System.err.println("[DIAG] runScenario: BEFORE chat('${turn.user.take(40)}')")
+            // DIAG (systematic-debugging): перехват с полным stack trace для root-cause "Parent job is Completed".
+            val answer = try {
+                val result = chat(turn.user)
+                System.err.println("[DIAG] runScenario: chat returned OK, len=${result.length}")
+                result
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                System.err.println("[DIAG] CancellationException on turn '${turn.user.take(40)}': ${e.message}")
+                e.printStackTrace(System.err)
+                "(error: ${e.message})"
+            } catch (e: Throwable) {
+                System.err.println("[DIAG] Throwable (${e::class.qualifiedName}) on turn '${turn.user.take(40)}': ${e.message}")
+                e.printStackTrace(System.err)
+                "(error: ${e.message})"
+            }
+            System.err.println("[DIAG] runScenario: AFTER chat, computing metrics")
             val cite = com.cliagent.rag.CitationDetector.detect(answer, emptyList(), turn.expectedSources)
             val kwHits = turn.expectedKeywords.count { kw -> answer.contains(kw, ignoreCase = true) }
             rows.add(
@@ -442,7 +456,9 @@ internal class RagCommands(
         AppTerminal.println("🎬 Scenario: ${scenario.id} (${scenario.turns.size} turns)")
         AppTerminal.println("   Goal: ${scenario.goal}")
         // Изоляция + память задачи: reset чистит history/working (НЕ long-term), затем ставим цель.
+        System.err.println("[DIAG] handleScenario: before reset()")
         agent.reset()
+        System.err.println("[DIAG] handleScenario: after reset(), before setRagEnabled")
         val savedRag = agent.isRagEnabled()
         val savedConv = agent.isConversationalQuery()
         agent.setRagEnabled(true)
@@ -450,6 +466,7 @@ internal class RagCommands(
         // («а сколько для этого нужно?») должны находить контекст. Восстанавливаем в finally.
         agent.setConversationalQuery(true)
         agent.setWorkingMemory(com.cliagent.memory.WorkingMemory(currentTask = scenario.goal))
+        System.err.println("[DIAG] handleScenario: setup done (rag=${agent.isRagEnabled()}, conv=${agent.isConversationalQuery()})")
         // T6: диагностика — если RAG реально не активировался (нет retriever'а), пользователь должен знать.
         if (!agent.isRagEnabled()) {
             AppTerminal.warn("RAG не активен (нет retriever'а) — ответы идут без retrieval/sources.")
