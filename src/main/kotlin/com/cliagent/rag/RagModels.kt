@@ -97,7 +97,9 @@ data class ScoredChunk(
  * @param embeddingProvider "ollama" (пока единственный; interface готов к облаку)
  * @param embeddingModel   "nomic-embed-text" (768 dim, из лекции недели 5)
  * @param embeddingBaseUrl "http://localhost:11434" — Ollama; на VPS заменить адрес
- * @param corpusRoots      относительные пути к корням корпуса (напр. ["docs", "plan", "src"])
+ * @param corpusRoots      относительные пути к корням корпуса (напр. ["plan", "docs", "README.md",
+     *                       "AGENTS.md", "src/main/kotlin"] — день 24: расширено с исходного
+     *                       `["plan","docs","README.md"]` для покрытия .kt-исходников и AGENTS.md)
  * @param chunkSizeTokens  целевой размер чанка (500–1000, рекомендация лекции)
  * @param chunkOverlapTokens перекрытие границ (overlap решает потерю контекста на стыках)
  * @param defaultStrategy  "fixed" | "structural"
@@ -122,7 +124,14 @@ data class RagConfig(
     val embeddingProvider: String = "ollama",
     val embeddingModel: String = "nomic-embed-text",
     val embeddingBaseUrl: String = "http://localhost:11434",
-    val corpusRoots: List<String> = listOf("plan", "docs", "README.md"),
+    /**
+     * День 24: расширение корпуса. Раньше только `plan`/`docs`/`README.md` → `AGENTS.md` и исходный
+     * код НЕ индексировались, но 7/10 eval-вопросов ссылались на `AGENTS.md` (невалидно). Добавлены
+     * `AGENTS.md` и `src/main/kotlin` — теперь `.kt`-исходники и сводный контекстный документ попадают
+     * в индекс, что даёт богатый RAG и валидные `expectedSources` в `/rag eval`. Старые config.json
+     * грузятся без правок (schema evolution, AGENTS.md) — поле переопределено только в дефолте.
+     */
+    val corpusRoots: List<String> = listOf("plan", "docs", "README.md", "AGENTS.md", "src/main/kotlin"),
     val chunkSizeTokens: Int = 500,
     val chunkOverlapTokens: Int = 100,
     val defaultStrategy: String = "structural",
@@ -133,5 +142,17 @@ data class RagConfig(
     val candidatePoolSize: Int = 20,
     val similarityThreshold: Float = 0.0f,
     val queryRewriter: String = "identity",
-    val reranker: String = "none"
+    val reranker: String = "none",
+    /**
+     * День 24: порог анти-галлюцинации. Если max similarity среди retrieved-чанков < порога (или
+     * список пуст) → агент возвращает canned-response «не знаю» **без вызова LLM**. `0.0` = режим
+     * выключен (backward-compat с днём 23 — даже при низком сходстве LLM отвечает).
+     *
+     * Отдельно от [similarityThreshold] (тот — день 23, фильтрует чанки для реранкера; этот —
+     * отказывается отвечать при слабом контексте в целом). Типичные значения 0.3–0.5.
+     *
+     * Важно: НЕ срабатывает при `retrieve()=null` (Ollama down / пустой индекс) — там мягкая
+     * деградация дня 22 (агент отвечает без RAG-блока), а не canned «не знаю».
+     */
+    val dontKnowThreshold: Float = 0.0f,
 )

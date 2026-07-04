@@ -3,6 +3,7 @@ package com.cliagent.cli
 import com.github.ajalt.mordant.animation.textAnimation
 import com.github.ajalt.mordant.markdown.Markdown
 import com.github.ajalt.mordant.rendering.AnsiLevel
+import com.github.ajalt.mordant.rendering.TextColors.gray
 import com.github.ajalt.mordant.rendering.TextColors.green
 import com.github.ajalt.mordant.rendering.TextColors.red
 import com.github.ajalt.mordant.rendering.TextColors.yellow
@@ -102,4 +103,57 @@ object AppTerminal {
             animation.clear()
         }
     }
+
+    // ── День 24: таймер выполнения + серая строка длительности ────────────────────
+
+    /**
+     * Форматирует elapsed-время (мс) как `HH:MM:SS`. Используется в live-таймере спиннера и в
+     * пост-выводе серой строки длительности после ответа агента (день 24).
+     *
+     * Примеры: `999ms` → `00:00:00`, `65_000ms` → `00:01:05`, `3_661_000ms` → `01:01:01`.
+     */
+    fun formatHMS(elapsedMillis: Long): String {
+        val totalSeconds = elapsedMillis / 1000
+        val hours = totalSeconds / 3600
+        val minutes = (totalSeconds % 3600) / 60
+        val seconds = totalSeconds % 60
+        return "%02d:%02d:%02d".format(hours, minutes, seconds)
+    }
+
+    /**
+     * День 24: серая (gray) строка длительности после ответа агента.
+     *
+     * Печатает `⏱ HH:MM:SS` серым цветом (ANSI gray = тёмно-серый; на `--no-color` —
+     * plain-текст без ANSI-кодов). Не печатает ничего при `elapsedMillis <= 0` (мгновенный ответ
+     * — canned «не знаю» или кеш — не засоряем вывод). Новая строка для визуального отделения.
+     */
+    fun printDuration(elapsedMillis: Long) {
+        if (elapsedMillis <= 0) return
+        t.println(gray("⏱ ${formatHMS(elapsedMillis)}"))
+    }
+
+    /**
+     * День 24: спиннер с live-таймером. Крутит анимацию с лейблом `"<baseLabel> HH:MM:SS"`, где
+     * время обновляется на каждом кадре (каждые 120ms) — пользователь видит, сколько уже длится
+     * запрос. По завершении возвращает [TimedResult] с результатом и elapsed-временем для пост-вывода
+     * через [printDuration].
+     *
+     * Время замеряется через `System.nanoTime()` в closure labelProvider-а (non-suspend, как требует
+     * [withSpinner]) — точно и не зависит от системных часов. Альтернатива — расширение существующего
+     * [withSpinner] `labelProvider`-overload-а; здесь вынесено отдельно, чтобы не ломать call-sites.
+     *
+     * `CancellationException` пробрасывается (как в [withSpinner] — finally чистит кадр).
+     */
+    suspend fun <T> withTimedSpinner(baseLabel: String, block: suspend () -> T): TimedResult<T> {
+        val start = System.nanoTime()
+        val result = withSpinner({ "$baseLabel ${formatHMS((System.nanoTime() - start) / 1_000_000)}" }, block)
+        val elapsedMillis = (System.nanoTime() - start) / 1_000_000
+        return TimedResult(result, elapsedMillis)
+    }
+
+    /**
+     * День 24: результат [withTimedSpinner] — значение блока + затраченное время (мс).
+     * `elapsedMillis` используется для серой строки [printDuration] после ответа.
+     */
+    data class TimedResult<T>(val value: T, val elapsedMillis: Long)
 }

@@ -195,6 +195,8 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             // День 22: RAG-retrieval в промпт. Дефолт режима — из config.rag.enabled; toggle `/rag on|off`.
             ragRetriever = ragRetriever,
             ragEnabled = config.rag.enabled,
+            // День 24: порог анти-галлюцинации («не знаю» при слабом контексте). 0.0 = выключено.
+            dontKnowThreshold = config.rag.dontKnowThreshold,
         )
 
         // День 13 (авто-поток стадий): оркестратор автоматизирует /task start → артефакт стадии →
@@ -352,15 +354,18 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         // LLM-сбой (таймаут/HTTP) — раньше сворачивался в строку "Error: ..." и печатался как
         // обычный ответ; теперь ContextAwareAgent.chat бросает LlmCallException — ловим тут,
         // чтобы REPL не упал, а показал понятную ошибку.
-        val response = try {
-            AppTerminal.withSpinner({ spinnerLabel() }) { statefulAgent.chat(input) }
+        // День 24: withTimedSpinner — live-таймер в лейбле спиннера (каждые 120ms обновляется
+        // HH:MM:SS); после ответа печатается серая строка длительности через printDuration.
+        val timed = try {
+            AppTerminal.withTimedSpinner(spinnerLabel()) { statefulAgent.chat(input) }
         } catch (e: LlmCallException) {
             val msg = "⚠️ Ошибка запроса к LLM: ${e.message}"
             onEmit(msg)
             return msg
         }
-        onEmit(response)
-        return response
+        onEmit(timed.value)
+        AppTerminal.printDuration(timed.elapsedMillis)   // день 24: серая ⏱ HH:MM:SS
+        return timed.value
     }
 
     private fun createStrategy(

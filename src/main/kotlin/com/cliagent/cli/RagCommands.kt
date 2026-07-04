@@ -105,6 +105,8 @@ internal class RagCommands(
         AppTerminal.println("   Chunking: size=${config.chunkSizeTokens} overlap=${config.chunkOverlapTokens}, topK=${config.topK}")
         AppTerminal.println("   Rewrite: $rewriteName  (config: ${config.queryRewriter})  |  Rerank: $rerankName  (config: ${config.reranker})")
         AppTerminal.println("   Candidate pool: ${config.candidatePoolSize}  |  Similarity threshold: ${String.format("%.2f", config.similarityThreshold)}")
+        // День 24: порог анти-галлюцинации (canned «не знаю» при max similarity < порога).
+        AppTerminal.println("   Anti-hallucination: dontKnowThreshold=${String.format("%.2f", config.dontKnowThreshold)}")
         val idx = loadActiveIndex()
         if (idx.chunks.isEmpty()) {
             AppTerminal.println("   Index: empty. Use: /rag index")
@@ -252,6 +254,8 @@ internal class RagCommands(
         AppTerminal.println("  similarityThreshold: ${config.similarityThreshold}")
         AppTerminal.println("  queryRewriter: ${config.queryRewriter}")
         AppTerminal.println("  reranker: ${config.reranker}")
+        // День 24: порог анти-галлюцинации («не знаю» при слабом контексте). 0.0 = выключено.
+        AppTerminal.println("  dontKnowThreshold: ${config.dontKnowThreshold}")
         // День 23: runtime-режим (может отличаться от config после toggle).
         AppTerminal.println("  runtime rewrite: ${ragRetriever.getRewriter()?.name ?: "identity"}")
         AppTerminal.println("  runtime rerank: ${ragRetriever.getReranker()?.name ?: "none"}")
@@ -292,15 +296,20 @@ internal class RagCommands(
             agent.setRagEnabled(true)
             val answerRag = runCatching { chat(q.question) }
                 .getOrElse { "(error: ${it.message})" }
+            // День 24: анти-галлюцинации — детекция источников/цитат в RAG-ответе. hits не передаём
+            // (они внутри агента), детектируем по expectedSources (basename) и кавычкам в ответе.
+            val cite = com.cliagent.rag.CitationDetector.detect(answerRag, emptyList(), q.expectedSources)
             val row = EvalRow(
                 q,
                 answerNoRag,
                 answerRag,
                 noRagHits = q.expectedKeywords.count { kw -> answerNoRag.contains(kw, ignoreCase = true) },
                 ragHits = q.expectedKeywords.count { kw -> answerRag.contains(kw, ignoreCase = true) },
+                ragSources = cite.sourcesPresent,
+                ragCitations = cite.citationsPresent,
             )
             results.add(row)
-            AppTerminal.println("  no-RAG keywords: ${row.noRagHits}/${q.expectedKeywords.size}  |  RAG keywords: ${row.ragHits}/${q.expectedKeywords.size}")
+            AppTerminal.println("  no-RAG kw: ${row.noRagHits}/${q.expectedKeywords.size}  |  RAG kw: ${row.ragHits}/${q.expectedKeywords.size}  |  src: ${if (row.ragSources) "✓" else "✗"}  cite: ${if (row.ragCitations) "✓" else "✗"}")
         }
 
         agent.setRagEnabled(originalState)
@@ -318,16 +327,23 @@ internal class RagCommands(
     }
 
     private fun printEvalReport(results: List<EvalRow>) {
-        AppTerminal.println("\n${"─".repeat(60)}")
+        AppTerminal.println("\n${"─".repeat(72)}")
         AppTerminal.println("📊 RAG eval summary (${results.size} questions)")
-        AppTerminal.println("${"─".repeat(60)}")
+        AppTerminal.println("${"─".repeat(72)}")
         val tbl = table {
-            header { style(bold = true); row("Q", "no-RAG kw", "RAG kw", "Δ") }
+            header { style(bold = true); row("Q", "no-RAG kw", "RAG kw", "Δ", "RAG src", "RAG cite") }
             body {
                 results.forEach { r ->
                     val delta = r.ragHits - r.noRagHits
                     val deltaStr = (if (delta >= 0) "+" else "") + delta
-                    row(r.question.id, "${r.noRagHits}/${r.expectedKeywords.size}", "${r.ragHits}/${r.expectedKeywords.size}", deltaStr)
+                    row(
+                        r.question.id,
+                        "${r.noRagHits}/${r.expectedKeywords.size}",
+                        "${r.ragHits}/${r.expectedKeywords.size}",
+                        deltaStr,
+                        if (r.ragSources) "✓" else "✗",
+                        if (r.ragCitations) "✓" else "✗",
+                    )
                 }
             }
         }
@@ -337,6 +353,14 @@ internal class RagCommands(
         val totalKw = results.sumOf { it.expectedKeywords.size }
         AppTerminal.println("Total keyword coverage: no-RAG $noRagTotal/$totalKw  |  RAG $ragTotal/$totalKw")
         AppTerminal.println("Δ total: ${if (ragTotal - noRagTotal >= 0) "+" else ""}${ragTotal - noRagTotal}")
+        // День 24: метрика анти-галлюцинаций — % RAG-ответов с источниками и цитатами (требование задания).
+        val srcCount = results.count { it.ragSources }
+        val citeCount = results.count { it.ragCitations }
+        val n = results.size
+        val srcPct = if (n > 0) srcCount * 100 / n else 0
+        val citePct = if (n > 0) citeCount * 100 / n else 0
+        AppTerminal.println("RAG answers with sources:   $srcCount/$n ($srcPct%)   ← день 24")
+        AppTerminal.println("RAG answers with citations: $citeCount/$n ($citePct%)   ← день 24")
         AppTerminal.println("\nInspect full answers per question with /rag on then asking directly.")
     }
 
@@ -591,6 +615,9 @@ private data class EvalRow(
     val answerRag: String,
     val noRagHits: Int,
     val ragHits: Int,
+    // День 24: анти-галлюцинации — источники и цитаты в RAG-ответе (CitationDetector).
+    val ragSources: Boolean,
+    val ragCitations: Boolean,
 ) {
     val expectedKeywords: List<String> get() = question.expectedKeywords
 }

@@ -22,6 +22,7 @@ import com.cliagent.rag.ScoredChunk
  *  - Day 12: [LongTermMemory.profile] рендерится автоматически (см. [UserProfile.renderBlock]).
  *  - Day 13: [WorkingMemory.taskState] рендерится в [WorkingMemory.renderBlock] (блок Task state).
  *  - Day 22: [retrievedContext] рендерится в [renderRetrievedBlock] (блок `[Retrieved context]`).
+ *  - Day 24: инструкция блока усилена — обязательные источники + цитаты + «не знаю» (анти-галлюцинации).
  */
 class PromptBuilder(
     private val baseSystem: ChatMessage,
@@ -113,14 +114,24 @@ internal fun UserProfile.renderBlock(): String {
 }
 
 /**
- * Секция retrieved-контекста RAG (день 22): топ-K чанков, найденных по запросу в индексе корпуса.
- * Лекция недели 5: чанки **комбинируются с промптом** — модель отвечает из них, а не из общей
- * тренировочной базы (анти-галлюцинации). Метаданные source/section/chunk_id/score кладутся явно —
- * задел под день 24 (обязательные цитаты + источники в ответе).
+ * Секция retrieved-контекста RAG (день 22 → усилено день 24): топ-K чанков, найденных по запросу в
+ * индексе корпуса. Лекция недели 5: чанки **комбинируются с промптом** — модель отвечает из них, а не
+ * из общей тренировочной базы (анти-галлюцинации).
+ *
+ * **День 24** (цитаты, источники, анти-галлюцинации): инструкция усилена — модель ОБЯЗАНА вернуть
+ * структурированный ответ (Ответ / Источники / Цитаты) и сказать «не знаю», если чанки не содержат
+ * ответа. Метаданные `source › section (chunk_id, score)` кладутся явно для цитирования.
+ * Пост-чек выполнения инструкции — в [com.cliagent.agent.ContextAwareAgent.finalizeAssistant]
+ * через [com.cliagent.rag.CitationDetector] (warning only, не re-prompt).
  */
 internal fun List<ScoredChunk>.renderRetrievedBlock(): String {
     val lines = mutableListOf<String>()
-    lines.add("[Retrieved context — answer using these sources; cite source › section]")
+    lines.add("[Retrieved context — ответь СТРОГО по этим источникам, не выдумывай. Формат ответа:]")
+    lines.add("  1) Ответ: суть по чанкам своими словами")
+    lines.add("  2) Источники: перечисли каждый использованный source › section (chunk_id)")
+    lines.add("  3) Цитаты: дословные фрагменты из чанков в кавычках «...» с указанием источника")
+    lines.add("  Если чанки не содержат ответа на вопрос — так и скажи: «не знаю, уточните вопрос».")
+    lines.add("Найденные чанки:")
     forEachIndexed { i, sc ->
         val chunk = sc.chunk
         lines.add("${i + 1}. ${chunk.text}")
