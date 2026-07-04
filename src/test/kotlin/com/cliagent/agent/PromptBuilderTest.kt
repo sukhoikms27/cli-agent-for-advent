@@ -203,6 +203,42 @@ class PromptBuilderTest {
         assertTrue(invIdx > ragIdx, "invariants after retrieved")
     }
 
+    // ── День 24: усиленная инструкция retrieved-блока (цитаты, источники, «не знаю») ────
+
+    @Test
+    fun `retrieved block requires structured answer format — день 24`() {
+        val chunks = listOf(ScoredChunk(chunk("c1", "SlidingWindow", "a.md", "keep last N"), 0.9f))
+        val built = PromptBuilder(base, null, null, chunks).build()
+        // Анти-галлюцинации: модель обязана вернуть структурированный ответ.
+        assertTrue(built.content.contains("Ответ:"), "должен требовать раздел Ответ")
+        assertTrue(built.content.contains("Источники:"), "должен требовать раздел Источники")
+        assertTrue(built.content.contains("Цитаты:"), "должен требовать раздел Цитаты")
+    }
+
+    @Test
+    fun `retrieved block includes dont-know instruction — день 24`() {
+        val chunks = listOf(ScoredChunk(chunk("c1", "S", "a.md", "text"), 0.5f))
+        val built = PromptBuilder(base, null, null, chunks).build()
+        // Усиление задания day-24: при отсутствии ответа в чанках — «не знаю, уточните».
+        assertTrue(built.content.contains("не знаю"), "должна быть инструкция «не знаю»")
+        assertTrue(built.content.contains("уточните"), "должна быть просьба уточнить")
+    }
+
+    @Test
+    fun `retrieved block still renders source section chunkId score — no regression`() {
+        // Backward-compat: формат метаданных чанка не сломан усилением инструкции.
+        val chunks = listOf(ScoredChunk(chunk("c1", "SlidingWindow", "SlidingWindow.kt", "keep last N"), 0.9f))
+        val built = PromptBuilder(base, null, null, chunks).build()
+        assertTrue(built.content.contains("SlidingWindow.kt › SlidingWindow"))
+        assertTrue(built.content.contains("c1"))
+        // score рендерится через %.3f (Locale-dependent на JVM — может быть 0.900 или 0,900);
+        // проверяем наличие score-подстроки толерантно к разделителю.
+        assertTrue(
+            built.content.contains("score 0.900") || built.content.contains("score 0,900"),
+            "score должен рендериться с 3 знаками (0.900 или 0,900 в зависимости от locale)"
+        )
+    }
+
     private fun chunk(id: String, section: String, source: String, text: String): RagChunk =
         RagChunk(
             chunkId = id, documentId = "d", source = source, title = "T", section = section,

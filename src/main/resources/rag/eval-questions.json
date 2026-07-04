@@ -1,62 +1,62 @@
 [
   {
     "id": "q1",
-    "question": "Какие четыре стратегии управления контекстом реализованы в проекте?",
-    "expectedKeywords": ["sliding", "facts", "summary", "branch"],
-    "expectedSources": ["global-plan.md", "AGENTS.md"]
+    "question": "Какой размер батча используется при эмбеддинге документов через Ollama и сколько делается повторных попыток при транзиентных ошибках?",
+    "expectedKeywords": ["32", "5"],
+    "expectedSources": ["OllamaEmbeddingClient.kt", "05-embeddings.md"]
   },
   {
     "id": "q2",
-    "question": "Какие слои памяти есть у агента и в чём разница между working и long-term memory?",
-    "expectedKeywords": ["working", "long", "task", "knowledge"],
-    "expectedSources": ["AGENTS.md"]
+    "question": "Какой размер чанка в токенах и какое перекрытие (overlap) используются в стратегии fixed chunking?",
+    "expectedKeywords": ["500", "100"],
+    "expectedSources": ["04-chunking.md", "FixedSizeChunker.kt"]
   },
   {
     "id": "q3",
-    "question": "Как работает tool-use loop в агенте и сколько раундов по умолчанию?",
-    "expectedKeywords": ["tool", "rounds", "8"],
-    "expectedSources": ["AGENTS.md"]
+    "question": "По какой формуле эвристический реранкер объединяет косинусное сходство и overlap терминов, и какой коэффициент alpha используется по умолчанию?",
+    "expectedKeywords": ["alpha", "jaccard", "0.5"],
+    "expectedSources": ["README.md", "HeuristicReranker.kt"]
   },
   {
     "id": "q4",
-    "question": "Какие две стратегии чанкинга поддерживает RAG и чем они отличаются?",
-    "expectedKeywords": ["fixed", "structural"],
-    "expectedSources": ["global-plan.md"]
+    "question": "Какой алгоритм хэширования идентифицирует документы при индексации, обеспечивая стабильность id между перезапусками?",
+    "expectedKeywords": ["FNV"],
+    "expectedSources": ["03-document-loader.md", "DocumentLoader.kt"]
   },
   {
     "id": "q5",
-    "question": "Зачем нужны project invariants и какие категории инвариантов есть?",
-    "expectedKeywords": ["invariant", "STACK", "BAN", "ARCH"],
-    "expectedSources": ["global-plan.md", "AGENTS.md"]
+    "question": "Какая стратегия роя (swarm) и сколько воркеров используются на стадии VALIDATION задачи?",
+    "expectedKeywords": ["REDUNDANCY", "3"],
+    "expectedSources": ["swarm-stabilization.md"]
   },
   {
     "id": "q6",
-    "question": "Что хранит профиль пользователя и какие у него поля?",
-    "expectedKeywords": ["style", "format", "about", "constraints"],
-    "expectedSources": ["global-plan.md"]
+    "question": "Какие четыре категории инвариантов проекта существуют и какая категория используется по умолчанию при создании инварианта?",
+    "expectedKeywords": ["BUSINESS", "STACK", "BAN", "ARCH"],
+    "expectedSources": ["01-invariant-model.md", "Invariant.kt"]
   },
   {
     "id": "q7",
-    "question": "Какие стадии проходит задача в task state machine?",
-    "expectedKeywords": ["clarify", "planning", "execution", "validation"],
-    "expectedSources": ["global-plan.md", "AGENTS.md"]
+    "question": "Какие три режима взаимодействия (InteractionMode) управляют автоматизацией стадийного потока и какой режим включён по умолчанию?",
+    "expectedKeywords": ["PLAN", "MANUAL", "AUTO"],
+    "expectedSources": ["18-interaction-mode.md", "InteractionMode.kt"]
   },
   {
     "id": "q8",
-    "question": "Какой LLM-провайдер и модель используются в проекте по умолчанию?",
-    "expectedKeywords": ["z.ai", "glm"],
-    "expectedSources": ["AGENTS.md"]
+    "question": "Сколько раундов tool-use loop выполняется по умолчанию и для какого сценария это значение было увеличено?",
+    "expectedKeywords": ["8", "rounds"],
+    "expectedSources": ["00-task.md", "ContextAwareAgent.kt"]
   },
   {
     "id": "q9",
-    "question": "Как эмбеддинг-модель сравнивает тексты и что означает косинусное сходство равное 1?",
-    "expectedKeywords": ["cosine", "embedding", "1"],
-    "expectedSources": ["global-plan.md"]
+    "question": "Что означают значения косинусного сходства равные 1, 0 и минус 1 при сравнении векторов?",
+    "expectedKeywords": ["1", "0", "-1"],
+    "expectedSources": ["06-vector-math.md", "VectorMath.kt"]
   },
   {
     "id": "q10",
-    "question": "Какие паттерны корутин применяются в проекте для REPL и IO-операций?",
-    "expectedKeywords": ["runBlocking", "Dispatchers", "SupervisorJob"],
-    "expectedSources": ["AGENTS.md"]
+    "question": "Какие три исхода может вернуть попытка перехода между стадиями через TransitionGuard и чем они отличаются?",
+    "expectedKeywords": ["Allowed", "Illegal", "ArtifactMissing"],
+    "expectedSources": ["05-transition-outcome.md", "TransitionOutcome.kt"]
   }
 ]

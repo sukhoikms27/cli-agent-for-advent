@@ -23,6 +23,8 @@ import com.cliagent.memory.LongTermMemory
 import com.cliagent.memory.MemoryStore
 import com.cliagent.memory.UserProfile
 import com.cliagent.memory.WorkingMemory
+import com.cliagent.rag.CannedResponses
+import com.cliagent.rag.CitationDetector
 import com.cliagent.rag.RagRetriever
 import com.cliagent.rag.ScoredChunk
 import com.cliagent.state.invariant.Invariant
@@ -84,6 +86,20 @@ class ContextAwareAgent(
      * берёт top-K чанков по запросу и кладёт в `[Retrieved context]`-блок промпта.
      */
     private var ragEnabled: Boolean = false,
+    /**
+     * День 24: порог анти-галлюцинации. Если max similarity среди retrieved-чанков < порога (или
+     * список пуст) → canned-response «не знаю» **без вызова LLM**. `0.0` = режим выключен
+     * (backward-compat с днём 23). Отдельно от [com.cliagent.rag.RagConfig.similarityThreshold]
+     * (тот фильтрует чанки для реранкера; этот — отказывается отвечать при слабом контексте).
+     * Не срабатывает при `retrieve()=null` (мягкая деградация дня 22).
+     */
+    private val dontKnowThreshold: Float = 0.0f,
+    /**
+     * День 24: sink для результата пост-чека цитирования ([CitationDetector.detect]). **Default
+     * noop** — сам чек идёт через [logger] (warning поверх спиннера). Этот колбэк — для `/rag eval`
+     * и тестов, чтобы собрать метрику % ответов с источниками/цитатами без повторного детектирования.
+     */
+    private val citationLogger: (CitationDetector.Result) -> Unit = {},
 ) : Agent {
 
     /** Доступ к [TokenCounter] для stage-агентов (мера C: bounded-усечение межартефактных передач). */
@@ -95,6 +111,8 @@ class ContextAwareAgent(
     private var workingMemory: WorkingMemory? = null
     private var longTermMemory: LongTermMemory? = null
     private var turnCount = 0   // день 12: счётчик ходов для авто-извлечения профиля
+    // День 24: буфер retrieved-контекста текущего хода для пост-чека цитирования в finalizeAssistant.
+    private var ragContextAtLastTurn: List<ScoredChunk>? = null
     // День 17: парсер JSON-аргументов tool_calls от LLM.
     private val toolArgsJson = Json { ignoreUnknownKeys = true }
 
@@ -149,11 +167,32 @@ class ContextAwareAgent(
             val hits = ragRetriever?.retrieve(userMessage)
             when {
                 hits == null -> logger("⚠️ RAG on, but retrieve() returned null (index empty or Ollama error) — answering without context")
-                hits.isEmpty() -> logger("⚠️ RAG on, but 0 chunks matched — answering without context")
-                else -> logger("📚 RAG: retrieved ${hits.size} chunk(s) — injecting into prompt")
+                hits.isEmpty() -> logger("📚 RAG: 0 chunks matched")
+                else -> {
+                    val best = hits.maxOfOrNull { it.score } ?: 0f
+                    logger("📚 RAG: ${hits.size} chunk(s), best similarity ${String.format("%.2f", best)}")
+                }
             }
             hits
         } else null
+
+        // День 24: анти-галлюцинация. Слабый контекст (max similarity < порога или 0 чанков) →
+        // canned-response БЕЗ вызова LLM (дёшево, 100% отказ, persist'ится в history). Не триггерится
+        // при ragContext=null (мягкая деградация дня 22 — Ollama down/пустой индекс → без RAG-блока,
+        // не отказ). dontKnowThreshold=0.0 (default) → выключено, backward-compat с днём 23.
+        if (ragContext != null && dontKnowThreshold > 0.0f) {
+            val maxScore = ragContext.maxOfOrNull { it.score } ?: 0f
+            val weak = ragContext.isEmpty() || maxScore < dontKnowThreshold
+            if (weak) {
+                logger("🚫 Anti-hallucination: best similarity ${String.format("%.2f", maxScore)} < threshold ${String.format("%.2f", dontKnowThreshold)} → canned «не знаю» (LLM не вызывается)")
+                val canned = CannedResponses.weakContext(userMessage, maxScore, dontKnowThreshold)
+                val cannedMsg = ChatMessage(role = "assistant", content = canned, parentId = userMsg.id)
+                history.add(cannedMsg)
+                memoryStore.saveMessage(chatId, cannedMsg)
+                return canned
+            }
+        }
+        if (ragContext != null) logger("🤖 Generating answer via LLM…")
 
         // Build messages
         val messagesToSend = buildMessagesToSend(userMsg, ragContext)
@@ -165,6 +204,8 @@ class ContextAwareAgent(
         // День 17: tool-use loop. tools = null (нет toolExecutor / MCP недоступен) → один shot,
         // поведение дней 1–16. Иначе LLM может вернуть tool_calls → исполняем → feed-back → финал.
         val tools = loadToolsOrNull()
+        // День 24: сохраняем retrieved-контекст хода для пост-чека цитирования в finalizeAssistant.
+        ragContextAtLastTurn = ragContext
         return runToolLoop(messagesToSend, OutputBudget.maxTokensFor(estimatedTokens), tools, userMsg)
     }
 
@@ -238,6 +279,18 @@ class ContextAwareAgent(
         )
         history.add(assistantMsg)
         memoryStore.saveMessage(chatId, assistantMsg)
+
+        // День 24: пост-чек цитирования (анти-галлюцинации). Если был RAG-контекст — проверяем,
+        // упомянуты ли источники и есть ли цитаты в ответе. Warning через logger (поверх спиннера),
+        // НЕ блокирует и НЕ re-prompt — модель может не послушаться усиленный промпт, это дёшево
+        // сигнализирует. citationLogger — для /rag eval и тестов (метрика покрытия).
+        val lastCtx = ragContextAtLastTurn
+        if (lastCtx != null && lastCtx.isNotEmpty()) {
+            val cite = CitationDetector.detect(assistantContent, lastCtx)
+            if (!cite.sourcesPresent) logger("⚠️ Citation check: источники не упомянуты в ответе (anti-hallucination warning)")
+            if (!cite.citationsPresent) logger("⚠️ Citation check: цитаты отсутствуют в ответе (anti-hallucination warning)")
+            citationLogger(cite)
+        }
 
         // Let strategy process the response (e.g., update facts)
         contextManager?.onAssistantResponse(assistantMsg)

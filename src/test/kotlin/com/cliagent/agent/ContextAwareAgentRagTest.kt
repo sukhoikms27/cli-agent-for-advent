@@ -142,4 +142,120 @@ class ContextAwareAgentRagTest {
         agent.setRagEnabled(false)
         assertFalse(agent.isRagEnabled())
     }
+
+    // ── День 24: анти-галлюцинации (canned «не знаю» + пост-чек цитирования) ──────────
+
+    @Test
+    fun `weak context below threshold returns canned response without LLM call — день 24`() = runTest {
+        val store = memoryStoreMock()
+        val llm = mockk<LlmClient>()
+        val retriever = mockk<RagRetriever>()
+        // Retrieve дал чанк, но с низким сходством (0.2 < threshold 0.4).
+        coEvery { retriever.retrieve(any()) } returns listOf(ragChunk("irrelevant text", "x.md").copy(score = 0.2f))
+
+        val agent = ContextAwareAgent(
+            llmClient = llm, memoryStore = store, model = "m", chatId = "c",
+            ragRetriever = retriever, ragEnabled = true,
+            dontKnowThreshold = 0.4f,
+        )
+        val answer = agent.chat("что-то совсем нерелевантное")
+
+        // LLM НЕ вызывался — canned-response без обращения к модели.
+        coVerify(exactly = 0) { llm.chat(any()) }
+        assertTrue(answer.contains("не знаю"), "canned должен содержать «не знаю»")
+        // score/threshold рендерятся через %.2f — Locale-dependent (0.20 или 0,20). Толерантно.
+        assertTrue(answer.contains("0.20") || answer.contains("0,20"), "canned должен показать max similarity")
+        assertTrue(answer.contains("0.40") || answer.contains("0,40"), "canned должен показать threshold")
+    }
+
+    @Test
+    fun `empty retrieved list below threshold returns canned — день 24`() = runTest {
+        val store = memoryStoreMock()
+        val llm = mockk<LlmClient>()
+        val retriever = mockk<RagRetriever>()
+        coEvery { retriever.retrieve(any()) } returns emptyList()   // 0 чанков совпали
+
+        val agent = ContextAwareAgent(
+            llmClient = llm, memoryStore = store, model = "m", chatId = "c",
+            ragRetriever = retriever, ragEnabled = true,
+            dontKnowThreshold = 0.3f,
+        )
+        val answer = agent.chat("непонятный запрос")
+        coVerify(exactly = 0) { llm.chat(any()) }
+        assertTrue(answer.contains("не знаю"))
+    }
+
+    @Test
+    fun `strong context above threshold calls LLM normally — день 24`() = runTest {
+        val store = memoryStoreMock()
+        val llm = mockk<LlmClient>()
+        coEvery { llm.chat(any()) } returns LlmResult.Success(fakeResponse())
+        val retriever = mockk<RagRetriever>()
+        // Сходство 0.8 ≥ threshold 0.4 → LLM вызывается (backward-compat с днём 23).
+        coEvery { retriever.retrieve(any()) } returns listOf(ragChunk("relevant text", "a.md").copy(score = 0.8f))
+
+        val agent = ContextAwareAgent(
+            llmClient = llm, memoryStore = store, model = "m", chatId = "c",
+            ragRetriever = retriever, ragEnabled = true,
+            dontKnowThreshold = 0.4f,
+        )
+        agent.chat("релевантный вопрос")
+        coVerify(exactly = 1) { llm.chat(any()) }
+    }
+
+    @Test
+    fun `threshold zero disables dont-know mode — backward compat with day 23`() = runTest {
+        val store = memoryStoreMock()
+        val llm = mockk<LlmClient>()
+        coEvery { llm.chat(any()) } returns LlmResult.Success(fakeResponse())
+        val retriever = mockk<RagRetriever>()
+        // Низкое сходство (0.1), но threshold=0.0 → режим выключен, LLM зовётся (день 23).
+        coEvery { retriever.retrieve(any()) } returns listOf(ragChunk("weak text", "a.md").copy(score = 0.1f))
+
+        val agent = ContextAwareAgent(
+            llmClient = llm, memoryStore = store, model = "m", chatId = "c",
+            ragRetriever = retriever, ragEnabled = true,
+            dontKnowThreshold = 0.0f,   // выключено
+        )
+        agent.chat("вопрос")
+        coVerify(exactly = 1) { llm.chat(any()) }
+    }
+
+    @Test
+    fun `retrieve null with positive threshold does not trigger canned — day 22 graceful degradation`() = runTest {
+        val store = memoryStoreMock()
+        val llm = mockk<LlmClient>()
+        coEvery { llm.chat(any()) } returns LlmResult.Success(fakeResponse())
+        val retriever = mockk<RagRetriever>()
+        // retrieve()=null → Ollama down/пустой индекс → мягкая деградация дня 22 (НЕ canned «не знаю»).
+        coEvery { retriever.retrieve(any()) } returns null
+
+        val agent = ContextAwareAgent(
+            llmClient = llm, memoryStore = store, model = "m", chatId = "c",
+            ragRetriever = retriever, ragEnabled = true,
+            dontKnowThreshold = 0.5f,
+        )
+        agent.chat("вопрос")
+        // LLM вызывается — это мягкая деградация (без RAG-блока), а не отказ.
+        coVerify(exactly = 1) { llm.chat(any()) }
+    }
+
+    @Test
+    fun `canned response is persisted in history — день 24`() = runTest {
+        val store = memoryStoreMock()
+        val llm = mockk<LlmClient>()
+        val retriever = mockk<RagRetriever>()
+        coEvery { retriever.retrieve(any()) } returns emptyList()
+
+        val agent = ContextAwareAgent(
+            llmClient = llm, memoryStore = store, model = "m", chatId = "c",
+            ragRetriever = retriever, ragEnabled = true,
+            dontKnowThreshold = 0.3f,
+        )
+        agent.chat("непонятный вопрос")
+
+        val history = agent.getHistory()
+        // user + canned assistant — последний ответ сохранён как обычный assistant message.
+        assertTrue(history.any { it.role == "assistant" && it.content.contains("не знаю") })
+    }
 }

@@ -76,6 +76,8 @@ class ConfigRepository(
                 embeddingBaseUrl = System.getenv("CLI_AGENT_RAG_EMBEDDING_URL") ?: base.embeddingBaseUrl,
                 chunkSizeTokens = System.getenv("CLI_AGENT_RAG_CHUNK_SIZE")?.toIntOrNull() ?: base.chunkSizeTokens,
                 chunkOverlapTokens = System.getenv("CLI_AGENT_RAG_CHUNK_OVERLAP")?.toIntOrNull() ?: base.chunkOverlapTokens,
+                // День 24: порог анти-галлюцинации («не знаю» при слабом контексте). 0.0 = выключено.
+                dontKnowThreshold = System.getenv("CLI_AGENT_RAG_DONT_KNOW_THRESHOLD")?.toFloatOrNull() ?: base.dontKnowThreshold,
             )
         }
 
