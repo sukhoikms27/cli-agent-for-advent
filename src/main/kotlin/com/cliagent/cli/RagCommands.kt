@@ -1,6 +1,7 @@
 package com.cliagent.cli
 
 import com.cliagent.config.AppPaths
+import com.cliagent.llm.LlmClient
 import com.cliagent.rag.ChunkingComparison
 import com.cliagent.rag.DocumentLoader
 import com.cliagent.rag.JsonRagStore
@@ -8,7 +9,12 @@ import com.cliagent.rag.RagChunk
 import com.cliagent.rag.RagConfig
 import com.cliagent.rag.RagIndex
 import com.cliagent.rag.RagIndexer
+import com.cliagent.rag.RagRetriever
 import com.cliagent.rag.ScoredChunk
+import com.cliagent.rag.queryRewriterOf
+import com.cliagent.rag.rerankerOf
+import com.cliagent.rag.rerank.RerankerType
+import com.cliagent.rag.rewrite.QueryRewriterType
 import com.cliagent.rag.chunk.ChunkingStrategy
 import com.cliagent.rag.chunk.ChunkingStrategyType
 import com.cliagent.rag.chunk.FixedSizeChunker
@@ -37,16 +43,25 @@ import kotlinx.serialization.json.Json
  * - `/rag on` / `/rag off` — toggle RAG-режима агента (инъекция в промпт, день 22)
  * - `/rag eval` — прогон 10 контрольных вопросов с/без RAG + сравнительный отчёт (день 22)
  * - `/rag config` — показать RagConfig
+ * - `/rag rewrite <identity|heuristic|llm>` — runtime-toggle query rewrite (день 23)
+ * - `/rag rerank <none|threshold|heuristic|llm>` — runtime-toggle реранкера/фильтра (день 23)
+ * - `/rag compare-modes` — A/B-сравнение матрицы режимов rerank×rewrite (день 23)
  *
  * @param agent агент для toggle on|off и eval-прогона
  * @param chat  chat-функция (statefulAgent.chat под спиннером) — для eval, чтобы RAG-инъекция
  *              шла через защищённый StatefulAgent (инварианты покрывают RAG-ответы)
+ * @param ragRetriever retrieval для runtime-toggle rerank/rewrite (день 23)
+ * @param llmClient LLM для LLM-режимов rewrite/rerank; null → деградация до identity/none
+ * @param model имя LLM-модели (для LLM-режимов)
  */
 internal class RagCommands(
     private val config: RagConfig,
     private val sharedEmbedder: OllamaEmbeddingClient,
     private val agent: com.cliagent.agent.ContextAwareAgent,
     private val chat: suspend (String) -> String,
+    private val ragRetriever: RagRetriever,
+    private val llmClient: LlmClient?,
+    private val model: String,
 ) {
 
     /** Ленивый embedder для index/compare — переиспользует shared-инстанс сессии. */
@@ -62,33 +77,41 @@ internal class RagCommands(
             "index" -> handleIndex(parts)
             "stats" -> handleStats(parts)
             "compare" -> handleCompare(parts)
+            "compare-modes" -> handleCompareModes(parts)
             "search" -> handleSearch(parts)
             "on" -> { agent.setRagEnabled(true); AppTerminal.ok("RAG injection: ON") }
             "off" -> { agent.setRagEnabled(false); AppTerminal.ok("RAG injection: OFF") }
             "eval" -> handleEval(parts)
+            "rewrite" -> handleRewrite(parts)
+            "rerank" -> handleRerank(parts)
             "config" -> printConfig()
             else -> AppTerminal.println(
-                "Unknown /rag command: ${parts[1]}. Use: index, stats, compare, search, on, off, eval, config"
+                "Unknown /rag command: ${parts[1]}. Use: index, stats, compare, compare-modes, search, on, off, eval, rewrite, rerank, config"
             )
         }
     }
 
     // ── /rag — сводка ──────────────────────────────────────────────────────────
 
-    /** Сводка: runtime-режим агента (день 22), модель эмбеддинга, текущий индекс. */
+    /** Сводка: runtime-режим агента (день 22), модель эмбеддинга, текущий индекс, rerank/rewrite (день 23). */
     private suspend fun printSummary() {
         val runtimeState = if (agent.isRagEnabled()) "ON" else "OFF"
+        // День 23: runtime-режим rerank/rewrite (из RagRetriever), дефолт — из config.
+        val rewriteName = ragRetriever.getRewriter()?.name ?: "identity"
+        val rerankName = ragRetriever.getReranker()?.name ?: "none"
         AppTerminal.println("📚 RAG injection: $runtimeState  (config default: ${if (config.enabled) "ON" else "OFF"})")
         AppTerminal.println("   Embeddings: ${config.embeddingProvider} / ${config.embeddingModel} (${config.embeddingBaseUrl})")
         AppTerminal.println("   Corpus: ${config.corpusRoots.joinToString(", ")}")
         AppTerminal.println("   Chunking: size=${config.chunkSizeTokens} overlap=${config.chunkOverlapTokens}, topK=${config.topK}")
+        AppTerminal.println("   Rewrite: $rewriteName  (config: ${config.queryRewriter})  |  Rerank: $rerankName  (config: ${config.reranker})")
+        AppTerminal.println("   Candidate pool: ${config.candidatePoolSize}  |  Similarity threshold: ${String.format("%.2f", config.similarityThreshold)}")
         val idx = loadActiveIndex()
         if (idx.chunks.isEmpty()) {
             AppTerminal.println("   Index: empty. Use: /rag index")
         } else {
             AppTerminal.println("   Index: ${idx.chunks.size} chunks (${idx.embeddedChunks.size} embedded), strategy=${idx.strategy}, model=${idx.embeddingModel}")
         }
-        AppTerminal.println("   /rag index [fixed|structural] | stats | compare | search <q> | on | off | eval | config")
+        AppTerminal.println("   /rag index [fixed|structural] | stats | compare | compare-modes | search <q> | on | off | eval | rewrite <type> | rerank <type> | config")
     }
 
     // ── /rag index [fixed|structural] ──────────────────────────────────────────
@@ -224,6 +247,14 @@ internal class RagCommands(
         AppTerminal.println("  defaultStrategy: ${config.defaultStrategy}")
         AppTerminal.println("  topK: ${config.topK}")
         AppTerminal.println("  injectIntoPrompt: ${config.injectIntoPrompt}")
+        // День 23: реранкинг и фильтрация.
+        AppTerminal.println("  candidatePoolSize: ${config.candidatePoolSize}")
+        AppTerminal.println("  similarityThreshold: ${config.similarityThreshold}")
+        AppTerminal.println("  queryRewriter: ${config.queryRewriter}")
+        AppTerminal.println("  reranker: ${config.reranker}")
+        // День 23: runtime-режим (может отличаться от config после toggle).
+        AppTerminal.println("  runtime rewrite: ${ragRetriever.getRewriter()?.name ?: "identity"}")
+        AppTerminal.println("  runtime rerank: ${ragRetriever.getReranker()?.name ?: "none"}")
         AppTerminal.println("  indexDir: ${AppPaths.ragDir}")
     }
 
@@ -307,6 +338,151 @@ internal class RagCommands(
         AppTerminal.println("Total keyword coverage: no-RAG $noRagTotal/$totalKw  |  RAG $ragTotal/$totalKw")
         AppTerminal.println("Δ total: ${if (ragTotal - noRagTotal >= 0) "+" else ""}${ragTotal - noRagTotal}")
         AppTerminal.println("\nInspect full answers per question with /rag on then asking directly.")
+    }
+
+    // ── /rag rewrite <identity|heuristic|llm> (день 23) ────────────────────────
+
+    /** Runtime-toggle query rewrite. Создаёт rewriter через фабрику → `ragRetriever.setRewriter`. */
+    private fun handleRewrite(parts: List<String>) {
+        val type = parts.getOrNull(2)?.trim()?.lowercase()
+        if (type.isNullOrEmpty()) {
+            AppTerminal.println("Usage: /rag rewrite <identity|heuristic|llm>")
+            AppTerminal.println("  Current: ${ragRetriever.getRewriter()?.name ?: "identity"}")
+            return
+        }
+        // Валидация типа ДО фабрики (чтобы не молча деградировать до identity при опечатке).
+        val resolved = QueryRewriterType.fromString(type)
+        if (resolved == QueryRewriterType.LLM && llmClient == null) {
+            AppTerminal.warn("LLM client unavailable — 'llm' rewrite degrades to identity.")
+        }
+        val rewriter = queryRewriterOf(type, llmClient, model)
+        ragRetriever.setRewriter(rewriter)
+        AppTerminal.ok("RAG rewrite: ${rewriter.name}")
+    }
+
+    // ── /rag rerank <none|threshold|heuristic|llm> (день 23) ───────────────────
+
+    /** Runtime-toggle реранкера/фильтра. Создаёт reranker через фабрику → `ragRetriever.setReranker`. */
+    private fun handleRerank(parts: List<String>) {
+        val type = parts.getOrNull(2)?.trim()?.lowercase()
+        if (type.isNullOrEmpty()) {
+            AppTerminal.println("Usage: /rag rerank <none|threshold|heuristic|llm>")
+            AppTerminal.println("  Current: ${ragRetriever.getReranker()?.name ?: "none"}")
+            return
+        }
+        val resolved = RerankerType.fromString(type)
+        if (resolved == RerankerType.LLM && llmClient == null) {
+            AppTerminal.warn("LLM client unavailable — 'llm' rerank disabled (none).")
+        }
+        val reranker = rerankerOf(type, config, llmClient, model)
+        ragRetriever.setReranker(reranker)
+        AppTerminal.ok("RAG rerank: ${reranker?.name ?: "none"}")
+    }
+
+    // ── /rag compare-modes (день 23) ───────────────────────────────────────────
+
+    /**
+     * A/B-сравнение матрицы режимов rerank × rewrite (день 23, требование «сравните качество без
+     * фильтра/rewriting и с фильтром»). Лекция недели 5: метрика — правдивость ответов (покрытие
+     * expectedKeywords из контрольных вопросов).
+     *
+     * Для каждой пары (rewrite, rerank) прогоняет все eval-вопросы через `chat()` и считает покрытие.
+     * RAG должен быть включён (иначе режимы не влияют на ответ). Сохраняет/восстанавливает исходный
+     * runtime-режим RagRetriever — side-effect только в виде отчёта.
+     */
+    private suspend fun handleCompareModes(parts: List<String>) {
+        val index = loadActiveIndex()
+        if (index.embeddedChunks.isEmpty()) {
+            AppTerminal.warn("No embedded index. Use: /rag index first.")
+            return
+        }
+        val questions = loadEvalQuestions()
+        if (questions.isEmpty()) {
+            AppTerminal.warn("No eval questions found (rag/eval-questions.json).")
+            return
+        }
+        // Матрица режимов. none/identity — baseline (день 22); остальные — день 23.
+        val rewriters = listOf("identity", "heuristic", "llm")
+        val rerankers = listOf("none", "threshold", "heuristic", "llm")
+
+        AppTerminal.println("📊 Compare-modes: ${rewriters.size}×${rerankers.size}=${rewriters.size * rerankers.size} modes × ${questions.size} questions…")
+        AppTerminal.println("   (RAG must be ON for modes to affect answers)")
+
+        // Сохраняем исходный runtime-режим, чтобы восстановить после прогона.
+        val savedRewriter = ragRetriever.getRewriter()
+        val savedReranker = ragRetriever.getReranker()
+        val savedRagState = agent.isRagEnabled()
+        agent.setRagEnabled(true)
+
+        try {
+            // modeHits[modeLabel] = total keyword hits across all questions
+            val modeHits = LinkedHashMap<String, Int>()
+            val modeKeyTotals = LinkedHashMap<String, Int>()
+            for (rw in rewriters) {
+                for (rr in rerankers) {
+                    val label = "rw=$rw|rr=$rr"
+                    ragRetriever.setRewriter(queryRewriterOf(rw, llmClient, model))
+                    ragRetriever.setReranker(rerankerOf(rr, config, llmClient, model))
+                    var hits = 0
+                    var totalKw = 0
+                    questions.forEach { q ->
+                        totalKw += q.expectedKeywords.size
+                        val answer = runCatching { chat(q.question) }.getOrElse { "(error: ${it.message})" }
+                        hits += q.expectedKeywords.count { kw -> answer.contains(kw, ignoreCase = true) }
+                    }
+                    modeHits[label] = hits
+                    modeKeyTotals[label] = totalKw
+                    AppTerminal.println("  $label → $hits/$totalKw keywords")
+                }
+            }
+            printCompareModesReport(rewriters, rerankers, modeHits, modeKeyTotals)
+        } catch (e: CancellationException) {
+            throw e
+        } finally {
+            // Восстанавливаем исходный runtime-режим.
+            ragRetriever.setRewriter(savedRewriter)
+            ragRetriever.setReranker(savedReranker)
+            agent.setRagEnabled(savedRagState)
+        }
+    }
+
+    private fun printCompareModesReport(
+        rewriters: List<String>,
+        rerankers: List<String>,
+        modeHits: Map<String, Int>,
+        modeKeyTotals: Map<String, Int>,
+    ) {
+        AppTerminal.println("\n${"─".repeat(72)}")
+        AppTerminal.println("📊 RAG compare-modes (keyword coverage by rewrite×rerank)")
+        AppTerminal.println("${"─".repeat(72)}")
+        val tbl = table {
+            header {
+                style(bold = true)
+                row("rewrite \\ rerank", *rerankers.toTypedArray())
+            }
+            body {
+                rewriters.forEach { rw ->
+                    val cells = rerankers.map { rr ->
+                        val label = "rw=$rw|rr=$rr"
+                        val hits = modeHits[label] ?: 0
+                        val total = modeKeyTotals[label] ?: 1
+                        "$hits/$total"
+                    }
+                    row(rw, *cells.toTypedArray())
+                }
+            }
+        }
+        AppTerminal.println(tbl)
+        // Подсветка лучшего режима.
+        val best = modeHits.maxByOrNull { it.value }
+        if (best != null) {
+            val total = modeKeyTotals[best.key] ?: 1
+            AppTerminal.println("Best mode: ${best.key} → ${best.value}/$total keywords")
+        }
+        val baselineKey = "rw=identity|rr=none"
+        val baselineHits = modeHits[baselineKey] ?: 0
+        AppTerminal.println("Baseline ($baselineKey): $baselineHits/${modeKeyTotals[baselineKey] ?: 0}")
+        AppTerminal.println("\nHigher keyword coverage = better retrieval quality (lecture week 5 metric).")
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────
