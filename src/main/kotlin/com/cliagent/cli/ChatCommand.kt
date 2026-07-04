@@ -197,6 +197,8 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             ragEnabled = config.rag.enabled,
             // День 24: порог анти-галлюцинации («не знаю» при слабом контексте). 0.0 = выключено.
             dontKnowThreshold = config.rag.dontKnowThreshold,
+            // День 25: conversation-aware retrieval (обогащение запроса целью + историей).
+            conversationalQuery = config.rag.conversationalQuery,
         )
 
         // День 13 (авто-поток стадий): оркестратор автоматизирует /task start → артефакт стадии →

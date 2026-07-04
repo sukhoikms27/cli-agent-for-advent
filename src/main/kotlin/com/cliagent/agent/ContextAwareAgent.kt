@@ -95,6 +95,13 @@ class ContextAwareAgent(
      */
     private val dontKnowThreshold: Float = 0.0f,
     /**
+     * День 25: conversation-aware retrieval. `true` → перед `retrieve()` запрос обогащается целью
+     * диалога (`WorkingMemory.currentTask`) + последними 2 user-репликами истории (см.
+     * [buildConversationQuery]). Follow-up «а сколько для этого?» находят контекст (production-like).
+     * `false` (default) → для эмбеддинга берётся только `userMessage` (байт-идентично дню 24).
+     */
+    private val conversationalQuery: Boolean = false,
+    /**
      * День 24: sink для результата пост-чека цитирования ([CitationDetector.detect]). **Default
      * noop** — сам чек идёт через [logger] (warning поверх спиннера). Этот колбэк — для `/rag eval`
      * и тестов, чтобы собрать метрику % ответов с источниками/цитатами без повторного детектирования.
@@ -163,8 +170,11 @@ class ContextAwareAgent(
         // День 22: RAG-retrieval. Каждый ход — свежий поиск top-K чанков по запросу (лекция недели 5:
         // инференс-тайм подгрузка). ragEnabled=false или нет retriever'а → null → без [Retrieved context].
         // Мягкая деградация: ошибка эмбеддинга/пустой индекс → ragContext=null → агент отвечает без RAG.
+        // День 25: conversation-aware retrieval — запрос обогащается целью диалога + последними
+        // репликами, чтобы follow-up находили контекст. conversationalQuery=false → только userMessage.
         val ragContext = if (isRagEnabled()) {
-            val hits = ragRetriever?.retrieve(userMessage)
+            val retrievalQuery = if (conversationalQuery) buildConversationQuery(userMessage) else userMessage
+            val hits = ragRetriever?.retrieve(retrievalQuery)
             when {
                 hits == null -> logger("⚠️ RAG on, but retrieve() returned null (index empty or Ollama error) — answering without context")
                 hits.isEmpty() -> logger("📚 RAG: 0 chunks matched")
@@ -403,6 +413,40 @@ class ContextAwareAgent(
             com.cliagent.state.TaskStage.EXECUTION,
             com.cliagent.state.TaskStage.VALIDATION,
         )
+    }
+
+    /**
+     * День 25: собирает запрос для retrieval из [userMessage] + контекста диалога (conversation-aware
+     * retrieval, GAP-B). Обогащение идёт **до** эмбеддинга — сам `RagRetriever`/`QueryRewriter` не
+     * меняются (backward-compat дней 22–24).
+     *
+     * Контекст склеивается из:
+     *  1. **Цели диалога** (`WorkingMemory.currentTask`) — фрейм, в котором интерпретируются follow-up.
+     *     Напр. цель «разобраться в RAG» + реплика «а сколько для этого нужно?» → эмбеддер «понимает»,
+     *     что «этим» = RAG.
+     *  2. **Последних 2 user-реплик** истории (исключая только что добавленный `userMsg`) — для
+     *     разрешения анафоры («это», «тот», «он») и контекста уточняющих вопросов.
+     *  3. **Текущего вопроса** — всегда последней строкой (наибольший вес для близкого match).
+     *
+     * Edge-cases:
+     *  - Первый ход (история пуста, только `userMsg`) → без блока «Предыдущие вопросы» (no-op).
+     *  - `currentTask == null` → без блока «Контекст задачи».
+     *  - Длинная история → только 2 последние реплики (не раздуваем embedding, ~4 chars/token).
+     */
+    internal fun buildConversationQuery(userMessage: String): String {
+        val parts = mutableListOf<String>()
+        workingMemory?.currentTask?.takeIf { it.isNotBlank() }?.let { parts.add("Контекст задачи: $it") }
+        // dropLast(1) убирает только что добавленный userMsg; takeLast(2) — ограничивает контекст.
+        val priorUserTurns = history
+            .filter { it.role == "user" }
+            .dropLast(1)
+            .takeLast(2)
+            .map { it.content }
+        if (priorUserTurns.isNotEmpty()) {
+            parts.add("Предыдущие вопросы: ${priorUserTurns.joinToString(" | ")}")
+        }
+        parts.add("Текущий вопрос: $userMessage")
+        return parts.joinToString("\n")
     }
 
     private suspend fun buildMessagesToSend(

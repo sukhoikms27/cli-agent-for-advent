@@ -1,0 +1,56 @@
+{
+  "id": "task-fsm",
+  "goal": "Разобраться, как работает task state machine в проекте: стадии, переходы, артефакты-гейты, режимы взаимодействия",
+  "turns": [
+    {
+      "user": "Какие стадии проходит задача в task state machine проекта?",
+      "expectedKeywords": ["clarify", "planning", "execution", "validation"],
+      "expectedSources": ["01-taskstage.md", "TaskStage.kt"]
+    },
+    {
+      "user": "А что нужно заполнить, чтобы перейти из стадии planning дальше?",
+      "expectedKeywords": ["approvedPlan", "plan", "artifact"],
+      "expectedSources": ["13-artifact-gating.md", "TaskStateMachine.kt"]
+    },
+    {
+      "user": "Сколько всего артефактов-гейтов в системе и какие они?",
+      "expectedKeywords": ["3", "approvedPlan", "implementation", "verdict"],
+      "expectedSources": ["13-artifact-gating.md"]
+    },
+    {
+      "user": "А что происходит, если переход структурно запрещён — не по списку разрешённых?",
+      "expectedKeywords": ["Illegal", "Illegal", "allowedTargets"],
+      "expectedSources": ["05-transition-outcome.md", "TransitionOutcome.kt"]
+    },
+    {
+      "user": "Чем Illegal отличается от ArtifactMissing при попытке перехода?",
+      "expectedKeywords": ["Illegal", "ArtifactMissing", "artifact"],
+      "expectedSources": ["05-transition-outcome.md"]
+    },
+    {
+      "user": "Какие три режима взаимодействия управляют автоматизацией стадийного потока?",
+      "expectedKeywords": ["PLAN", "MANUAL", "AUTO"],
+      "expectedSources": ["18-interaction-mode.md", "InteractionMode.kt"]
+    },
+    {
+      "user": "Какой режим включён по умолчанию и почему выбран именно он?",
+      "expectedKeywords": ["PLAN", "default", "подтвержд"],
+      "expectedSources": ["18-interaction-mode.md", "InteractionMode.kt"]
+    },
+    {
+      "user": "Можно ли в режиме AUTO перепрыгнуть стадию, минуя артефакт-гейт?",
+      "expectedKeywords": ["TransitionGuard", "нельзя", "блокир"],
+      "expectedSources": ["18-interaction-mode.md"]
+    },
+    {
+      "user": "Какая стадия идёт после EXECUTION и что нужно для перехода в неё?",
+      "expectedKeywords": ["validation", "implementation", "verdict"],
+      "expectedSources": ["01-taskstage.md", "13-artifact-gating.md"]
+    },
+    {
+      "user": "Подытожь: какие 5 стадий FSM и какие 3 артефакта их связывают?",
+      "expectedKeywords": ["clarify", "planning", "execution", "validation", "done"],
+      "expectedSources": ["01-taskstage.md"]
+    }
+  ]
+}

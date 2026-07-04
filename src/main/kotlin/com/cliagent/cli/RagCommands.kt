@@ -84,9 +84,10 @@ internal class RagCommands(
             "eval" -> handleEval(parts)
             "rewrite" -> handleRewrite(parts)
             "rerank" -> handleRerank(parts)
+            "scenario" -> handleScenario(parts)
             "config" -> printConfig()
             else -> AppTerminal.println(
-                "Unknown /rag command: ${parts[1]}. Use: index, stats, compare, compare-modes, search, on, off, eval, rewrite, rerank, config"
+                "Unknown /rag command: ${parts[1]}. Use: index, stats, compare, compare-modes, search, on, off, eval, rewrite, rerank, scenario, config"
             )
         }
     }
@@ -107,13 +108,14 @@ internal class RagCommands(
         AppTerminal.println("   Candidate pool: ${config.candidatePoolSize}  |  Similarity threshold: ${String.format("%.2f", config.similarityThreshold)}")
         // День 24: порог анти-галлюцинации (canned «не знаю» при max similarity < порога).
         AppTerminal.println("   Anti-hallucination: dontKnowThreshold=${String.format("%.2f", config.dontKnowThreshold)}")
+        AppTerminal.println("   Conversational query: ${config.conversationalQuery}   ← день 25")
         val idx = loadActiveIndex()
         if (idx.chunks.isEmpty()) {
             AppTerminal.println("   Index: empty. Use: /rag index")
         } else {
             AppTerminal.println("   Index: ${idx.chunks.size} chunks (${idx.embeddedChunks.size} embedded), strategy=${idx.strategy}, model=${idx.embeddingModel}")
         }
-        AppTerminal.println("   /rag index [fixed|structural] | stats | compare | compare-modes | search <q> | on | off | eval | rewrite <type> | rerank <type> | config")
+        AppTerminal.println("   /rag index [fixed|structural] | stats | compare | compare-modes | search <q> | on | off | eval | rewrite <type> | rerank <type> | scenario <name> | config")
     }
 
     // ── /rag index [fixed|structural] ──────────────────────────────────────────
@@ -256,6 +258,8 @@ internal class RagCommands(
         AppTerminal.println("  reranker: ${config.reranker}")
         // День 24: порог анти-галлюцинации («не знаю» при слабом контексте). 0.0 = выключено.
         AppTerminal.println("  dontKnowThreshold: ${config.dontKnowThreshold}")
+        // День 25: conversation-aware retrieval (обогащение запроса целью + историей).
+        AppTerminal.println("  conversationalQuery: ${config.conversationalQuery}")
         // День 23: runtime-режим (может отличаться от config после toggle).
         AppTerminal.println("  runtime rewrite: ${ragRetriever.getRewriter()?.name ?: "identity"}")
         AppTerminal.println("  runtime rerank: ${ragRetriever.getReranker()?.name ?: "none"}")
@@ -362,6 +366,123 @@ internal class RagCommands(
         AppTerminal.println("RAG answers with sources:   $srcCount/$n ($srcPct%)   ← день 24")
         AppTerminal.println("RAG answers with citations: $citeCount/$n ($citePct%)   ← день 24")
         AppTerminal.println("\nInspect full answers per question with /rag on then asking directly.")
+    }
+
+    // ── /rag scenario <name> (день 25 — production-like multi-turn validation) ───
+
+    /**
+     * Прогон scripted-сценария (день 25): список связанных реплик в одном диалоге с целью (память
+     * задачи) + RAG каждый ход + проверка источников/цитат per-turn. Валидирует требование задания
+     * «не теряет цель и продолжает выдавать ответы с источниками».
+     *
+     * Pipeline: `agent.reset()` (изоляция — чистит history/working, НЕ long-term) →
+     * `setRagEnabled(true)` (RAG-on для сценария) → `setWorkingMemory(currentTask=goal)` (память
+     * задачи) → прогон всех `turns` через `chat()` с персистентной историей → per-turn пост-чек
+     * (CitationDetector + keywords) → сводный отчёт. Исходный RAG-режим восстанавливается в `finally`.
+     */
+    private suspend fun handleScenario(parts: List<String>) {
+        val name = parts.getOrNull(2)?.trim()?.lowercase()
+        if (name.isNullOrEmpty()) {
+            AppTerminal.println("Usage: /rag scenario <name>")
+            AppTerminal.println("  Available scenarios: ${listScenarios().joinToString(", ")}")
+            return
+        }
+        val scenario = loadScenario(name)
+        if (scenario == null) {
+            AppTerminal.warn("Scenario '$name' not found. Available: ${listScenarios().joinToString(", ")}")
+            return
+        }
+        val index = loadActiveIndex()
+        if (index.embeddedChunks.isEmpty()) {
+            AppTerminal.warn("No embedded index. Use: /rag index first (scenarios require RAG).")
+            return
+        }
+
+        AppTerminal.println("🎬 Scenario: ${scenario.id} (${scenario.turns.size} turns)")
+        AppTerminal.println("   Goal: ${scenario.goal}")
+        // Изоляция + память задачи: reset чистит history/working (НЕ long-term), затем ставим цель.
+        agent.reset()
+        val savedRag = agent.isRagEnabled()
+        agent.setRagEnabled(true)
+        agent.setWorkingMemory(com.cliagent.memory.WorkingMemory(currentTask = scenario.goal))
+
+        try {
+            val rows = mutableListOf<ScenarioTurnRow>()
+            scenario.turns.forEachIndexed { i, turn ->
+                AppTerminal.println("\n[${i + 1}/${scenario.turns.size}] ${turn.user}")
+                val answer = runCatching { chat(turn.user) }
+                    .getOrElse { "(error: ${it.message})" }
+                val cite = com.cliagent.rag.CitationDetector.detect(answer, emptyList(), turn.expectedSources)
+                val kwHits = turn.expectedKeywords.count { kw -> answer.contains(kw, ignoreCase = true) }
+                rows.add(
+                    ScenarioTurnRow(
+                        user = turn.user,
+                        answer = answer,
+                        keywordHits = kwHits,
+                        keywordTotal = turn.expectedKeywords.size,
+                        sourcesPresent = cite.sourcesPresent,
+                        citationsPresent = cite.citationsPresent,
+                    )
+                )
+                AppTerminal.println("  kw: $kwHits/${turn.expectedKeywords.size}  |  src: ${if (cite.sourcesPresent) "✓" else "✗"}  |  cite: ${if (cite.citationsPresent) "✓" else "✗"}")
+            }
+            printScenarioReport(scenario, rows)
+        } catch (e: CancellationException) {
+            throw e
+        } finally {
+            // Восстанавливаем исходный RAG-режим (history/working — изолированы reset'ом, не трогаем).
+            agent.setRagEnabled(savedRag)
+        }
+    }
+
+    /** Грузит сценарий из classpath `/rag/scenarios/<name>.json` (по образцу [loadEvalQuestions]). */
+    private fun loadScenario(name: String): EvalScenario? {
+        val json = Json { ignoreUnknownKeys = true }
+        val raw = runCatching {
+            javaClass.getResourceAsStream("/rag/scenarios/$name.json")?.use { it.readBytes() }
+        }.getOrNull() ?: return null
+        return runCatching {
+            json.decodeFromString<EvalScenario>(String(raw, Charsets.UTF_8))
+        }.getOrNull()
+    }
+
+    /** Список доступных сценариев из classpath `rag/scenarios/` (для `/rag scenario` без аргумента). */
+    private fun listScenarios(): List<String> {
+        // Classpath-директория не всегда перечисляется единообразно; фиксируем известные сценарии.
+        return listOf("rag-architecture", "task-fsm")
+    }
+
+    private suspend fun printScenarioReport(scenario: EvalScenario, rows: List<ScenarioTurnRow>) {
+        AppTerminal.println("\n${"─".repeat(72)}")
+        AppTerminal.println("🎬 Scenario report: ${scenario.id} (${rows.size} turns)")
+        AppTerminal.println("   Goal: ${scenario.goal}")
+        AppTerminal.println("${"─".repeat(72)}")
+        val tbl = table {
+            header { style(bold = true); row("#", "kw", "src", "cite") }
+            body {
+                rows.forEachIndexed { i, r ->
+                    row(
+                        "${i + 1}",
+                        "${r.keywordHits}/${r.keywordTotal}",
+                        if (r.sourcesPresent) "✓" else "✗",
+                        if (r.citationsPresent) "✓" else "✗",
+                    )
+                }
+            }
+        }
+        AppTerminal.println(tbl)
+        val n = rows.size
+        val srcCount = rows.count { it.sourcesPresent }
+        val citeCount = rows.count { it.citationsPresent }
+        val srcPct = if (n > 0) srcCount * 100 / n else 0
+        val citePct = if (n > 0) citeCount * 100 / n else 0
+        AppTerminal.println("Sources in turns:   $srcCount/$n ($srcPct%)   ← день 25")
+        AppTerminal.println("Citations in turns: $citeCount/$n ($citePct%)   ← день 25")
+        // Goal retention: цель задаётся в WorkingMemory.currentTask и не сбрасывается между ходами
+        // (reset только в начале сценария). Прямой suspend-вызов — без runBlocking (handleScenario suspend).
+        val goalRetained = agent.getWorkingMemory()?.currentTask == scenario.goal
+        AppTerminal.println("Goal retained: ${if (goalRetained) "✓" else "✗"}   ← день 25 (память задачи)")
+        AppTerminal.println("\nInspect answers per turn with /rag on then asking directly.")
     }
 
     // ── /rag rewrite <identity|heuristic|llm> (день 23) ────────────────────────
@@ -621,3 +742,40 @@ private data class EvalRow(
 ) {
     val expectedKeywords: List<String> get() = question.expectedKeywords
 }
+
+// ── День 25: scripted-сценарии (multi-turn validation «production-like») ───────────
+
+/**
+ * Контрольный сценарий для `/rag scenario` (день 25). Список связанных реплик, прогоняемых в одном
+ * диалоге с персистентной историей и целью (память задачи). Проверяет, что ассистент не теряет цель
+ * и продолжает выдавать ответы с источниками на follow-up реплики.
+ *
+ * @param id   идентификатор сценария (имя JSON-файла без расширения в `rag/scenarios/`).
+ * @param goal цель диалога → `WorkingMemory.currentTask` (память задачи). Задаётся в harness перед
+ *             прогоном; используется conversation-aware retrieval для интерпретации follow-up.
+ * @param turns реплики пользователя по порядку; поздние могут ссылаться на ранние (follow-up).
+ */
+@Serializable
+private data class EvalScenario(
+    val id: String,
+    val goal: String,
+    val turns: List<EvalScenarioTurn>,
+)
+
+/** Одна реплика сценария с ожиданиями для post-check (по образцу [EvalQuestion], день 22). */
+@Serializable
+private data class EvalScenarioTurn(
+    val user: String,
+    val expectedKeywords: List<String> = emptyList(),
+    val expectedSources: List<String> = emptyList(),
+)
+
+/** Результат прогона одной реплики сценария (для отчёта [printScenarioReport]). */
+private data class ScenarioTurnRow(
+    val user: String,
+    val answer: String,
+    val keywordHits: Int,
+    val keywordTotal: Int,
+    val sourcesPresent: Boolean,
+    val citationsPresent: Boolean,
+)

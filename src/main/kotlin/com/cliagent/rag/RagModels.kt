@@ -93,7 +93,9 @@ data class ScoredChunk(
  *
  * @param enabled          включён ли RAG-режим агента по умолчанию (инъекция в промпт, день 22).
  *                       В CLI переопределяется в рантайме через `/rag on|off`. Дни 1–21 поле
- *                       влияло только на статус-строку.
+ *                       влияло только на статус-строку. **День 25: дефолт изменён с `false` на `true`** —
+ *                       к концу недели 5 RAG (с индексом, источниками, цитатами, анти-галлюцинациями)
+ *                       становится основной фичей мини-чата; выключать явно через config/env/`/rag off`.
  * @param embeddingProvider "ollama" (пока единственный; interface готов к облаку)
  * @param embeddingModel   "nomic-embed-text" (768 dim, из лекции недели 5)
  * @param embeddingBaseUrl "http://localhost:11434" — Ollama; на VPS заменить адрес
@@ -120,7 +122,7 @@ data class ScoredChunk(
  */
 @Serializable
 data class RagConfig(
-    val enabled: Boolean = false,
+    val enabled: Boolean = true,   // день 25: default ON (раньше false) — RAG стал основной фичей недели 5
     val embeddingProvider: String = "ollama",
     val embeddingModel: String = "nomic-embed-text",
     val embeddingBaseUrl: String = "http://localhost:11434",
@@ -155,4 +157,12 @@ data class RagConfig(
      * деградация дня 22 (агент отвечает без RAG-блока), а не canned «не знаю».
      */
     val dontKnowThreshold: Float = 0.0f,
+    /**
+     * День 25: conversation-aware retrieval (production-like). `true` → перед `retrieve()` запрос
+     * обогащается контекстом диалога: цель (`WorkingMemory.currentTask`) + последние 2 user-реплики
+     * истории. Это позволяет follow-up репликам вида «а сколько для этого нужно?» находить релевантный
+     * контекст (а не только текущую короткую фразу). `false` (default) → для эмбеддинга берётся только
+     * `userMessage` (байт-идентично дню 24). Backward-compat: default off не меняет поведение дней 22–24.
+     */
+    val conversationalQuery: Boolean = false,
 )
