@@ -1,0 +1,56 @@
+{
+  "id": "rag-architecture",
+  "goal": "Разобраться, как устроен RAG-пайплайн в проекте: retrieval, чанкинг, эмбеддинги, реранкинг, источники",
+  "turns": [
+    {
+      "user": "Как работает retrieval в проекте — от запроса до чанков в промпте?",
+      "expectedKeywords": ["retriev", "embed", "topK", "chunk"],
+      "expectedSources": ["RagRetriever.kt", "00-task.md"]
+    },
+    {
+      "user": "А какие стратегии чанкинга поддерживаются и чем они отличаются?",
+      "expectedKeywords": ["fixed", "structural"],
+      "expectedSources": ["04-chunking.md", "FixedSizeChunker.kt"]
+    },
+    {
+      "user": "Сколько токенов в чанке по умолчанию и какое перекрытие?",
+      "expectedKeywords": ["500", "100"],
+      "expectedSources": ["04-chunking.md"]
+    },
+    {
+      "user": "Какая модель эмбеддинга используется и какая у неё размерность?",
+      "expectedKeywords": ["nomic", "768"],
+      "expectedSources": ["05-embeddings.md", "OllamaEmbeddingClient.kt"]
+    },
+    {
+      "user": "А какой размер батча при эмбеддинге и сколько ретраев?",
+      "expectedKeywords": ["32", "5"],
+      "expectedSources": ["05-embeddings.md", "OllamaEmbeddingClient.kt"]
+    },
+    {
+      "user": "Какой алгоритм хэширования идентифицирует документы при реиндексации?",
+      "expectedKeywords": ["FNV"],
+      "expectedSources": ["03-document-loader.md", "DocumentLoader.kt"]
+    },
+    {
+      "user": "По какой формуле эвристический реранкер объединяет сходство и overlap?",
+      "expectedKeywords": ["alpha", "jaccard", "0.5"],
+      "expectedSources": ["README.md", "HeuristicReranker.kt"]
+    },
+    {
+      "user": "А что значит косинусное сходство равное 1 или 0?",
+      "expectedKeywords": ["1", "0", "-1"],
+      "expectedSources": ["06-vector-math.md", "VectorMath.kt"]
+    },
+    {
+      "user": "Сколько кандидатов берётся до фильтрации реранкером и сколько после?",
+      "expectedKeywords": ["20", "5"],
+      "expectedSources": ["README.md"]
+    },
+    {
+      "user": "Подытожь: какие этапы проходит запрос от пользователя до ответа с источниками?",
+      "expectedKeywords": ["retriev", "embed", "rerank", "prompt"],
+      "expectedSources": ["00-task.md", "README.md"]
+    }
+  ]
+}

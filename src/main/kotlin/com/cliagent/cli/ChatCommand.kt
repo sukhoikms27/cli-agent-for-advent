@@ -197,6 +197,8 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             ragEnabled = config.rag.enabled,
             // День 24: порог анти-галлюцинации («не знаю» при слабом контексте). 0.0 = выключено.
             dontKnowThreshold = config.rag.dontKnowThreshold,
+            // День 25: conversation-aware retrieval (обогащение запроса целью + историей).
+            conversationalQuery = config.rag.conversationalQuery,
         )
 
         // День 13 (авто-поток стадий): оркестратор автоматизирует /task start → артефакт стадии →
@@ -229,7 +231,15 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         // День 22 (RAG): команды /rag + инъекция retrieved-чанков в промпт. chat() — для /rag eval
         // (прогон контрольных вопросов в обоих режимах); agent — для toggle on|off.
         val ragCommands = RagCommands(config.rag, ragEmbedder, agent,
-            chat = { msg -> AppTerminal.withSpinner({ "RAG eval…" }) { statefulAgent.chat(msg) } },
+            chat = { msg ->
+                System.err.println("[DIAG] chat-lambda: ENTER (msg='${msg.take(40)}')")
+                val r = AppTerminal.withSpinner({ "RAG eval…" }) {
+                    System.err.println("[DIAG] chat-lambda: inside spinner, calling statefulAgent.chat")
+                    statefulAgent.chat(msg)
+                }
+                System.err.println("[DIAG] chat-lambda: EXIT, len=${r.length}")
+                r
+            },
             ragRetriever = ragRetriever,
             llmClient = client,
             model = model,

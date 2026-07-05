@@ -78,6 +78,10 @@ class ConfigRepository(
                 chunkOverlapTokens = System.getenv("CLI_AGENT_RAG_CHUNK_OVERLAP")?.toIntOrNull() ?: base.chunkOverlapTokens,
                 // День 24: порог анти-галлюцинации («не знаю» при слабом контексте). 0.0 = выключено.
                 dontKnowThreshold = System.getenv("CLI_AGENT_RAG_DONT_KNOW_THRESHOLD")?.toFloatOrNull() ?: base.dontKnowThreshold,
+                // День 25: conversation-aware retrieval (env "true"/"1"/"yes" → on).
+                conversationalQuery = System.getenv("CLI_AGENT_RAG_CONVERSATIONAL_QUERY")
+                    ?.let { it.equals("true", true) || it == "1" || it.equals("yes", true) }
+                    ?: base.conversationalQuery,
             )
         }
 

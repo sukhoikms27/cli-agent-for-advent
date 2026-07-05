@@ -85,20 +85,30 @@ object AppTerminal {
      * в одной строке. `CancellationException` пробрасывается после очистки кадра.
      */
     suspend fun <T> withSpinner(labelProvider: () -> String, block: suspend () -> T): T = coroutineScope {
+        System.err.println("[DIAG] withSpinner: ENTER coroutineScope")
         val frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
         val animation = t.textAnimation<Int> { tick ->
             "${frames[tick % frames.length]} ${labelProvider()}"
         }
         val job = launch {
+            System.err.println("[DIAG] withSpinner: animation job launched")
             var tick = 0
             while (isActive) {
                 animation.update(tick++)
                 delay(120)
             }
+            System.err.println("[DIAG] withSpinner: animation job exiting (isActive=false)")
         }
         try {
-            block()
+            System.err.println("[DIAG] withSpinner: BEFORE block()")
+            val result = block()
+            System.err.println("[DIAG] withSpinner: block() returned OK")
+            result
+        } catch (e: Throwable) {
+            System.err.println("[DIAG] withSpinner: block() threw ${e::class.qualifiedName}: ${e.message}")
+            throw e
         } finally {
+            System.err.println("[DIAG] withSpinner: finally — job.cancel + animation.clear")
             job.cancel()
             animation.clear()
         }
