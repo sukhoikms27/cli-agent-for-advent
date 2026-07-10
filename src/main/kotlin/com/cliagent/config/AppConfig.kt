@@ -18,6 +18,9 @@ import kotlinx.serialization.Serializable
  * @param apiKey ключ z.ai (required при работе LLM). empty в файле — env override заполнит
  * @param model имя модели (default glm-5.1)
  * @param baseUrl API base URL (default z.ai coding endpoint)
+ * @param provider LLM-провайдер как строка-дискриминатор (день 25: multi-provider support). empty
+ *   → [com.cliagent.llm.LlmProvider.autoDetect] по [baseUrl] (z.ai / Ollama / generic). env override
+ *   `CLI_AGENT_PROVIDER`. Значения: "zai" | "ollama" | "openai-compatible" (см. [LlmProvider.fromString])
  * @param maxToolRounds лимит раундов tool-use loop в [com.cliagent.agent.ContextAwareAgent]
  *   (default 8) — для «длинного флоу» оркестрации нескольких MCP-серверов (день 20)
  * @param mcp массив MCP-серверов (default empty — tools отключены, поведение дней 1–16).
@@ -28,6 +31,7 @@ data class AppConfig(
     val apiKey: String = "",
     val model: String = "glm-5.1",
     val baseUrl: String = "https://api.z.ai/api/coding/paas/v4",
+    val provider: String = "",
     val maxToolRounds: Int = 8,
     val mcp: List<McpServerConfig> = emptyList(),
     /**

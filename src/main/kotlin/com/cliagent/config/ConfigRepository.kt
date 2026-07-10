@@ -1,5 +1,6 @@
 package com.cliagent.config
 
+import com.cliagent.llm.LlmProvider
 import com.cliagent.mcp.McpServerConfig
 import kotlinx.serialization.json.Json
 import java.io.FileInputStream
@@ -49,25 +50,45 @@ class ConfigRepository(
         val localProps = loadLocalProperties()
         val fileConfig = loadConfigFile()
 
-        // 1. apiKey: env > config.json > local.properties (required)
+        // 1. provider: env > config.json (default blank → autoDetect в LlmClientFactory).
+        //    Резолвим рано, чтобы решить, нужен ли apiKey (Ollama — без auth).
+        val provider = System.getenv("CLI_AGENT_PROVIDER")
+            ?: fileConfig.provider.ifBlank { null }
+            ?: localProps.getProperty("provider")
+            ?: ""
+
+        // 2. apiKey: env > config.json > local.properties. REQUIRED для cloud-провайдеров,
+        //    OPTIONAL для Ollama (no-auth). День 25: локальная LLM не требует ключа.
+        val resolvedProvider = LlmProvider.fromString(provider)
+            ?: LlmProvider.autoDetect(
+                System.getenv("CLI_AGENT_BASE_URL")
+                    ?: fileConfig.baseUrl.ifBlank { null }
+                    ?: localProps.getProperty("base.url")
+                    ?: "https://api.z.ai/api/coding/paas/v4"
+            )
         val apiKey = System.getenv("CLI_AGENT_API_KEY")
             ?: fileConfig.apiKey.takeIf { it.isNotBlank() }
             ?: localProps.getProperty("api.key")
-            ?: error(
-                "API key not found. Set CLI_AGENT_API_KEY environment variable, " +
-                    "or add apiKey to ${AppPaths.configFile}, or api.key=<your-key> to local.properties"
-            )
+            ?: if (resolvedProvider.requiresApiKey()) {
+                error(
+                    "API key not found. Set CLI_AGENT_API_KEY environment variable, " +
+                        "or add apiKey to ${AppPaths.configFile}, or api.key=<your-key> to local.properties. " +
+                        "For local Ollama (no auth): set provider=ollama (CLI_AGENT_PROVIDER=ollama)."
+                )
+            } else {
+                ""   // Ollama и прочие no-auth провайдеры — пустой apiKey OK.
+            }
 
-        // 2. model/baseUrl/maxToolRounds: env override > file > local.properties
+        // 3. model/baseUrl/maxToolRounds: env override > file > local.properties
         val model = System.getenv("CLI_AGENT_MODEL") ?: fileConfig.model.ifBlank { null } ?: localProps.getProperty("model") ?: "glm-5.1"
         val baseUrl = System.getenv("CLI_AGENT_BASE_URL") ?: fileConfig.baseUrl.ifBlank { null } ?: localProps.getProperty("base.url")
             ?: "https://api.z.ai/api/coding/paas/v4"
         val maxToolRounds = System.getenv("CLI_AGENT_MAX_TOOL_ROUNDS")?.toIntOrNull() ?: fileConfig.maxToolRounds
 
-        // 3. mcp-серверы: ТОЛЬКО из config.json. Legacy fallback, если файл пуст.
+        // 4. mcp-серверы: ТОЛЬКО из config.json. Legacy fallback, если файл пуст.
         val mcpServers = fileConfig.mcp.ifEmpty { legacyMcpServers(localProps) }
 
-        // 4. День 21 (RAG): config.json как base; env override одиночных полей (как для model/baseUrl).
+        // 5. День 21 (RAG): config.json как base; env override одиночных полей (как для model/baseUrl).
         //    corpusRoots/defaultStrategy через env НЕ задаётся — только через config.json (как mcp).
         val rag = fileConfig.rag.let { base ->
             base.copy(
@@ -89,6 +110,7 @@ class ConfigRepository(
             apiKey = apiKey,
             model = model,
             baseUrl = baseUrl,
+            provider = provider,
             maxToolRounds = maxToolRounds,
             mcp = mcpServers,
             rag = rag,
@@ -149,6 +171,30 @@ class ConfigRepository(
 
 
     /**
+     * Устанавливает поле LLM-конфигурации (REPL `/config set <field> <value>`, день 25). Поддерживаемые
+     * fields: `provider`, `model`, `baseUrl`, `apiKey`. Остальные секции (mcp, rag, maxToolRounds)
+     * сохраняются. Возвращает обновлённый [AppConfig]. Неизвестный field → IllegalArgumentException.
+     *
+     * ВАЖНО: меняет config.json, но НЕ активную сессию REPL — для применения нужен рестарт `chat`
+     * (или перезагрузка config в будущем). Это сознательное упрощение: live-switch провайдера
+     * потребовал бы пересоздания [com.cliagent.llm.LlmClient] и всех зависимых агентов.
+     */
+    fun setLlmField(field: String, value: String): AppConfig {
+        val current = loadConfigFile()
+        val updated = when (field.lowercase()) {
+            "provider" -> current.copy(provider = value)
+            "model" -> current.copy(model = value)
+            "baseurl", "base_url", "base-url" -> current.copy(baseUrl = value)
+            "apikey", "api_key", "api-key" -> current.copy(apiKey = value)
+            else -> throw IllegalArgumentException(
+                "Unknown field '$field'. Supported: provider, model, baseUrl, apiKey."
+            )
+        }
+        save(updated)
+        return updated
+    }
+
+    /**
      * Генерирует стартовый config.json из текущих env/properties (REPL `/config init`, день 20).
      * Помогает миграции с legacy. НЕ перезаписывает существующий файл (возвращает false) — явное
      * удаление/переименование лежит на пользователе.
@@ -161,6 +207,7 @@ class ConfigRepository(
             model = System.getenv("CLI_AGENT_MODEL") ?: localProps.getProperty("model") ?: "glm-5.1",
             baseUrl = System.getenv("CLI_AGENT_BASE_URL") ?: localProps.getProperty("base.url")
                 ?: "https://api.z.ai/api/coding/paas/v4",
+            provider = System.getenv("CLI_AGENT_PROVIDER") ?: localProps.getProperty("provider") ?: "",
             maxToolRounds = System.getenv("CLI_AGENT_MAX_TOOL_ROUNDS")?.toIntOrNull() ?: 8,
             mcp = legacyMcpServers(localProps),
         )

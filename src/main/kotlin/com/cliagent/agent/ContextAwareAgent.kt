@@ -144,9 +144,7 @@ class ContextAwareAgent(
     }
 
     override suspend fun chat(userMessage: String): String {
-        System.err.println("[DIAG] Agent.chat: ENTER (msg='${userMessage.take(40)}', ragEnabled=${isRagEnabled()})")
         ensureLoaded()
-        System.err.println("[DIAG] Agent.chat: after ensureLoaded")
 
         val lastMsgId = history.lastOrNull()?.id
         val userMsg = ChatMessage(
@@ -179,9 +177,7 @@ class ContextAwareAgent(
         // репликами, чтобы follow-up находили контекст. conversationalQuery=false → только userMessage.
         val ragContext = if (isRagEnabled()) {
             val retrievalQuery = if (conversationalQuery) buildConversationQuery(userMessage) else userMessage
-            System.err.println("[DIAG] Agent.chat: BEFORE retrieve (conv=$conversationalQuery)")
             val hits = ragRetriever?.retrieve(retrievalQuery)
-            System.err.println("[DIAG] Agent.chat: AFTER retrieve, hits=${hits?.size ?: "null"}")
             when {
                 hits == null -> logger("⚠️ RAG on, but retrieve() returned null (index empty or Ollama error) — answering without context")
                 hits.isEmpty() -> logger("📚 RAG: 0 chunks matched")
@@ -223,9 +219,7 @@ class ContextAwareAgent(
         val tools = loadToolsOrNull()
         // День 24: сохраняем retrieved-контекст хода для пост-чека цитирования в finalizeAssistant.
         ragContextAtLastTurn = ragContext
-        System.err.println("[DIAG] Agent.chat: BEFORE runToolLoop (tools=${tools?.size ?: "null"})")
-        val result = runToolLoop(messagesToSend, OutputBudget.maxTokensFor(estimatedTokens), tools, userMsg)
-        System.err.println("[DIAG] Agent.chat: AFTER runToolLoop, result len=${result.length}")
+        val result = runToolLoop(messagesToSend, OutputBudget.maxTokensFor(model, estimatedTokens), tools, userMsg)
         return result
     }
 

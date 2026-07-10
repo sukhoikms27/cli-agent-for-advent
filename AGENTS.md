@@ -361,11 +361,29 @@ This project fulfills the AI Advent Challenge #8 assignments. Each phase maps to
 
 ## Environment Variables
 
-- `CLI_AGENT_API_KEY` — z.ai API key (required)
+- `CLI_AGENT_API_KEY` — LLM API key. Required for cloud providers (z.ai, OpenAI-compatible); optional for local Ollama (`provider=ollama`, no auth).
 - `CLI_AGENT_MODEL` — model name (default: glm-5.1)
-- `CLI_AGENT_BASE_URL` — API base URL (default: https://api.z.ai/api/coding/paas/v4)
+- `CLI_AGENT_BASE_URL` — API base URL (default: https://api.z.ai/api/coding/paas/v4). For Ollama: `http://localhost:11434/v1`.
+- `CLI_AGENT_PROVIDER` — LLM backend discriminator (день 25: multi-provider support). Values: `zai` | `ollama` | `openai-compatible`. Default empty → auto-detect by `baseUrl` (`z.ai` → zai, `localhost:11434` → ollama, else generic).
 - `XDG_DATA_HOME` — data directory override (default: ~/.local/share)
 - `XDG_CONFIG_HOME` — config directory override (default: ~/.config)
+
+## Multi-LLM Provider Support (день 25)
+
+Архитектура поддерживает несколько LLM-провайдеров через `LlmClientFactory` (единая точка dispatch) + `LlmProvider` enum. Ollama говорит на OpenAI-compatible endpoint (`/v1/chat/completions`), поэтому все провайдеры пока используют `OpenAiCompatibleClient` (Ollama — с пустым apiKey, auth-header conditional). Factory — seam для будущих нативных клиентов (Anthropic messages, Gemini generateContent).
+
+**Локальная Ollama на M3 Pro / 36 ГБ** — рекомендованная модель: `qwen2.5:32b-instruct-q5_K_M` (~20 ГБ RAM, лучший в классе русский + function calling, 128K контекст). Fallback: `qwen2.5:14b-instruct-q5_K_M` для быстрых классификаторов. Подготовка: `ollama pull qwen2.5:32b-instruct-q5_K_M`.
+
+**Запуск с локальной моделью:**
+```
+CLI_AGENT_PROVIDER=ollama \
+CLI_AGENT_BASE_URL=http://localhost:11434/v1 \
+CLI_AGENT_MODEL=qwen2.5:32b-instruct-q5_K_M \
+./gradlew run --args="chat"
+```
+Либо через REPL `/config set provider ollama` + `/config set baseUrl http://localhost:11434/v1` + `/config set model qwen2.5:32b-instruct-q5_K_M` (применяется после рестарта `chat`).
+
+**Per-model лимиты** (`ModelLimitsRegistry`) заменили хардкод GLM-констант в `OutputBudget`: локальные модели (qwen2.5: 128K контекст / 8K output) получают корректный бюджет `max_tokens`. Неизвестные модели → консервативный default (128K / 8K).
 
 ### Agent info
 - use ast-index tool every time, when you need to find out anything in project

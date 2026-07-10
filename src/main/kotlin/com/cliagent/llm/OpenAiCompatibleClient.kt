@@ -83,7 +83,11 @@ class OpenAiCompatibleClient(
      */
     private suspend fun executeOnce(request: ChatRequest): LlmResult<ChatResponse> = try {
         val response: HttpResponse = httpClient.post("$baseUrl/chat/completions") {
-            header(HttpHeaders.Authorization, "Bearer $apiKey")
+            // День 25: auth только при наличии apiKey. Локальная Ollama работает без auth — пустой
+            // `Bearer ` header может ломать некоторых провайдеров, поэтому не шлём его вовсе.
+            if (apiKey.isNotBlank()) {
+                header(HttpHeaders.Authorization, "Bearer $apiKey")
+            }
             contentType(ContentType.Application.Json)
             setBody(request)
         }
@@ -91,14 +95,19 @@ class OpenAiCompatibleClient(
         try {
             LlmResult.Success(json.decodeFromString<ChatResponse>(bodyText))
         } catch (e: Exception) {
-            System.err.println("[DEBUG] Raw API response:\n$bodyText")
             LlmResult.Error(0, "Failed to parse response: ${e.message}")
         }
     } catch (e: ClientRequestException) {
         val statusCode = e.response.status.value
         val errorBody = runCatching { e.response.bodyAsText() }.getOrDefault("")
         val message = when (statusCode) {
-            401 -> "Invalid API key. Check CLI_AGENT_API_KEY environment variable."
+            401 -> if (apiKey.isBlank()) {
+                // День 25: локальный провайдер (Ollama) обычно без auth. 401 здесь — нетрадиционен.
+                "Server returned 401 Unauthorized. For local Ollama, ensure no reverse-proxy auth is in front; " +
+                    "for cloud providers, set CLI_AGENT_API_KEY."
+            } else {
+                "Invalid API key. Check CLI_AGENT_API_KEY environment variable."
+            }
             429 -> "Rate limit exceeded. Try again later."
             else -> "Client error: $errorBody"
         }

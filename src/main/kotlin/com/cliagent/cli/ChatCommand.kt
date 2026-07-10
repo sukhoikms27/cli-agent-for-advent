@@ -16,7 +16,7 @@ import com.cliagent.context.strategy.SlidingWindowStrategy
 import com.cliagent.context.strategy.StickyFactsStrategy
 import com.cliagent.context.strategy.SummaryStrategy
 import com.cliagent.llm.LlmCallException
-import com.cliagent.llm.OpenAiCompatibleClient
+import com.cliagent.llm.LlmClientFactory
 import com.cliagent.llm.model.ReasoningStrategy
 import com.cliagent.llm.pricing.Pricing
 import com.cliagent.memory.JsonChatStore
@@ -45,7 +45,11 @@ import com.github.ajalt.mordant.table.table
 import kotlinx.coroutines.runBlocking
 
 class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat with LLM") {
-    private val model by option("-m", "--model", help = "Model name").default("glm-5.1")
+    // День 25: nullable — переопределяет config.model ТОЛЬКО если передан явно (-m). Иначе effective-
+    // модель резолвится из config (env CLI_AGENT_MODEL > config.json > "glm-5.1"). До этого хардкод
+    // .default("glm-5.1") всегда перекрывал config.model → /config set model не работал без -m
+    // (баг: баннер показывал provider из config, но модель из default-флага → "model not found").
+    private val model by option("-m", "--model", help = "Model name (overrides config.model)")
     private val temperature by option("-t", "--temperature", help = "Temperature (0.0-2.0)").double().default(0.7)
     private val strategy by option("-s", "--strategy", help = "Reasoning: direct, step_by_step, meta_prompt, expert_group").default("direct")
     private val chat by option("-c", "--chat", help = "Chat ID (or 'new')").default("default")
@@ -101,10 +105,14 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             return@runBlocking
         }
 
-        val client = OpenAiCompatibleClient(
-            baseUrl = config.baseUrl,
-            apiKey = config.apiKey
-        )
+        // День 25: multi-provider dispatch через factory. Заменила хардкод OpenAiCompatibleClient.
+        // Provider резолвится из config.provider (env CLI_AGENT_PROVIDER) или autoDetect по baseUrl.
+        val client = LlmClientFactory.create(config)
+        val resolvedProvider = LlmClientFactory.resolveProvider(config)
+
+        // День 25: effective-модель — флаг -m > config.model (env CLI_AGENT_MODEL > config.json) >
+        // "glm-5.1". Флаг nullable (см. выше), поэтому /config set model теперь работает без -m.
+        val model = model ?: config.model.ifBlank { "glm-5.1" }
 
         val memoryStore = JsonChatStore()
 
@@ -232,20 +240,16 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         // (прогон контрольных вопросов в обоих режимах); agent — для toggle on|off.
         val ragCommands = RagCommands(config.rag, ragEmbedder, agent,
             chat = { msg ->
-                System.err.println("[DIAG] chat-lambda: ENTER (msg='${msg.take(40)}')")
-                val r = AppTerminal.withSpinner({ "RAG eval…" }) {
-                    System.err.println("[DIAG] chat-lambda: inside spinner, calling statefulAgent.chat")
+                AppTerminal.withSpinner({ "RAG eval…" }) {
                     statefulAgent.chat(msg)
                 }
-                System.err.println("[DIAG] chat-lambda: EXIT, len=${r.length}")
-                r
             },
             ragRetriever = ragRetriever,
             llmClient = client,
             model = model,
         )
         val ragLabel = if (agent.isRagEnabled()) "ON" else "OFF"
-        AppTerminal.println("CLI Agent v0.8 | Chat: $chatId | Model: $model | Context: ${contextManager.getStrategy().getName()} | MCP: $mcpLabel | RAG: $ragLabel | MaxToolRounds: ${config.maxToolRounds} | Compress: $compressLabel | Invariants: $invariantsLabel | Swarm: $swarmLabel | Mode: $modeLabel")
+        AppTerminal.println("CLI Agent v0.8 | Chat: $chatId | Provider: ${resolvedProvider.id} | Model: $model | Context: ${contextManager.getStrategy().getName()} | MCP: $mcpLabel | RAG: $ragLabel | MaxToolRounds: ${config.maxToolRounds} | Compress: $compressLabel | Invariants: $invariantsLabel | Swarm: $swarmLabel | Mode: $modeLabel")
         AppTerminal.println("Type /help for commands, /exit to quit")
 
         val repl = ReplEngine()
@@ -482,6 +486,7 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             |  /config init          — Generate config.json from env/local.properties
             |  /config show          — Show config file summary
             |  /config path          — Print config file path
+            |  /config set <f> <v>   — Set LLM field (provider, model, baseUrl, apiKey); restart to apply
             |  /reset               — Clear chat history, summary, facts, branches, working memory
             |  /exit                — Exit the program
             |
@@ -492,7 +497,7 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             |  branch   — Create branches from checkpoints, switch between them
             |
             |CLI Flags:
-            |  -m, --model <name>       — Model name (default: glm-5.1)
+            |  -m, --model <name>       — Model name (overrides config.model; default: glm-5.1 or /config set model)
             |  -t, --temperature <0-2>  — Sampling temperature (default: 0.7)
             |  -s, --strategy <type>    — Reasoning strategy (direct, step_by_step, meta_prompt, expert_group)
             |  -c, --chat <id|new>      — Chat session (default: continue last)
@@ -1246,6 +1251,7 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                     AppTerminal.println("  (file does not exist; config from env/local.properties)")
                     return
                 }
+                AppTerminal.println("  provider: ${cfg.provider.ifBlank { "(auto-detect)" }}")
                 AppTerminal.println("  model: ${cfg.model.ifBlank { "(default)" }}")
                 AppTerminal.println("  baseUrl: ${cfg.baseUrl.ifBlank { "(default)" }}")
                 AppTerminal.println("  maxToolRounds: ${cfg.maxToolRounds}")
@@ -1253,10 +1259,33 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                 AppTerminal.println("  mcp servers: ${cfg.mcp.size}")
                 cfg.mcp.forEach { AppTerminal.println("    - ${it.name} [${if (it.enabled) "enabled" else "disabled"}]: ${it.transportLabel()}") }
             }
-            null, "" -> {
-                AppTerminal.println("Usage: /config init | show | path")
+            "set" -> {
+                // /config set <field> <value...> — value может содержать пробелы (e.g. имя модели).
+                val setParts = input.removePrefix("/config set").trim().split(Regex("\\s+"), limit = 2)
+                if (setParts.size < 2 || setParts.any { it.isBlank() }) {
+                    AppTerminal.println("Usage: /config set <field> <value>  (fields: provider, model, baseUrl, apiKey)")
+                    AppTerminal.println("Example: /config set provider ollama")
+                } else {
+                    val field = setParts[0]
+                    val value = setParts[1]
+                    try {
+                        val updated = ConfigRepository().setLlmField(field, value)
+                        AppTerminal.ok("$field updated → '$value'")
+                        AppTerminal.warn("Restart chat to apply (provider/model change is not live).")
+                        // Результирующий LLM-конфиг для подтверждения.
+                        AppTerminal.println("  provider: ${updated.provider.ifBlank { "(auto)" }}")
+                        AppTerminal.println("  model:    ${updated.model}")
+                        AppTerminal.println("  baseUrl:  ${updated.baseUrl}")
+                    } catch (e: IllegalArgumentException) {
+                        AppTerminal.err(e.message ?: "Unknown field")
+                        AppTerminal.println("Supported fields: provider, model, baseUrl, apiKey")
+                    }
+                }
             }
-            else -> AppTerminal.println("Unknown /config command: $sub. Use: init, show, path")
+            null, "" -> {
+                AppTerminal.println("Usage: /config init | show | path | set <field> <value>")
+            }
+            else -> AppTerminal.println("Unknown /config command: $sub. Use: init, show, path, set")
         }
     }
 

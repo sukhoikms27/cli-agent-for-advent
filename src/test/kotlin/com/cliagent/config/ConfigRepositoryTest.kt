@@ -234,6 +234,70 @@ class ConfigRepositoryTest {
         }
     }
 
+    // ── День 25: provider-aware config (Ollama без apiKey) ─────────────────────────
+    // CAVEAT: env vars (CLI_AGENT_API_KEY/CLI_AGENT_PROVIDER) — process-global, JVM не даёт
+    // надёжно unset'нуть их в тестах. Поэтому deterministic-часть покрываем через round-trip файла
+    // (config.json — единственный контролируемый источник в @TempDir). См. также флаг ошибки ниже.
+
+    @Test
+    fun `ollama provider loads without apiKey (no-auth)`() {
+        // provider=ollama → requiresApiKey()==false → apiKey optional (пустая строка OK).
+        // Если CI-окружение выставило CLI_AGENT_API_KEY, тест всё равно проходит (env > file),
+        // но здесь проверяем именно что load() НЕ бросает и provider корректно резолвится.
+        val json = """
+            {"provider":"ollama","baseUrl":"http://localhost:11434/v1","model":"qwen2.5:32b"}
+        """.trimIndent()
+        val cfg = repo(json).load()
+
+        assertEquals("ollama", cfg.provider)
+        assertEquals("http://localhost:11434/v1", cfg.baseUrl)
+        assertEquals("qwen2.5:32b", cfg.model)
+    }
+
+    @Test
+    fun `zai provider without apiKey throws with helpful message`() {
+        // provider=zai (requiresApiKey()==true), apiKey отсутствует в file/env/props → error.
+        // Сообщение должно упоминать подсказку про Ollama и/или apiKey.
+        val json = """{"provider":"zai"}"""
+        val ex = assertThrows(IllegalStateException::class.java) {
+            repo(json).load()
+        }
+        val msg = ex.message.orEmpty()
+        assertTrue(
+            msg.contains("Ollama", ignoreCase = true) || msg.contains("API key", ignoreCase = true),
+            "error message should hint at apiKey or Ollama; was: $msg",
+        )
+    }
+
+    @Test
+    fun `provider round-trips through save and load`() {
+        // deterministic-проверка провайдера: save()→load() сохраняет поле (без зависимости от env).
+        val r = repo()
+        r.save(AppConfig(provider = "ollama", baseUrl = "http://localhost:11434/v1", model = "qwen2.5"))
+
+        val loaded = r.load()
+        assertEquals("ollama", loaded.provider)
+        assertEquals("http://localhost:11434/v1", loaded.baseUrl)
+        assertEquals("qwen2.5", loaded.model)
+    }
+
+    @Test
+    fun `config provider value is loaded into AppConfig`() {
+        // env-override (CLI_AGENT_PROVIDER) не тестируем (process-global); вместо этого — что
+        // значение из config.json попадает в AppConfig.provider.
+        val cfg = repo(configJson = """{"provider":"ollama","model":"qwen2.5","baseUrl":"http://localhost:11434/v1"}""").load()
+        assertEquals("ollama", cfg.provider)
+    }
+
+    @Test
+    fun `initFromLegacy picks up provider from env or local properties`() {
+        // legacy-миграция: provider из local.properties попадает в созданный config.json.
+        val r = repo(localProps = "provider=ollama\napi.key=k\nmodel=qwen2.5")
+        assertTrue(r.initFromLegacy())
+        val loaded = r.loadConfigFile()
+        assertEquals("ollama", loaded.provider)
+    }
+
     @Test
     fun `toTransport on McpServerConfig - url wins over command`() {
         val s = McpServerConfig(name = "x", command = "java", url = "https://h/mcp")
