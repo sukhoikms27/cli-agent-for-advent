@@ -1,0 +1,38 @@
+# День 30 — Caddyfile: reverse proxy для приватного LLM-сервиса
+#
+# Caddy терминирует TLS (auto-HTTPS от Let's Encrypt) + Bearer auth + proxy на Ollama.
+# Ollama биндится на 127.0.0.1:11434 (см. systemd override), наружу — только через Caddy.
+#
+# Установка:
+#   sudo apt install -y caddy
+#   sudo cp deploy/vps/Caddyfile /etc/caddy/Caddyfile
+#   # Сгенерировать токен: LLM_TOKEN=$(openssl rand -base64 32)
+#   sudo systemctl edit caddy  → добавить [Service] Environment="LLM_TOKEN=ВАШ_ТОКЕН"
+#   sudo systemctl restart caddy
+#
+# Замените llm.ВАШ-ДОМЕН.ru на ваш домен (A-record → VPS IP).
+
+llm.ВАШ-ДОМЕН.ru {
+	# Bearer auth — простая проверка header'а. Токен из env (systemd override).
+	@unauth not header Authorization "Bearer {$LLM_TOKEN}"
+	handle @unauth {
+		respond "Unauthorized" 401
+	}
+
+	# Reverse proxy на Ollama (bind 127.0.0.1:11434).
+	reverse_proxy 127.0.0.1:11434 {
+		header_up Host {host}
+		header_up X-Real-IP {remote_host}
+		# Не форвардить клиентский auth в Ollama (она его не проверяет).
+		header_down -Set-Cookie
+	}
+
+	# Логирование (для мониторинга/дебага).
+	log {
+		output file /var/log/caddy/llm-access.log {
+			roll_size 100mb
+			roll_keep 5
+		}
+		format json
+	}
+}

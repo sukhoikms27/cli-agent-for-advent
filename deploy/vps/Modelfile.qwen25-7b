@@ -1,0 +1,30 @@
+# День 30 — Modelfile для приватного LLM-сервиса на VPS
+#
+# Обёртка над qwen2.5:7b-instruct с явно ограниченным контекстом для CPU-VPS (8 GB RAM).
+# KV-cache растёт линейно с контекстом → num_ctx 8192 — главный OOM-предохранитель.
+# Достаточно для single-user диалогов + RAG-чанков.
+#
+# Установка на VPS:
+#   ollama create qwen2.5-7b-vps -f deploy/vps/Modelfile.qwen25-7b
+#   ollama run qwen2.5-7b-vps "ping"   # smoke-test
+
+FROM qwen2.5:7b-instruct-q5_K_M
+
+# Контекст: 8192 токена (KV-cache ~1-2 GB на 7B). Больше = OOM риск на 8GB VPS.
+PARAMETER num_ctx 8192
+
+# Output ceiling: 2048 токена (достаточно для развёрнутых ответов, не раздувает latency).
+PARAMETER num_predict 2048
+
+# Температура для RAG/чата: 0.7 (баланс креативности и фактичности).
+PARAMETER temperature 0.7
+
+# keep_alive: модель держится в RAM 30 минут после последнего запроса (cold-start 10-30с).
+# Для always-on сервиса можно -1 (всегда в RAM), но это блокирует RAM для других процессов.
+PARAMETER keep_alive 30m
+
+# System prompt для приватного ассистента (task-specific, день 29 localRag-стиль).
+SYSTEM """
+You are a helpful private assistant running on a self-hosted server.
+Answer concisely and accurately. If unsure, say so explicitly.
+"""
