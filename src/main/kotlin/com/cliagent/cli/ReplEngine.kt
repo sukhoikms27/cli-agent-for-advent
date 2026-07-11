@@ -104,9 +104,11 @@ class ReplEngine {
             StringsCompleter("add", "remove", "enable", "disable", "on", "off", "list-tools")
         )
         // День 26: /local — live-switch cloud ↔ локальная Ollama без рестарта REPL.
+        // День 27: + mark on|off|status (маркировка ответов моделью-источником).
         val local = ArgumentCompleter(
             StringsCompleter("/local"),
-            StringsCompleter("on", "off", "status", "smoke")
+            StringsCompleter("on", "off", "status", "smoke", "mark"),
+            StringsCompleter("qwen3:14b", "on", "off", "status")
         )
         return AggregateCompleter(top, strategy, branch, memory, profile, task, invariants, mode, rag, mcp, local)
     }
