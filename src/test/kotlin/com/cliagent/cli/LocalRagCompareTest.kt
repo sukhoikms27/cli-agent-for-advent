@@ -1,6 +1,8 @@
 package com.cliagent.cli
 
 import com.cliagent.llm.LlmClient
+import com.cliagent.llm.model.StreamChunk
+import kotlinx.coroutines.flow.Flow
 import com.cliagent.llm.LlmResult
 import com.cliagent.llm.model.ChatMessage
 import com.cliagent.llm.model.ChatRequest
@@ -295,6 +297,8 @@ class LocalRagCompareTest {
                 )
             )
         }
+        // День 30: streaming не используется в compare-local (batch chat). Заглушка для контракта.
+        override fun chatStream(request: ChatRequest) = throw UnsupportedOperationException("streaming not supported in ScriptedClient stub")
     }
 
     /** LLM-stub, запоминающий maxTokens каждого запроса (для проверки thinking-model фикс). */
@@ -306,17 +310,20 @@ class LocalRagCompareTest {
                 ChatResponse(id = "r", choices = listOf(Choice(0, ChatMessage("assistant", "ok"))))
             )
         }
+        override fun chatStream(request: ChatRequest) = throw UnsupportedOperationException("streaming not supported in RecordingClient stub")
     }
 
     /** Всегда LlmResult.Error — проверка stable-обработки (прогон продолжается). */
     private class ErrorClient : LlmClient {
         override suspend fun chat(request: ChatRequest): LlmResult<ChatResponse> =
             LlmResult.Error(503, "LLM unavailable")
+        override fun chatStream(request: ChatRequest) = throw UnsupportedOperationException("streaming not supported in ErrorClient stub")
     }
 
     /** Бросает CancellationException — проверка что harness не глотает отмену. */
     private class CancellingClient : LlmClient {
         override suspend fun chat(request: ChatRequest): LlmResult<ChatResponse> =
             throw kotlinx.coroutines.CancellationException("cancelled")
+        override fun chatStream(request: ChatRequest) = throw UnsupportedOperationException("streaming not supported in CancellingClient stub")
     }
 }

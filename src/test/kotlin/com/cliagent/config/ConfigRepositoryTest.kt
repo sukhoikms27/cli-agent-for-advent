@@ -303,4 +303,31 @@ class ConfigRepositoryTest {
         val s = McpServerConfig(name = "x", command = "java", url = "https://h/mcp")
         assertEquals("https://h/mcp", (s.toTransport() as com.cliagent.mcp.McpTransportConfig.Http).url)
     }
+
+    // ── День 30 (streaming SSE): config.stream field + schema evolution ───────────
+
+    @Test
+    fun `stream defaults to auto when absent (schema evolution)`() {
+        // Старый config.json без поля stream → default "auto" (streaming для Ollama, off для cloud).
+        val cfg = repo(configJson = """{"apiKey":"k"}""").load()
+        assertEquals("auto", cfg.stream)
+    }
+
+    @Test
+    fun `stream value round-trips through save and load`() {
+        val r = repo()
+        r.save(AppConfig(apiKey = "k", stream = "true"))
+        assertEquals("true", r.loadConfigFile().stream)
+
+        r.save(AppConfig(apiKey = "k", stream = "false"))
+        assertEquals("false", r.loadConfigFile().stream)
+    }
+
+    @Test
+    fun `stream value is loaded into AppConfig from config json`() {
+        // deterministic-проверка: значение из config.json попадает в AppConfig.stream (env override
+        // CLI_AGENT_STREAM не тестируем здесь — env process-global, как для provider).
+        val cfg = repo(configJson = """{"apiKey":"k","stream":"true"}""").load()
+        assertEquals("true", cfg.stream)
+    }
 }

@@ -60,6 +60,44 @@ object AppTerminal {
         }
     }
 
+    // ── День 30 (streaming SSE): progressive render токенов ───────────────────────
+
+    /**
+     * День 30: raw-вывод инкрементального токена без новой строки (progressive render). Caller
+     * (REPL streaming-путь) вызывает на каждый [com.cliagent.llm.model.StreamChunk.Delta] — текст
+     * появляется по мере генерации, а не через 40-90с «пустоты» (qwen3:14b thinking-модель).
+     *
+     * Использует `t.print(delta)` (без форматирования) — токены склеиваются в одну строку вывода.
+     * На non-interactive терминале (пайп) mordant всё равно печатает plain-текст (ANSI нет).
+     */
+    fun streamPrint(delta: String) {
+        t.print(delta)
+    }
+
+    /**
+     * День 30 (streaming): progressive вывод reasoning/thinking-контента (qwen3 `delta.reasoning`)
+     * приглушённым серым цветом. Модель «думает» — пользователь видит размышления в реальном времени,
+     * ДО финального ответа (content). На `--no-color` — plain-текст без ANSI.
+     */
+    fun streamPrintReasoning(delta: String) {
+        t.print(gray(delta))
+    }
+
+    /**
+     * День 30: завершение streaming-вывода — перенос строки после последнего токена + финальный
+     * красивый markdown-рендер полного текста. Progressive-вывод показал raw-токены (без подсветки
+     * заголовков/кода/списков); здесь перерисовываем готовым [markdown]-блоком, как после обычного
+     * batch-чата. Двойной вывод (raw + markdown) сознателен: пользователь видит контент сразу
+     * (raw), а финальный рендер даёт читаемость (форматирование). На non-TTY дублирование заметно
+     * меньше (нет ANSI-анимации), и это acceptable trade-off за live-feedback.
+     *
+     * Порядок: `t.println()` (перенос после raw-стрима) → [markdown] (рендер).
+     */
+    fun streamFinalize(fullText: String) {
+        t.println()                       // перенос после последнего progressive-токена
+        markdown(fullText)                // финальный красивый рендер
+    }
+
     /**
      * Крутит спиннер с [label], пока выполняется [block] (LLM-вызов и т.п.).
      *
