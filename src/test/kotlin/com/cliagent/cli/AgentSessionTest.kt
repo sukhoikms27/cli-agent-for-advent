@@ -181,5 +181,8 @@ class AgentSessionTest {
             LlmResult.Success(
                 ChatResponse(id = "x", choices = emptyList())
             )
+        // День 30: streaming не используется в AgentSession-тестах. Заглушка для контракта LlmClient.
+        override fun chatStream(request: ChatRequest): kotlinx.coroutines.flow.Flow<com.cliagent.llm.model.StreamChunk> =
+            throw UnsupportedOperationException("streaming not supported in StubClient")
     }
 }
