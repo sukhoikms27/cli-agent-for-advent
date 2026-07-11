@@ -103,6 +103,11 @@ class ReplEngine {
             StringsCompleter("/mcp"),
             StringsCompleter("add", "remove", "enable", "disable", "on", "off", "list-tools")
         )
-        return AggregateCompleter(top, strategy, branch, memory, profile, task, invariants, mode, rag, mcp)
+        // День 26: /local — live-switch cloud ↔ локальная Ollama без рестарта REPL.
+        val local = ArgumentCompleter(
+            StringsCompleter("/local"),
+            StringsCompleter("on", "off", "status", "smoke")
+        )
+        return AggregateCompleter(top, strategy, branch, memory, profile, task, invariants, mode, rag, mcp, local)
     }
 }

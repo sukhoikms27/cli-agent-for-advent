@@ -105,15 +105,6 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             return@runBlocking
         }
 
-        // День 25: multi-provider dispatch через factory. Заменила хардкод OpenAiCompatibleClient.
-        // Provider резолвится из config.provider (env CLI_AGENT_PROVIDER) или autoDetect по baseUrl.
-        val client = LlmClientFactory.create(config)
-        val resolvedProvider = LlmClientFactory.resolveProvider(config)
-
-        // День 25: effective-модель — флаг -m > config.model (env CLI_AGENT_MODEL > config.json) >
-        // "glm-5.1". Флаг nullable (см. выше), поэтому /config set model теперь работает без -m.
-        val model = model ?: config.model.ifBlank { "glm-5.1" }
-
         val memoryStore = JsonChatStore()
 
         val chatId = when {
@@ -128,6 +119,108 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             }
         }
 
+        // День 22: единый RAG-embedder на сессию (переиспользуется retrieval-агентом и командами /rag).
+        // День 26: embedder живёт ВНЕ [AgentSession] — он shared across cloud↔local switches (Ollama
+        // работает независимо от chat-провайдера). Создаётся один раз, закрывается в finally при выходе.
+        // OllamaEmbeddingClient лёгкий (HttpClient без активного соединения до первого запроса).
+        val ragEmbedder = com.cliagent.rag.embedding.OllamaEmbeddingClient(
+            baseUrl = config.rag.embeddingBaseUrl,
+            model = config.rag.embeddingModel,
+        )
+
+        // День 26: сессия собрана через buildSession (вынесено из run() для /local live-switch).
+        // `var` — команда `/local on|off` пересоздаёт сессию на другом провайдере без рестарта REPL.
+        var session = buildSession(config, memoryStore, chatId, ragEmbedder)
+        printBanner(session, chatId)
+        AppTerminal.println("Type /help for commands, /exit to quit")
+
+        val repl = ReplEngine()
+
+        try {
+            while (true) {
+                val input = repl.readLine() ?: break   // null = Ctrl+D
+                if (input.isBlank()) continue
+
+                when {
+                input == "/exit" -> break
+                input == "/help" -> printHelp()
+                input == "/history" -> printHistory(session.agent)
+                input == "/chats" -> printChats(memoryStore)
+                input == "/stats" -> printStats(session.agent, session.model)
+                input == "/cost" -> printCost(session.agent, session.model)
+                input == "/summary" -> printSummary(session.agent)
+                input == "/compress" -> manualCompress(session.agent)
+                input == "/facts" -> printFacts(session.agent)
+                input.startsWith("/local") -> {
+                    // День 26: /local live-switch cloud↔Ollama. handleLocal возвращает новую сессию
+                    // при on/off (null при status/smoke — без switch). Закрываем старую при замене.
+                    val next = handleLocal(input, session, memoryStore, chatId, ragEmbedder)
+                    if (next != null) {
+                        session.close()
+                        session = next
+                        printBanner(session, chatId)
+                    }
+                }
+                input.startsWith("/strategy") -> handleStrategy(input, session.agent, session.client, session.model, memoryStore, chatId, keepRecent)
+                input.startsWith("/branch") -> handleBranch(input, session.agent)
+                input.startsWith("/memory") -> handleMemory(input, session.agent)
+                input.startsWith("/profile") -> handleProfile(input, session.agent, session.client, session.model)
+                input.startsWith("/invariants") -> handleInvariants(input, session.agent)
+                input.startsWith("/task") -> handleTask(input, session.agent, session.orchestrator)
+                input.startsWith("/mode") -> handleMode(input, session.agent)
+                input.startsWith("/mcp") -> handleMcp(input, session.config.mcp.filter { it.enabled })
+                input.startsWith("/rag") -> session.ragCommands.handle(input)
+                input.startsWith("/config") -> handleConfig(input)
+                input == "/reset" -> {
+                    session.agent.reset()
+                    AppTerminal.ok("History, summary, facts, branches, working memory cleared.")
+                }
+                else -> {
+                    // День 15 (progressive): каждый блок стадии печатается сразу через onEmit
+                    // по мере готовности; onStageStart ставит лейбл спиннера per-stage.
+                    dispatchFreeText(
+                        input, session.agent, session.statefulAgent, session.orchestrator, session.intentClassifier,
+                        onEmit = { block ->
+                            AppTerminal.println()
+                            AppTerminal.markdown(block)
+                            AppTerminal.println()
+                        },
+                        onStageStart = { stage -> currentSpinnerStage = stage }
+                    )
+                }
+            }
+            }
+        } finally {
+            // День 17/26: закрываем ресурсы текущей сессии (MCP toolExecutor) и shared RAG-embedder.
+            session.close()
+            // День 22: закрываем RAG-embedder (shared HttpClient) при выходе из REPL.
+            runCatching { ragEmbedder.close() }
+        }
+    }
+
+    /**
+     * День 26: сборка [AgentSession] из [config] + CLI-флагов. Вынесено из `run()` (:110-251), чтобы
+     * команда `/local` могла пересоздать сессию на другом провайдере без рестарта REPL. CLI-флаги
+     * (-m, --temperature, --strategy, --compress, --swarm-mode и пр.) читаются из свойств класса —
+     * они постоянны на время жизни REPL; меняется только [config] (provider/model/baseUrl/apiKey).
+     *
+     * `ragEmbedder` передаётся параметром: он shared across switches (создаётся один раз в `run()`),
+     * не принадлежит сессии и не закрывается в [AgentSession.close].
+     */
+    private suspend fun buildSession(
+        config: com.cliagent.config.AppConfig,
+        memoryStore: MemoryStore,
+        chatId: String,
+        ragEmbedder: com.cliagent.rag.embedding.OllamaEmbeddingClient,
+    ): AgentSession {
+        // День 25: multi-provider dispatch через factory.
+        val client = LlmClientFactory.create(config)
+        val resolvedProvider = LlmClientFactory.resolveProvider(config)
+
+        // День 25: effective-модель — флаг -m > config.model (env CLI_AGENT_MODEL > config.json) >
+        // "glm-5.1". Флаг nullable, поэтому /config set model работает без -m.
+        val model = model ?: config.model.ifBlank { "glm-5.1" }
+
         val reasoningStrategy = ReasoningStrategy.entries.find { it.label == strategy }
         val historyCompressor = if (compress) {
             HistoryCompressor(client, model, keepRecentCount = keepRecent)
@@ -135,17 +228,10 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             null
         }
 
-        // Create context strategy
         val contextManager = createStrategy(contextStrategy, client, model, memoryStore, chatId, keepRecent)
 
-        // День 12: авто-извлечение профиля (opt-in)
         val profileExtractor = if (autoProfile) ProfileExtractor(client, model) else null
 
-        // День 20: ToolExecutor поверх MCP-серверов из config.mcp (массив). Multi-server:
-        // ≥2 → CompositeMcpToolExecutor (оркестрация + routing); 1 → single McpToolExecutor;
-        // 0 → null (tools отключены, поведение дней 1–16). Legacy single-server (mcpCommand/mcpUrl)
-        // уже свёрнут в config.mcp на уровне ConfigRepository → 0 регрессий. Persistent в сессии
-        // REPL (lazy-connect), закрывается в finally при выходе.
         val mcpServers = config.mcp.filter { it.enabled }
         val toolExecutor: com.cliagent.agent.ToolExecutor? = when {
             mcpServers.size >= 2 -> com.cliagent.mcp.CompositeMcpToolExecutor(
@@ -157,15 +243,7 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         }
         val mcpServerCount = mcpServers.size
 
-        // День 22: единый RAG-embedder на сессию (переиспользуется retrieval-агентом и командами /rag).
-        // Lifecycle — внешний: закрывается в finally при выходе из REPL. OllamaEmbeddingClient лёгкий
-        // (HttpClient без активного соединения до первого запроса), поэтому создаём заранее.
-        val ragEmbedder = com.cliagent.rag.embedding.OllamaEmbeddingClient(
-            baseUrl = config.rag.embeddingBaseUrl,
-            model = config.rag.embeddingModel,
-        )
-        // Fallback: per-strategy файл дефолтной стратегии — если основной index.json пуст (баг дня 21:
-        // /rag index писал только в index-structural.json, а не в index.json).
+        // Fallback: per-strategy файл дефолтной стратегии — если основной index.json пуст.
         val ragFallbackStore = when (config.rag.defaultStrategy) {
             "fixed" -> com.cliagent.rag.JsonRagStore(com.cliagent.config.AppPaths.ragIndexFixed)
             else -> com.cliagent.rag.JsonRagStore(com.cliagent.config.AppPaths.ragIndexStructural)
@@ -174,8 +252,6 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             embedder = ragEmbedder,
             topK = config.rag.topK,
             fallbackStore = ragFallbackStore,
-            // День 23: query rewrite + реранкинг/фильтрация (null при none/identity → поведение дня 22).
-            // LLM-варианты используют общий `client` (z.ai GLM), а не embedder. Фабрики — в rag/RagFactories.kt.
             rewriter = if (config.rag.queryRewriter.lowercase() == "identity") null
                 else com.cliagent.rag.queryRewriterOf(config.rag.queryRewriter, client, model),
             reranker = com.cliagent.rag.rerankerOf(config.rag.reranker, config.rag, client, model),
@@ -193,51 +269,25 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             profileExtractor = profileExtractor,
             autoProfileEvery = if (autoProfile) 5 else 0,
             toolExecutor = toolExecutor,
-            // День 20: лимит раундов tool-loop (default 8) — для «длинного флоу» multi-server оркестрации.
             maxToolRounds = config.maxToolRounds,
-            // День 21 (W6.3): температура основного цикла. --temperature ранее был мёртвым флагом.
             temperature = temperature,
-            // День 19: статусный вывод агента — через mordant-терминал, чтобы печать шла «поверх»
-            // активного спиннера (chat() крутит его в withSpinner). Сырой println затирается анимацией.
             logger = AppTerminal::println,
-            // День 22: RAG-retrieval в промпт. Дефолт режима — из config.rag.enabled; toggle `/rag on|off`.
             ragRetriever = ragRetriever,
             ragEnabled = config.rag.enabled,
-            // День 24: порог анти-галлюцинации («не знаю» при слабом контексте). 0.0 = выключено.
             dontKnowThreshold = config.rag.dontKnowThreshold,
-            // День 25: conversation-aware retrieval (обогащение запроса целью + историей).
             conversationalQuery = config.rag.conversationalQuery,
         )
 
-        // День 13 (авто-поток стадий): оркестратор автоматизирует /task start → артефакт стадии →
-        // подтверждение перехода. Один StageAgent на каждую стадию FSM + StepAgent на каждый
-        // пункт плана внутри execution. Свободный текст при активной задаче = подтверждение/уточнение.
-        // День 15 (B, gap №6): оркестратор использует защищённый chat-провайдер от StatefulAgent →
-        // инварианты (если включены) покрывают и stage-поток, а не только свободный чат.
         val checker = if (invariantsEnabled) LlmInvariantChecker(client, model) else null
         val statefulAgent = StatefulAgent(agent, checker) { agent.getInvariants() }
-        // День 15 (progressive): спиннер на уровне одного stage-LLM-вызова. Каждый chat()-вызоз
-        // оркестратора крутит спиннер с лейблом текущей стадии (spinnerLabel читает
-        // currentSpinnerStage, который ставится через onStageStart); finally чистит кадр до
-        // печати блока → гарблинга нет. Блоки стадий печатаются progressive через onEmit.
         val orchestrator = TaskOrchestrator(
             agent, client, model,
-            // День 21: --swarm-mode auto|on|off. --no-swarm (legacy) форсирует OFF.
             swarmMode = if (noSwarm) com.cliagent.agent.swarm.SwarmMode.OFF else swarmMode,
             chat = { msg -> AppTerminal.withSpinner({ spinnerLabel() }) { statefulAgent.chat(msg) } }
         )
 
-        // День 15 (п.1): авто-определение «простой вопрос vs задача» при отсутствии активной задачи
-        // и режиме ≠ MANUAL. QUESTION → обычный чат; TASK → автостарт FSM без /task start.
         val intentClassifier = IntentClassifier(client, model)
 
-        val invariantsLabel = if (invariantsEnabled) "ON" else "OFF"
-        val compressLabel = if (compress) "ON" else "OFF"
-        val swarmLabel = if (noSwarm) "OFF" else swarmMode.label.uppercase()
-        val modeLabel = (agent.getWorkingMemory()?.interactionMode ?: InteractionMode.PLAN).name.lowercase()
-        val mcpLabel = if (mcpServerCount == 0) "OFF" else "$mcpServerCount server(s)"
-        // День 22 (RAG): команды /rag + инъекция retrieved-чанков в промпт. chat() — для /rag eval
-        // (прогон контрольных вопросов в обоих режимах); agent — для toggle on|off.
         val ragCommands = RagCommands(config.rag, ragEmbedder, agent,
             chat = { msg ->
                 AppTerminal.withSpinner({ "RAG eval…" }) {
@@ -248,62 +298,203 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             llmClient = client,
             model = model,
         )
-        val ragLabel = if (agent.isRagEnabled()) "ON" else "OFF"
-        AppTerminal.println("CLI Agent v0.8 | Chat: $chatId | Provider: ${resolvedProvider.id} | Model: $model | Context: ${contextManager.getStrategy().getName()} | MCP: $mcpLabel | RAG: $ragLabel | MaxToolRounds: ${config.maxToolRounds} | Compress: $compressLabel | Invariants: $invariantsLabel | Swarm: $swarmLabel | Mode: $modeLabel")
-        AppTerminal.println("Type /help for commands, /exit to quit")
 
-        val repl = ReplEngine()
+        return AgentSession(
+            client = client,
+            resolvedProvider = resolvedProvider,
+            model = model,
+            config = config,
+            agent = agent,
+            statefulAgent = statefulAgent,
+            orchestrator = orchestrator,
+            intentClassifier = intentClassifier,
+            ragCommands = ragCommands,
+            ragRetriever = ragRetriever,
+            contextManager = contextManager,
+            checker = checker,
+            toolExecutor = toolExecutor,
+            maxToolRounds = config.maxToolRounds,
+            mcpServerCount = mcpServerCount,
+        )
+    }
 
-        try {
-            while (true) {
-                val input = repl.readLine() ?: break   // null = Ctrl+D
-                if (input.isBlank()) continue
+    /**
+     * День 26: баннер текущей сессии (провайдер/модель/контекст/MCP/RAG/…). Печатается при старте и
+     * после `/local on|off` switch. CLI-флаги (compress/invariants/swarm) берутся из свойств класса.
+     */
+    private suspend fun printBanner(session: AgentSession, chatId: String) {
+        val invariantsLabel = if (invariantsEnabled) "ON" else "OFF"
+        val compressLabel = if (compress) "ON" else "OFF"
+        val swarmLabel = if (noSwarm) "OFF" else swarmMode.label.uppercase()
+        val modeLabel = (session.agent.getWorkingMemory()?.interactionMode ?: InteractionMode.PLAN).name.lowercase()
+        val mcpLabel = if (session.mcpServerCount == 0) "OFF" else "${session.mcpServerCount} server(s)"
+        val ragLabel = if (session.agent.isRagEnabled()) "ON" else "OFF"
+        AppTerminal.println(
+            "CLI Agent v0.9 | Chat: $chatId | Provider: ${session.resolvedProvider.id} | Model: ${session.model} | " +
+                "Context: ${session.contextManager.getStrategy().getName()} | MCP: $mcpLabel | RAG: $ragLabel | " +
+                "MaxToolRounds: ${session.maxToolRounds} | Compress: $compressLabel | Invariants: $invariantsLabel | " +
+                "Swarm: $swarmLabel | Mode: $modeLabel"
+        )
+    }
 
-                when {
-                input == "/exit" -> break
-                input == "/help" -> printHelp()
-                input == "/history" -> printHistory(agent)
-                input == "/chats" -> printChats(memoryStore)
-                input == "/stats" -> printStats(agent, model)
-                input == "/cost" -> printCost(agent, model)
-                input == "/summary" -> printSummary(agent)
-                input == "/compress" -> manualCompress(agent)
-                input == "/facts" -> printFacts(agent)
-                input.startsWith("/strategy") -> handleStrategy(input, agent, client, model, memoryStore, chatId, keepRecent)
-                input.startsWith("/branch") -> handleBranch(input, agent)
-                input.startsWith("/memory") -> handleMemory(input, agent)
-                input.startsWith("/profile") -> handleProfile(input, agent, client, model)
-                input.startsWith("/invariants") -> handleInvariants(input, agent)
-                input.startsWith("/task") -> handleTask(input, agent, orchestrator)
-                input.startsWith("/mode") -> handleMode(input, agent)
-                input.startsWith("/mcp") -> handleMcp(input, mcpServers)
-                input.startsWith("/rag") -> ragCommands.handle(input)
-                input.startsWith("/config") -> handleConfig(input)
-                input == "/reset" -> {
-                    agent.reset()
-                    AppTerminal.ok("History, summary, facts, branches, working memory cleared.")
-                }
-                else -> {
-                    // День 15 (progressive): каждый блок стадии печатается сразу через onEmit
-                    // по мере готовности; onStageStart ставит лейбл спиннера per-stage.
-                    dispatchFreeText(
-                        input, agent, statefulAgent, orchestrator, intentClassifier,
-                        onEmit = { block ->
-                            AppTerminal.println()
-                            AppTerminal.markdown(block)
-                            AppTerminal.println()
-                        },
-                        onStageStart = { stage -> currentSpinnerStage = stage }
-                    )
-                }
+    /**
+     * День 26: сохранённый cloud-config для `/local off` (восстановление без повторной загрузки
+     * config.json — env перебил бы overlay). null, пока не было `/local on`. Класс инстанцируется
+     * clikt один раз на `chat`, поэтому это состояние валидно на время жизни REPL.
+     */
+    private var savedCloudConfig: com.cliagent.config.AppConfig? = null
+
+    /**
+     * День 26: обработчик `/local` — live-switch cloud ↔ локальная Ollama без рестарта REPL.
+     *
+     * Подкоманды:
+     * - `/local` | `/local status` — health-check Ollama (native /api/tags) + текущий provider/model.
+     * - `/local on [model]` — сохранить текущий config как cloud (если ещё не сохранён), переключиться
+     *   на overlay `{provider=ollama, baseUrl=http://localhost:11434/v1, model=qwen3:14b, apiKey=""}`,
+     *   пересобрать сессию, persist provider=ollama в config.json.
+     * - `/local off` — восстановить cloud-сессию из [savedCloudConfig], persist provider обратно.
+     * - `/local smoke` — прогнать 3 промпта через прямой client.chat (без агента/history).
+     *
+     * @return новая [AgentSession] при on/off (caller закрывает старую и заменяет); null при
+     *   status/smoke (без switch).
+     */
+    private suspend fun handleLocal(
+        input: String,
+        session: AgentSession,
+        memoryStore: MemoryStore,
+        chatId: String,
+        ragEmbedder: com.cliagent.rag.embedding.OllamaEmbeddingClient,
+    ): AgentSession? {
+        val parts = input.trim().split("\\s+".toRegex())
+        val sub = parts.getOrNull(1)?.lowercase()
+        when (sub) {
+            null, "status" -> {
+                printLocalStatus(session)
+                return null
             }
+            "on" -> {
+                val targetModel = parts.getOrNull(2) ?: "qwen3:14b"
+                return switchToLocal(session, targetModel, memoryStore, chatId, ragEmbedder)
+            }
+            "off" -> {
+                return switchToCloud(session, memoryStore, chatId, ragEmbedder)
+            }
+            "smoke" -> {
+                runLocalSmoke(session)
+                return null
+            }
+            else -> {
+                AppTerminal.println("Unknown /local command: $sub. Use: on [model], off, status, smoke")
+                return null
+            }
+        }
+    }
+
+    /** `/local` | `/local status` — health-check + текущий провайдер/модель. */
+    private suspend fun printLocalStatus(session: AgentSession) {
+        AppTerminal.println("🔌 Current session: provider=${session.resolvedProvider.id}, model=${session.model}")
+        val nativeBase = com.cliagent.llm.nativeBaseFrom(session.config.baseUrl)
+        val effectiveBase = if (session.resolvedProvider == com.cliagent.llm.LlmProvider.OLLAMA) nativeBase
+            else "http://localhost:11434"
+        val checker = com.cliagent.llm.OllamaHealthChecker(baseUrl = effectiveBase)
+        try {
+            val health = AppTerminal.withSpinner("Pinging Ollama…") { checker.checkHealth() }
+            if (!health.reachable) {
+                AppTerminal.warn("Ollama недоступна: ${health.errorMessage}")
+                AppTerminal.println("   Запустите: ollama serve (HTTP на http://localhost:11434)")
+                return
+            }
+            AppTerminal.ok("Ollama reachable на $effectiveBase (${health.models.size} models)")
+            if (health.models.isNotEmpty()) {
+                health.models.forEach { m ->
+                    val sizeMb = if (m.sizeBytes > 0) " · ${m.sizeBytes / 1_048_576}MB" else ""
+                    val q = m.quantization?.let { " · $it" } ?: ""
+                    val p = m.parameterSize?.let { " · $it" } ?: ""
+                    AppTerminal.println("  - ${m.name}$p$q$sizeMb")
+                }
+            } else {
+                AppTerminal.println("  (no models installed; ollama pull qwen3:14b)")
             }
         } finally {
-            // День 17: закрываем persistent MCP-соединение при выходе из REPL (Ctrl+D / /exit).
-            toolExecutor?.close()
-            // День 22: закрываем RAG-embedder (shared HttpClient) при выходе из REPL.
-            runCatching { ragEmbedder.close() }
+            checker.close()
         }
+    }
+
+    /**
+     * `/local on [model]` — переключение на локальную Ollama. Сохраняет текущий config как cloud
+     * (для будущего `/local off`), строит overlay, пересоздаёт сессию, persist provider=ollama.
+     */
+    private suspend fun switchToLocal(
+        session: AgentSession,
+        targetModel: String,
+        memoryStore: MemoryStore,
+        chatId: String,
+        ragEmbedder: com.cliagent.rag.embedding.OllamaEmbeddingClient,
+    ): AgentSession? {
+        // Сохраним cloud-config при первом переключении (чтобы /local off знал, куда вернуться).
+        if (savedCloudConfig == null) {
+            savedCloudConfig = session.config
+        }
+        val overlay = session.config.copy(
+            provider = "ollama",
+            baseUrl = "http://localhost:11434/v1",
+            model = targetModel,
+            apiKey = "",
+        )
+        val newSession = try {
+            buildSession(overlay, memoryStore, chatId, ragEmbedder)
+        } catch (e: Throwable) {
+            AppTerminal.err("Не удалось переключиться на локальную Ollama: ${e.message}")
+            return null
+        }
+        // Persist выбора в config.json (env override может перебить при следующем load, но file
+        // обновлён). runCatching — persist не должен ронять switch.
+        runCatching { ConfigRepository().setLlmField("provider", "ollama") }
+        val limits = com.cliagent.llm.ModelLimitsRegistry.forModel(targetModel)
+        AppTerminal.ok("Switched to LOCAL: provider=ollama, model=$targetModel " +
+            "(context ${limits.contextWindow / 1000}K, output ${limits.maxOutput / 1000}K)")
+        return newSession
+    }
+
+    /** `/local off` — возврат к cloud-сессии из [savedCloudConfig]. */
+    private suspend fun switchToCloud(
+        session: AgentSession,
+        memoryStore: MemoryStore,
+        chatId: String,
+        ragEmbedder: com.cliagent.rag.embedding.OllamaEmbeddingClient,
+    ): AgentSession? {
+        val cloud = savedCloudConfig
+        if (cloud == null) {
+            AppTerminal.warn("Нет сохранённого cloud-config. /local off доступен только после /local on.")
+            return null
+        }
+        val newSession = try {
+            buildSession(cloud, memoryStore, chatId, ragEmbedder)
+        } catch (e: Throwable) {
+            AppTerminal.err("Не удалось вернуться на cloud: ${e.message}")
+            return null
+        }
+        savedCloudConfig = null
+        runCatching { ConfigRepository().setLlmField("provider", cloud.provider) }
+        AppTerminal.ok("Switched to CLOUD: provider=${LlmClientFactory.resolveProvider(cloud).id}, " +
+            "model=${newSession.model}")
+        return newSession
+    }
+
+    /** `/local smoke` — прямой прогон 3 промптов через client.chat (без агента/history). */
+    private suspend fun runLocalSmoke(session: AgentSession) {
+        // Переиспользуем session.client если уже local, иначе временный client на localhost:11434/v1.
+        val client = if (session.resolvedProvider == com.cliagent.llm.LlmProvider.OLLAMA) {
+            session.client
+        } else {
+            com.cliagent.llm.OpenAiCompatibleClient(
+                baseUrl = "http://localhost:11434/v1",
+                apiKey = "",
+            )
+        }
+        val model = if (session.resolvedProvider == com.cliagent.llm.LlmProvider.OLLAMA) session.model else "qwen3:14b"
+        AppTerminal.println("🧪 Smoke test: model=$model, baseUrl=http://localhost:11434/v1")
+        LocalSmoke.runSmoke(client, model)
     }
 
     /**
@@ -487,6 +678,10 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             |  /config show          — Show config file summary
             |  /config path          — Print config file path
             |  /config set <f> <v>   — Set LLM field (provider, model, baseUrl, apiKey); restart to apply
+            |  /local [status]      — Show Ollama health + current provider/model
+            |  /local on [model]    — Switch to local Ollama (default qwen3:14b) without restart
+            |  /local off           — Switch back to cloud (z.ai) after /local on
+            |  /local smoke         — Run 3 prompts (arithmetic/reasoning/code) directly via LLM
             |  /reset               — Clear chat history, summary, facts, branches, working memory
             |  /exit                — Exit the program
             |
