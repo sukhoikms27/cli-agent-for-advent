@@ -41,6 +41,7 @@ import com.github.ajalt.clikt.parameters.options.flag
 import com.github.ajalt.clikt.parameters.options.option
 import com.github.ajalt.clikt.parameters.types.double
 import com.github.ajalt.clikt.parameters.types.int
+import com.github.ajalt.mordant.rendering.TextColors.gray
 import com.github.ajalt.mordant.table.table
 import kotlinx.coroutines.runBlocking
 
@@ -230,6 +231,15 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         // "glm-5.1". Флаг nullable, поэтому /config set model работает без -m.
         val model = model ?: config.model.ifBlank { "glm-5.1" }
 
+        // День 30 (streaming SSE): вычисляем streaming-флаг. config.stream: "auto" (default) →
+        // только Ollama (локальные thinking-модели — главный бенефициар; cloud z.ai и так быстрый);
+        // "true" → всегда; "false" → никогда (поведение дней 1–29). env CLI_AGENT_STREAM override.
+        streamEnabled = when (config.stream.lowercase().trim()) {
+            "true" -> true
+            "false" -> false
+            else -> resolvedProvider == com.cliagent.llm.LlmProvider.OLLAMA   // auto
+        }
+
         val reasoningStrategy = ReasoningStrategy.entries.find { it.label == strategy }
         val historyCompressor = if (compress) {
             HistoryCompressor(client, model, keepRecentCount = keepRecent)
@@ -360,6 +370,14 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
      * без persist в config.json: preference сессии). Бейдж печатается в REPL-цикле после ответа.
      */
     private var markProvider: Boolean = false
+
+    /**
+     * День 30 (streaming SSE): включён ли streaming-путь для REPL обычного чата. Вычисляется в
+     * [buildSession] из config.stream + resolvedProvider (auto → только Ollama; cloud быстрый, MVP
+     * не стримит). Пересчитывается на `/local` switch (сессия пересоздаётся, поле обновляется).
+     * Streaming применяется только в [dispatchFreeText] для свободного чата (без активной задачи).
+     */
+    private var streamEnabled: Boolean = false
 
     /**
      * День 26: обработчик `/local` — live-switch cloud ↔ локальная Ollama без рестарта REPL.
@@ -720,6 +738,43 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         // чтобы REPL не упал, а показал понятную ошибку.
         // День 24: withTimedSpinner — live-таймер в лейбле спиннера (каждые 120ms обновляется
         // HH:MM:SS); после ответа печатается серая строка длительности через printDuration.
+        //
+        // День 30 (streaming SSE): если streamEnabled (config.stream auto+Ollama / true) — streaming
+        // путь: токены печатаются progressive через [AppTerminal.streamPrint] по мере генерации,
+        // затем финальный markdown-рендер через [AppTerminal.streamFinalize]. Это убирает 40-90с
+        // «пустоты» thinking-моделей (qwen3:14b). Fallback на batch+spinner если streamEnabled=false.
+        if (streamEnabled) {
+            val start = System.nanoTime()
+            AppTerminal.println()   // пустая строка перед ответом (как onEmit делает)
+            var sawReasoning = false
+            val fullContent = try {
+                statefulAgent.contextAware.chatStreamed(
+                    input,
+                    onToken = { delta -> AppTerminal.streamPrint(delta) },
+                    onReasoning = { reasoning ->
+                        // Qwen3 thinking: первый reasoning-фрейм → разделитель + серый курсив.
+                        if (!sawReasoning) {
+                            AppTerminal.println(gray("💭 thinking…"))
+                            sawReasoning = true
+                        }
+                        AppTerminal.streamPrintReasoning(reasoning)
+                    },
+                )
+            } catch (e: LlmCallException) {
+                val msg = "⚠️ Ошибка запроса к LLM: ${e.message}"
+                onEmit(msg)
+                return msg
+            }
+            // Если был reasoning (thinking), content начинается с новой строки под ним.
+            if (sawReasoning) {
+                AppTerminal.println()   // закрываем reasoning-блок перед финальным ответом
+            }
+            AppTerminal.streamFinalize(fullContent)
+            val elapsedMillis = (System.nanoTime() - start) / 1_000_000
+            AppTerminal.printDuration(elapsedMillis)
+            return fullContent
+        }
+
         val timed = try {
             AppTerminal.withTimedSpinner(spinnerLabel()) { statefulAgent.chat(input) }
         } catch (e: LlmCallException) {

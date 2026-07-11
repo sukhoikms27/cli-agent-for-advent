@@ -114,6 +114,11 @@ class ConfigRepository(
             maxToolRounds = maxToolRounds,
             mcp = mcpServers,
             rag = rag,
+            // День 30 (streaming SSE): env CLI_AGENT_STREAM > config.json > default "auto".
+            // Паттерн симметричен CLI_AGENT_PROVIDER (env override одиночного строкового поля).
+            stream = System.getenv("CLI_AGENT_STREAM")
+                ?.takeIf { it.isNotBlank() }
+                ?: fileConfig.stream,
         )
     }
 

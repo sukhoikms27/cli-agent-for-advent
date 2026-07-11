@@ -42,4 +42,21 @@ data class AppConfig(
      * toggle `/rag on|off`, eval `/rag eval`.
      */
     val rag: RagConfig = RagConfig(),
+    /**
+     * День 30 (streaming SSE): режим серверного стриминга ответа. Решает проблему thinking-моделей
+     * (qwen3:14b: 40-90с «пустоты» до первого токена) — токены идут по мере генерации, пользователь
+     * видит контент сразу.
+     *
+     * Значения (строка, не bool — для auto-режима):
+     *  - `"auto"` (default) — streaming включается автоматически для Ollama (локальные thinking-модели
+     *    — главный бенефициар; cloud z.ai и так быстрый). Schema-evolution: старые config.json грузятся
+     *    без ошибок → auto → прежний не-streaming путь для cloud (0 регрессий дней 1–29).
+     *  - `"true"` — streaming всегда (даже для cloud; для дебага/сравнения latency).
+     *  - `"false"` — streaming всегда выключен (поведение дней 1–29 для всех провайдеров).
+     *
+     * env override `CLI_AGENT_STREAM`. Streaming применяется только в REPL обычном чате (без активной
+     * задачи / tools — см. [com.cliagent.cli.ChatCommand.dispatchFreeText]); stage-поток и tool-итерации
+     * остаются на batch-пути (MVP).
+     */
+    val stream: String = "auto",
 )

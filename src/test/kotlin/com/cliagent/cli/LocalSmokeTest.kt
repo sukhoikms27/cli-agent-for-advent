@@ -105,6 +105,9 @@ class LocalSmokeTest {
                 )
             )
         }
+        // День 30: streaming не используется в smoke-тестах. Заглушка для контракта LlmClient.
+        override fun chatStream(request: ChatRequest): kotlinx.coroutines.flow.Flow<com.cliagent.llm.model.StreamChunk> =
+            throw UnsupportedOperationException("streaming not supported in CountingStubClient")
     }
 
     /** Запоминает прогоненные промпты для проверки покрытия категорий. */
@@ -118,17 +121,23 @@ class LocalSmokeTest {
                 ChatResponse(id = "r", choices = listOf(Choice(0, ChatMessage("assistant", "ok"))))
             )
         }
+        override fun chatStream(request: ChatRequest): kotlinx.coroutines.flow.Flow<com.cliagent.llm.model.StreamChunk> =
+            throw UnsupportedOperationException("streaming not supported in RecordingStubClient")
     }
 
     /** Всегда Error — проверка, что harness фиксирует ошибку, не падая. */
     private class FailingStubClient : LlmClient {
         override suspend fun chat(request: ChatRequest): LlmResult<ChatResponse> =
             LlmResult.Error(503, "LLM unavailable")
+        override fun chatStream(request: ChatRequest): kotlinx.coroutines.flow.Flow<com.cliagent.llm.model.StreamChunk> =
+            throw UnsupportedOperationException("streaming not supported in FailingStubClient")
     }
 
     /** Бросает CancellationException — проверка, что harness не глотает отмену. */
     private class CancellingStubClient : LlmClient {
         override suspend fun chat(request: ChatRequest): LlmResult<ChatResponse> =
             throw kotlinx.coroutines.CancellationException("cancelled")
+        override fun chatStream(request: ChatRequest): kotlinx.coroutines.flow.Flow<com.cliagent.llm.model.StreamChunk> =
+            throw UnsupportedOperationException("streaming not supported in CancellingStubClient")
     }
 }
