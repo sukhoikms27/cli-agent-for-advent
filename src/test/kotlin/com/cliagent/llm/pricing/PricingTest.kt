@@ -3,6 +3,7 @@ package com.cliagent.llm.pricing
 import com.cliagent.llm.model.Usage
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 /**
@@ -75,5 +76,23 @@ class PricingTest {
     @Test
     fun `unknown model returns null price`() {
         assertNull(Pricing.getPrice("some-unknown-model-xyz"))
+    }
+
+    // ── День 27: детект local-free для /cost (Price(0,0) → "Local model — free") ───────
+
+    @Test
+    fun `local model detected as free via Price 0_0 (day 27 cost label)`() {
+        // printCost детектит local-free по price.input==0 && price.output==0 (без передачи provider).
+        // Инвариант: qwen3/qwen2.5 (local) → Price(0,0) → free; glm (cloud) → Price(>0).
+        val qwen3 = Pricing.getPrice("qwen3:14b")!!
+        assertTrue(qwen3.input == 0.0 && qwen3.output == 0.0, "qwen3 must be free (Price 0,0)")
+        val qwen25 = Pricing.getPrice("qwen2.5:32b")!!
+        assertTrue(qwen25.input == 0.0 && qwen25.output == 0.0, "qwen2.5 must be free (Price 0,0)")
+    }
+
+    @Test
+    fun `cloud model NOT detected as free (non-zero price)`() {
+        val glm = Pricing.getPrice("glm-5.1")!!
+        assert(glm.input > 0.0 || glm.output > 0.0) { "glm must NOT be free" }
     }
 }

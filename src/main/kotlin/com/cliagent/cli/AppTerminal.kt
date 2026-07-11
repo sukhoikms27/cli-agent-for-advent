@@ -3,6 +3,8 @@ package com.cliagent.cli
 import com.github.ajalt.mordant.animation.textAnimation
 import com.github.ajalt.mordant.markdown.Markdown
 import com.github.ajalt.mordant.rendering.AnsiLevel
+import com.cliagent.llm.LlmProvider
+import com.github.ajalt.mordant.rendering.TextColors.blue
 import com.github.ajalt.mordant.rendering.TextColors.gray
 import com.github.ajalt.mordant.rendering.TextColors.green
 import com.github.ajalt.mordant.rendering.TextColors.red
@@ -133,6 +135,35 @@ object AppTerminal {
     fun printDuration(elapsedMillis: Long) {
         if (elapsedMillis <= 0) return
         t.println(gray("⏱ ${formatHMS(elapsedMillis)}"))
+    }
+
+    // ── День 27: маркировка ответов моделью-источником (бонус-тумблер нед.6) ───────
+
+    /**
+     * День 27: текст бейджа модели-источника для маркировки ответов. Pure-функция (без I/O) —
+     * тестируется без мока терминала. Формат: `[local:qwen3:14b]` / `[cloud:glm-5.1]`.
+     *
+     * OLLAMA → `local`, остальные (ZAI, OPENAI_COMPATIBLE) → `cloud`.
+     */
+    fun providerBadgeText(provider: LlmProvider, model: String): String {
+        val tag = if (provider == LlmProvider.OLLAMA) "local" else "cloud"
+        return "[$tag:$model]"
+    }
+
+    /**
+     * День 27: печатает бейдж модели-источника после ответа (суффикс, рядом с [printDuration]).
+     *
+     * local → жёлтый (`🟡`), cloud → синий (`🔵`). На `--no-color`/пайпах — plain-текст без ANSI
+     * (mordant auto-detect, как для [gray]). Суффикс НЕ ломает markdown-рендер: отдельная строка
+     * ВНЕ [markdown]-блока, как [printDuration].
+     */
+    fun printProviderBadge(provider: LlmProvider, model: String) {
+        val badge = providerBadgeText(provider, model)
+        if (provider == LlmProvider.OLLAMA) {
+            t.println(yellow("🟡 $badge"))
+        } else {
+            t.println(blue("🔵 $badge"))
+        }
     }
 
     /**

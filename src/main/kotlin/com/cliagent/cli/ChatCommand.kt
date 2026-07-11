@@ -187,6 +187,12 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                         },
                         onStageStart = { stage -> currentSpinnerStage = stage }
                     )
+                    // День 27: бейдж модели-источника после ответа (бонус-тумблер нед.6). Одна точка
+                    // после dispatchFreeText — покрывает оба пути (stage-flow + обычный чат), без
+                    // дублирования в onEmit (stage-flow эміттит несколько блоков). opt-in через /local mark.
+                    if (markProvider) {
+                        AppTerminal.printProviderBadge(session.resolvedProvider, session.model)
+                    }
                 }
             }
             }
@@ -345,6 +351,14 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
     private var savedCloudConfig: com.cliagent.config.AppConfig? = null
 
     /**
+     * День 27: runtime-toggle маркировки ответов моделью-источником (бонус-тумблер нед.6).
+     * Default `false` (backward-compat — вывод не меняется для существующих cloud-only сессий).
+     * Переключается через `/local mark on|off|status` (как [savedCloudConfig] — session-scoped var,
+     * без persist в config.json: preference сессии). Бейдж печатается в REPL-цикле после ответа.
+     */
+    private var markProvider: Boolean = false
+
+    /**
      * День 26: обработчик `/local` — live-switch cloud ↔ локальная Ollama без рестарта REPL.
      *
      * Подкоманды:
@@ -383,8 +397,12 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                 runLocalSmoke(session)
                 return null
             }
+            "mark" -> {
+                handleLocalMark(parts.getOrNull(2))
+                return null
+            }
             else -> {
-                AppTerminal.println("Unknown /local command: $sub. Use: on [model], off, status, smoke")
+                AppTerminal.println("Unknown /local command: $sub. Use: on [model], off, status, smoke, mark")
                 return null
             }
         }
@@ -495,6 +513,30 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         val model = if (session.resolvedProvider == com.cliagent.llm.LlmProvider.OLLAMA) session.model else "qwen3:14b"
         AppTerminal.println("🧪 Smoke test: model=$model, baseUrl=http://localhost:11434/v1")
         LocalSmoke.runSmoke(client, model)
+    }
+
+    /**
+     * День 27: `/local mark on|off|status` — runtime-toggle маркировки ответов моделью-источником.
+     * on — после каждого ответа печатается бейдж (`🟡 [local:qwen3:14b]` / `🔵 [cloud:glm-5.1]`).
+     * off (default) — backward-compat, вывод не меняется. status — текущее состояние.
+     */
+    private fun handleLocalMark(arg: String?) {
+        when (arg?.lowercase()) {
+            "on", "true", "1" -> {
+                markProvider = true
+                AppTerminal.ok("Provider marking ON — ответы помечаются бейджем модели-источника.")
+            }
+            "off", "false", "0" -> {
+                markProvider = false
+                AppTerminal.ok("Provider marking OFF")
+            }
+            "status", null -> {
+                AppTerminal.println("Provider marking: ${if (markProvider) "ON" else "OFF"}")
+            }
+            else -> {
+                AppTerminal.println("Usage: /local mark on|off|status")
+            }
+        }
     }
 
     /**
@@ -682,6 +724,7 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             |  /local on [model]    — Switch to local Ollama (default qwen3:14b) without restart
             |  /local off           — Switch back to cloud (z.ai) after /local on
             |  /local smoke         — Run 3 prompts (arithmetic/reasoning/code) directly via LLM
+            |  /local mark on|off   — Toggle provider badge after each answer (local/cloud marking)
             |  /reset               — Clear chat history, summary, facts, branches, working memory
             |  /exit                — Exit the program
             |
@@ -766,6 +809,21 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         val price = Pricing.getPrice(model)
         if (price == null) {
             AppTerminal.println("No pricing data for model '$model'. Token counts: prompt=${stats.totalPromptTokens} completion=${stats.totalCompletionTokens} total=${stats.totalTokens}")
+            return
+        }
+        // День 27: локальная модель (Price(0,0)) бесплатна — показываем это явно вместо $0.00 везде.
+        if (price.input == 0.0 && price.output == 0.0) {
+            val table = table {
+                captionTop("💰 Estimated Cost (session)")
+                header { style(bold = true); row("Item", "Detail") }
+                body {
+                    row("Model", model)
+                    row("Cost", "Local model — free (no API billing)")
+                    row("Tokens", "prompt=${stats.totalPromptTokens} completion=${stats.totalCompletionTokens} total=${stats.totalTokens}")
+                    row("Cached saved", "${stats.totalCachedTokens} tokens")
+                }
+            }
+            AppTerminal.println(table)
             return
         }
         val inputCost = (stats.totalPromptTokens / 1_000_000.0) * price.input
