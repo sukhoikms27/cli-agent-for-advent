@@ -169,6 +169,9 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
                 input.startsWith("/task") -> handleTask(input, session.agent, session.orchestrator)
                 input.startsWith("/mode") -> handleMode(input, session.agent)
                 input.startsWith("/mcp") -> handleMcp(input, session.config.mcp.filter { it.enabled })
+                // День 28: /rag compare-local перехватываем ДО session.ragCommands.handle — нужен доступ
+                // к savedCloudConfig (cloud-config до /local on) для fair local-vs-cloud сравнения.
+                input.startsWith("/rag compare-local") -> handleCompareLocal(input, session)
                 input.startsWith("/rag") -> session.ragCommands.handle(input)
                 input.startsWith("/config") -> handleConfig(input)
                 input == "/reset" -> {
@@ -540,6 +543,120 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
     }
 
     /**
+     * День 28: `/rag compare-local` — side-by-side сравнение local vs cloud LLM на ОДНОМ retrieved-
+     * контексте (fair compare). Retrieval локальный (Ollama-эмбеддинги, общие для обоих клиентов);
+     * генерация прогоняется напрямую через [LlmClient.chat] без агента/history.
+     *
+     * Проводит fair-сравнение: для каждого контрольного вопроса контекст извлекается ОДИН раз,
+     * затем идентичный промпт скармливается local и (опционально) cloud клиенту. Метрики:
+     * latency (скорость), keyword coverage + citation (качество), errors (стабильность).
+     *
+     * Источники клиентов:
+     *  - local: session.client если provider=OLLAMA, иначе временный OpenAiCompatibleClient на
+     *    http://localhost:11434/v1 с model=qwen3:14b (паттерн [runLocalSmoke]).
+     *  - cloud: [savedCloudConfig] (cloud-config до `/local on`) если есть, иначе session.config
+     *    если текущий провайдер — cloud; пытаемся [LlmClientFactory.create], при отсутствии API key
+     *    → cloudClient=null (local-only режим).
+     *
+     * Ollama health-check через [com.cliagent.llm.OllamaHealthChecker]: если недоступна — warn + return
+     * (retrieval невозможен без локальных эмбеддингов).
+     */
+    private suspend fun handleCompareLocal(input: String, session: AgentSession) {
+        // День 28: опциональный аргумент N — число вопросов (ускоряет демо на медленных локальных
+        // моделях: qwen3:14b ~30-60с/вопрос → 10 вопросов = 5-10 мин). `/rag compare-local 3` → первые 3.
+        val arg = input.trim().split("\\s+".toRegex()).getOrNull(2)?.toIntOrNull()
+        // 1) Загрузка eval-вопросов (classpath, по образцу RagCommands.loadEvalQuestions).
+        val allQuestions = loadCompareQuestions()
+        if (allQuestions.isEmpty()) {
+            AppTerminal.warn("No eval questions found (rag/eval-questions.json).")
+            return
+        }
+        val questions = if (arg != null && arg > 0) allQuestions.take(arg) else allQuestions
+        if (arg != null && arg > 0) {
+            AppTerminal.println("Limiting to first $arg of ${allQuestions.size} questions.")
+        }
+
+        // 2) Ollama health-check — retrieval требует локальные эмбеддинги.
+        val nativeBase = com.cliagent.llm.nativeBaseFrom(session.config.baseUrl)
+        val effectiveBase = if (session.resolvedProvider == com.cliagent.llm.LlmProvider.OLLAMA) nativeBase
+            else "http://localhost:11434"
+        val checker = com.cliagent.llm.OllamaHealthChecker(baseUrl = effectiveBase)
+        try {
+            val health = AppTerminal.withSpinner("Pinging Ollama…") { checker.checkHealth() }
+            if (!health.reachable) {
+                AppTerminal.warn("Ollama недоступна: ${health.errorMessage}")
+                AppTerminal.println("   Compare-local требует Ollama для retrieval. Запустите: ollama serve")
+                return
+            }
+            AppTerminal.ok("Ollama reachable на $effectiveBase (${health.models.size} models)")
+        } finally {
+            checker.close()
+        }
+
+        // 3) localClient: session.client если уже local, иначе временный на localhost:11434/v1.
+        val localClient = if (session.resolvedProvider == com.cliagent.llm.LlmProvider.OLLAMA) {
+            session.client
+        } else {
+            com.cliagent.llm.OpenAiCompatibleClient(
+                baseUrl = "http://localhost:11434/v1",
+                apiKey = "",
+            )
+        }
+        val localModel = if (session.resolvedProvider == com.cliagent.llm.LlmProvider.OLLAMA) {
+            session.model
+        } else {
+            "qwen3:14b"
+        }
+
+        // 4) cloudClient: savedCloudConfig (до /local on) → иначе session.config если cloud активен.
+        val cloudConfig = savedCloudConfig
+            ?: session.config.takeIf { session.resolvedProvider != com.cliagent.llm.LlmProvider.OLLAMA }
+        val cloudClient: com.cliagent.llm.LlmClient? = if (cloudConfig != null) {
+            try {
+                LlmClientFactory.create(cloudConfig)
+            } catch (e: IllegalArgumentException) {
+                AppTerminal.warn("Cloud недоступен (${e.message?.take(80)}) — compare в local-only режиме.")
+                null
+            } catch (e: IllegalStateException) {
+                AppTerminal.warn("Cloud недоступен (${e.message?.take(80)}) — compare в local-only режиме.")
+                null
+            }
+        } else {
+            AppTerminal.warn("Cloud недоступен (нет API key / savedCloudConfig) — compare в local-only режиме.")
+            null
+        }
+        val cloudModel = cloudConfig?.model
+
+        // 5) Прогон через harness (печать per-question + сводной таблицы внутри runCompare).
+        AppTerminal.withSpinner("RAG compare-local…") {
+            LocalRagCompare.runCompare(
+                questions = questions,
+                retriever = session.ragRetriever,
+                localClient = localClient,
+                localModel = localModel,
+                cloudClient = cloudClient,
+                cloudModel = cloudModel,
+            )
+        }
+    }
+
+    /**
+     * День 28: загрузка eval-вопросов для compare-local. По образцу [RagCommands.loadEvalQuestions],
+     * но возвращает публичный [LocalRagCompare.CompareQuestion] (вместо private EvalQuestion).
+     * Classpath: `/rag/eval-questions.json`.
+     */
+    private fun loadCompareQuestions(): List<LocalRagCompare.CompareQuestion> {
+        // Единый Json с ignoreUnknownKeys=true (AGENTS.md / паттерн RagCommands.loadEvalQuestions).
+        val json = kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
+        val raw = runCatching {
+            javaClass.getResourceAsStream("/rag/eval-questions.json")?.use { it.readBytes() }
+        }.getOrNull() ?: return emptyList()
+        return runCatching {
+            json.decodeFromString<List<LocalRagCompare.CompareQuestion>>(String(raw, Charsets.UTF_8))
+        }.getOrDefault(emptyList())
+    }
+
+    /**
      * Диспетчеризация свободного текста (не slash-команды) — единый тестируемый шов stage-потока
      * (день 15). Извлечён из `else`-ветки REPL, чтобы покрыть юнит-тестами логику без мока
      * терминала: DONE-reset → авто-определение интента → автостарт FSM → stage-поток / обычный чат.
@@ -713,6 +830,7 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             |  /rag index [fixed|structural] — Index document corpus (chunking + embeddings)
             |  /rag stats            — Show index statistics (chunks, tokens, dimension)
             |  /rag compare          — Build both strategies + compare stats + probe retrieval
+            |  /rag compare-local [N] — Compare local vs cloud LLM on same retrieved context (N = questions)
             |  /rag search <query>   — Probe retrieval: top-5 chunks (smoke test, no agent)
             |  /rag config           — Show RAG configuration
             |  Note: RAG indexing requires Ollama running locally (ollama serve + pull nomic-embed-text).
