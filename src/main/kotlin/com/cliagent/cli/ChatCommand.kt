@@ -272,6 +272,14 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             memoryStore = memoryStore,
             model = model,
             chatId = chatId,
+            // День 29: prompt-адаптация для local RAG — task-specific system prompt для 14B моделей.
+            // Локальные модели хуже следуют сложным инструкциям → явный, короткий промпт с жёстким
+            // требованием источника. Включается когда provider=OLLAMA && RAG активен; cloud → default.
+            systemPrompt = if (resolvedProvider == com.cliagent.llm.LlmProvider.OLLAMA && config.rag.enabled) {
+                com.cliagent.llm.model.SystemPrompts.localRag
+            } else {
+                com.cliagent.llm.model.SystemPrompts.default
+            },
             reasoningStrategy = reasoningStrategy,
             historyCompressor = historyCompressor,
             contextManager = contextManager,
@@ -280,6 +288,9 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             toolExecutor = toolExecutor,
             maxToolRounds = config.maxToolRounds,
             temperature = temperature,
+            // День 29: contextLimit из registry (реальный context_length модели), не хардкод 128K.
+            // qwen3:14b → 40960 (Ollama /api/tags), glm-5.1 → 200K. Корректный warning при overflow.
+            contextLimit = com.cliagent.llm.ModelLimitsRegistry.forModel(model).contextWindow,
             logger = AppTerminal::println,
             ragRetriever = ragRetriever,
             ragEnabled = config.rag.enabled,
