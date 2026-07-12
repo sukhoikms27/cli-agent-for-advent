@@ -195,10 +195,33 @@ object LocalRagCompare {
                 ChatMessage(role = "user", content = prompt)),
             temperature = 0.0,
             maxTokens = maxTokens,
+            // День 28 (fix): стриминг под капотом measure. qwen3 thinking на RAG-контексте может
+            // думать >120с → non-streaming socketTimeout срабатывает → retry-loop (10 попыток)
+            // → compare-local 3 висит 20+ минут. При stream:true socketTimeout измеряет время
+            // МЕЖДУ байтами (reasoning-токены идут постоянно) → не срабатывает. Метрики (latency,
+            // content, usage) те же — дельты склеиваются в полную строку.
+            stream = true,
+            streamOptions = com.cliagent.llm.model.StreamOptions(includeUsage = true),
         )
         val start = System.currentTimeMillis()
-        val result = try {
-            client.chat(request)
+        val fullContent = StringBuilder()
+        var finalUsage: com.cliagent.llm.model.Usage? = null
+        var finishReason: String? = null
+        var errorMsg: String? = null
+        try {
+            client.chatStream(request).collect { chunk ->
+                when (chunk) {
+                    is com.cliagent.llm.model.StreamChunk.Delta -> fullContent.append(chunk.content)
+                    is com.cliagent.llm.model.StreamChunk.Reasoning -> { /* thinking — не входит в answer */ }
+                    is com.cliagent.llm.model.StreamChunk.Done -> {
+                        finalUsage = chunk.usage
+                        finishReason = chunk.finishReason
+                    }
+                    is com.cliagent.llm.model.StreamChunk.Error -> {
+                        errorMsg = if (chunk.message.isBlank()) "LLM error (code ${chunk.code})" else chunk.message
+                    }
+                }
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Throwable) {
@@ -206,13 +229,11 @@ object LocalRagCompare {
             return errorMetrics("ERROR: ${e.message}", elapsed, q, hits)
         }
         val elapsed = System.currentTimeMillis() - start
-        return when (result) {
-            is LlmResult.Success -> {
-                val usage = result.data.usage
-                val text = result.data.choices.firstOrNull()?.message?.content ?: "(empty)"
-                successMetrics(text, elapsed, usage?.promptTokens ?: 0, usage?.completionTokens ?: 0, q, hits)
-            }
-            is LlmResult.Error -> errorMetrics("ERROR: ${result.message}", elapsed, q, hits)
+        return if (errorMsg != null) {
+            errorMetrics("ERROR: $errorMsg", elapsed, q, hits)
+        } else {
+            val text = fullContent.toString().ifBlank { "(empty)" }
+            successMetrics(text, elapsed, finalUsage?.promptTokens ?: 0, finalUsage?.completionTokens ?: 0, q, hits)
         }
     }
 
