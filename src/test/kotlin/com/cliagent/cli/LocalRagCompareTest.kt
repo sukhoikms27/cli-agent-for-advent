@@ -3,6 +3,7 @@ package com.cliagent.cli
 import com.cliagent.llm.LlmClient
 import com.cliagent.llm.model.StreamChunk
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
 import com.cliagent.llm.LlmResult
 import com.cliagent.llm.model.ChatMessage
 import com.cliagent.llm.model.ChatRequest
@@ -297,8 +298,17 @@ class LocalRagCompareTest {
                 )
             )
         }
-        // День 30: streaming не используется в compare-local (batch chat). Заглушка для контракта.
-        override fun chatStream(request: ChatRequest) = throw UnsupportedOperationException("streaming not supported in ScriptedClient stub")
+        // День 28 (fix): compare-local теперь использует chatStream под капотом (чтобы обойти
+        // socketTimeout на долгих RAG-запросах). Stub эмитит ту же ответ-строку через flow.
+        override fun chatStream(request: ChatRequest): kotlinx.coroutines.flow.Flow<com.cliagent.llm.model.StreamChunk> = flow {
+            calls++
+            val text = queue.removeFirstOrNull() ?: "(no scripted response)"
+            emit(com.cliagent.llm.model.StreamChunk.Delta(text))
+            emit(com.cliagent.llm.model.StreamChunk.Done(
+                usage = Usage(promptTokens = 50, completionTokens = 20, totalTokens = 70),
+                finishReason = "stop",
+            ))
+        }
     }
 
     /** LLM-stub, запоминающий maxTokens каждого запроса (для проверки thinking-model фикс). */
@@ -310,20 +320,28 @@ class LocalRagCompareTest {
                 ChatResponse(id = "r", choices = listOf(Choice(0, ChatMessage("assistant", "ok"))))
             )
         }
-        override fun chatStream(request: ChatRequest) = throw UnsupportedOperationException("streaming not supported in RecordingClient stub")
+        override fun chatStream(request: ChatRequest): kotlinx.coroutines.flow.Flow<com.cliagent.llm.model.StreamChunk> = flow {
+            maxTokens.add(request.maxTokens)
+            emit(com.cliagent.llm.model.StreamChunk.Delta("ok"))
+            emit(com.cliagent.llm.model.StreamChunk.Done(finishReason = "stop"))
+        }
     }
 
-    /** Всегда LlmResult.Error — проверка stable-обработки (прогон продолжается). */
+    /** Всегда Error — проверка stable-обработки (прогон продолжается). */
     private class ErrorClient : LlmClient {
         override suspend fun chat(request: ChatRequest): LlmResult<ChatResponse> =
             LlmResult.Error(503, "LLM unavailable")
-        override fun chatStream(request: ChatRequest) = throw UnsupportedOperationException("streaming not supported in ErrorClient stub")
+        override fun chatStream(request: ChatRequest): kotlinx.coroutines.flow.Flow<com.cliagent.llm.model.StreamChunk> = flow {
+            emit(com.cliagent.llm.model.StreamChunk.Error(503, "LLM unavailable"))
+        }
     }
 
     /** Бросает CancellationException — проверка что harness не глотает отмену. */
     private class CancellingClient : LlmClient {
         override suspend fun chat(request: ChatRequest): LlmResult<ChatResponse> =
             throw kotlinx.coroutines.CancellationException("cancelled")
-        override fun chatStream(request: ChatRequest) = throw UnsupportedOperationException("streaming not supported in CancellingClient stub")
+        override fun chatStream(request: ChatRequest): kotlinx.coroutines.flow.Flow<com.cliagent.llm.model.StreamChunk> = flow {
+            throw kotlinx.coroutines.CancellationException("cancelled")
+        }
     }
 }
