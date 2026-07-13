@@ -41,6 +41,7 @@ import com.github.ajalt.clikt.parameters.options.flag
 import com.github.ajalt.clikt.parameters.options.option
 import com.github.ajalt.clikt.parameters.types.double
 import com.github.ajalt.clikt.parameters.types.int
+import com.github.ajalt.clikt.parameters.types.long
 import com.github.ajalt.mordant.rendering.TextColors.gray
 import com.github.ajalt.mordant.table.table
 import kotlinx.coroutines.runBlocking
@@ -51,7 +52,23 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
     // .default("glm-5.1") всегда перекрывал config.model → /config set model не работал без -m
     // (баг: баннер показывал provider из config, но модель из default-флага → "model not found").
     private val model by option("-m", "--model", help = "Model name (overrides config.model)")
-    private val temperature by option("-t", "--temperature", help = "Temperature (0.0-2.0)").double().default(0.7)
+    // День 31: все sampling-флаги nullable (без .default) → priority CLI > config.sampling.field > null
+    // (провайдерский дефолт в wire). Раньше temperature хардкод-дефолтил 0.7, перекрывая config — теперь
+    // config.sampling.temperature учитывается, если флаг не передан. Симметрия с model/-m (день 25).
+    private val temperature by option("-t", "--temperature", help = "Temperature (0.0-2.0); overrides config.sampling.temperature").double()
+    /** День 31: nucleus sampling. null = config.sampling.top_p решает, иначе провайдерский дефолт. */
+    private val topP by option("--top-p", help = "Top-p (0.0-1.0); overrides config.sampling.top_p").double()
+    /** День 31: top-k (K наиболее вероятных токенов). null = config.sampling.top_k решает. */
+    private val topK by option("--top-k", help = "Top-k sampling; overrides config.sampling.top_k").int()
+    /** День 31: seed для детерминизма. null = config.sampling.seed решает, иначе случайно. */
+    private val seed by option("--seed", help = "Sampling seed (deterministic); overrides config.sampling.seed").long()
+    /** День 31: stop-sequences (запятая-разделитель). null = config.sampling.stop решает. */
+    private val stop by option("--stop", help = "Stop sequences (comma-separated); overrides config.sampling.stop")
+        .convert { it.split(",").map { s -> s.trim() } }
+    /** День 31: штраф за повторения по частоте. null = config.sampling.frequency_penalty. */
+    private val frequencyPenalty by option("--frequency-penalty", help = "Frequency penalty; overrides config.sampling.frequency_penalty").double()
+    /** День 31: штраф за повторения по присутствию. null = config.sampling.presence_penalty. */
+    private val presencePenalty by option("--presence-penalty", help = "Presence penalty; overrides config.sampling.presence_penalty").double()
     private val strategy by option("-s", "--strategy", help = "Reasoning: direct, step_by_step, meta_prompt, expert_group").default("direct")
     private val chat by option("-c", "--chat", help = "Chat ID (or 'new')").default("default")
     private val compress by option("--compress", help = "Enable auto-compression of history").flag()
@@ -209,6 +226,15 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
     }
 
     /**
+     * День 31: priority resolver для sampling-параметров. CLI-флаг > config.sampling.field > null.
+     * `cliFlag` non-null → пользователь явно задал per-invocation (перекрывает config). Иначе — config-
+     * default (persistent), иначе null (провайдерский дефолт в wire). null в обоих → null (прежнее
+     * поведение дней 1–30). Обобщение для всех sampling-полей; не generic по типу (clikt-флаги разных
+     * типов — double/int/long/List<String>), поэтому per-call inline.
+     */
+    private fun <T> resolveSampling(cliFlag: T?, configValue: T?): T? = cliFlag ?: configValue
+
+    /**
      * День 26: сборка [AgentSession] из [config] + CLI-флагов. Вынесено из `run()` (:110-251), чтобы
      * команда `/local` могла пересоздать сессию на другом провайдере без рестарта REPL. CLI-флаги
      * (-m, --temperature, --strategy, --compress, --swarm-mode и пр.) читаются из свойств класса —
@@ -231,14 +257,20 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         // "glm-5.1". Флаг nullable, поэтому /config set model работает без -m.
         val model = model ?: config.model.ifBlank { "glm-5.1" }
 
-        // День 30 (streaming SSE): вычисляем streaming-флаг. config.stream: "auto" (default) →
-        // только Ollama (локальные thinking-модели — главный бенефициар; cloud z.ai и так быстрый);
-        // "true" → всегда; "false" → никогда (поведение дней 1–29). env CLI_AGENT_STREAM override.
+        // День 30 (streaming SSE): вычисляем streaming-флаг. config.stream:
+        //  - "auto" (default) → только Ollama (локальные thinking-модели — главный бенефициар;
+        //    cloud z.ai и так быстрый);
+        //  - "true" → всегда;
+        //  - "raw" (день 31) → всегда streaming, но БЕЗ markdown-дублирования (streamFinalize rawOnly);
+        //  - "false" → никогда (поведение дней 1–29).
+        // env CLI_AGENT_STREAM override. rawOnly флаг читается в dispatchFreeText.
         streamEnabled = when (config.stream.lowercase().trim()) {
-            "true" -> true
+            "true", "raw" -> true
             "false" -> false
             else -> resolvedProvider == com.cliagent.llm.LlmProvider.OLLAMA   // auto
         }
+        // День 31: raw-режим — streaming без markdown-дублирования (progressive-токены только).
+        streamRawOnly = config.stream.lowercase().trim() == "raw"
 
         val reasoningStrategy = ReasoningStrategy.entries.find { it.label == strategy }
         val historyCompressor = if (compress) {
@@ -297,7 +329,17 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             autoProfileEvery = if (autoProfile) 5 else 0,
             toolExecutor = toolExecutor,
             maxToolRounds = config.maxToolRounds,
-            temperature = temperature,
+            // День 31: sampling priority — CLI-флаг > config.sampling.field > null (провайдерский дефолт).
+            // resolveSampling helper ниже; без явного флага и без config-значения → null (прежнее
+            // поведение дней 1–30, провайдер решает). temperature раньше хардкод-дефолтил 0.7 — теперь
+            // учитывает config.sampling.temperature; legacy-поведение восстанавливается config-полем.
+            temperature = resolveSampling(temperature, config.sampling.temperature),
+            topP = resolveSampling(topP, config.sampling.topP),
+            topK = resolveSampling(topK, config.sampling.topK),
+            seed = resolveSampling(seed, config.sampling.seed),
+            stop = resolveSampling(stop, config.sampling.stop),
+            frequencyPenalty = resolveSampling(frequencyPenalty, config.sampling.frequencyPenalty),
+            presencePenalty = resolveSampling(presencePenalty, config.sampling.presencePenalty),
             // День 29: contextLimit из registry (реальный context_length модели), не хардкод 128K.
             // qwen3:14b → 40960 (Ollama /api/tags), glm-5.1 → 200K. Корректный warning при overflow.
             contextLimit = com.cliagent.llm.ModelLimitsRegistry.forModel(model).contextWindow,
@@ -351,6 +393,12 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
     /**
      * День 26: баннер текущей сессии (провайдер/модель/контекст/MCP/RAG/…). Печатается при старте и
      * после `/local on|off` switch. CLI-флаги (compress/invariants/swarm) берутся из свойств класса.
+     *
+     * День 29: для Ollama-провайдера добавляется compact-строка effective defaults
+     * ([com.cliagent.llm.ModelDefaultsRegistry.forModel], только non-null поля) — чтобы пользователь
+     * видел, какие sampling/num_ctx/keep_alive реально уйдут в wire (особенно num_ctx, который молчаливо
+     * режется server-default ~4096 без явного задания). Cloud-провайдеры эту строку не показывают
+     * (defaults — Ollama-специфичный слой).
      */
     private suspend fun printBanner(session: AgentSession, chatId: String) {
         val invariantsLabel = if (invariantsEnabled) "ON" else "OFF"
@@ -359,11 +407,16 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         val modeLabel = (session.agent.getWorkingMemory()?.interactionMode ?: InteractionMode.PLAN).name.lowercase()
         val mcpLabel = if (session.mcpServerCount == 0) "OFF" else "${session.mcpServerCount} server(s)"
         val ragLabel = if (session.agent.isRagEnabled()) "ON" else "OFF"
+        val defaultsSuffix = if (session.resolvedProvider == com.cliagent.llm.LlmProvider.OLLAMA) {
+            " | Defaults: ${com.cliagent.llm.ModelDefaultsRegistry.forModel(session.model).formatCompact()}"
+        } else {
+            ""
+        }
         AppTerminal.println(
             "CLI Agent v0.9 | Chat: $chatId | Provider: ${session.resolvedProvider.id} | Model: ${session.model} | " +
                 "Context: ${session.contextManager.getStrategy().getName()} | MCP: $mcpLabel | RAG: $ragLabel | " +
                 "MaxToolRounds: ${session.maxToolRounds} | Compress: $compressLabel | Invariants: $invariantsLabel | " +
-                "Swarm: $swarmLabel | Mode: $modeLabel"
+                "Swarm: $swarmLabel | Mode: $modeLabel$defaultsSuffix"
         )
     }
 
@@ -387,8 +440,15 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
      * [buildSession] из config.stream + resolvedProvider (auto → только Ollama; cloud быстрый, MVP
      * не стримит). Пересчитывается на `/local` switch (сессия пересоздаётся, поле обновляется).
      * Streaming применяется только в [dispatchFreeText] для свободного чата (без активной задачи).
+     *
+     * День 31 (raw-режим): [streamRawOnly]=true когда config.stream="raw" → streamFinalize вызывается
+     * с rawOnly=true (без markdown-дублирования). Убирает двойной вывод (raw + markdown) для длинных
+     * ответов локальных thinking-моделей. streamEnabled при этом true (стриминг активен).
      */
     private var streamEnabled: Boolean = false
+
+    /** День 31: config.stream="raw" → streamFinalize без markdown-рендера (только progressive-токены). */
+    private var streamRawOnly: Boolean = false
 
     /**
      * День 26: обработчик `/local` — live-switch cloud ↔ локальная Ollama без рестарта REPL.
@@ -533,18 +593,27 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
 
     /** `/local smoke` — прямой прогон 3 промптов через client.chat (без агента/history). */
     private suspend fun runLocalSmoke(session: AgentSession) {
-        // Переиспользуем session.client если уже local, иначе временный client на localhost:11434/v1.
-        val client = if (session.resolvedProvider == com.cliagent.llm.LlmProvider.OLLAMA) {
-            session.client
+        // Переиспользуем session.client если уже local, иначе временный client через factory (день 31:
+        // provider=ollama → OllamaNativeClient на native base, без /v1). Закрываем временный в finally.
+        val (client, ownsClient) = if (session.resolvedProvider == com.cliagent.llm.LlmProvider.OLLAMA) {
+            session.client to false
         } else {
-            com.cliagent.llm.OpenAiCompatibleClient(
-                baseUrl = "http://localhost:11434/v1",
-                apiKey = "",
-            )
+            LlmClientFactory.create(
+                com.cliagent.config.AppConfig(
+                    provider = "ollama",
+                    baseUrl = "http://localhost:11434/v1",
+                    model = "qwen3:14b",
+                    apiKey = "",
+                )
+            ) to true
         }
         val model = if (session.resolvedProvider == com.cliagent.llm.LlmProvider.OLLAMA) session.model else "qwen3:14b"
-        AppTerminal.println("🧪 Smoke test: model=$model, baseUrl=http://localhost:11434/v1")
-        LocalSmoke.runSmoke(client, model)
+        AppTerminal.println("🧪 Smoke test: model=$model, baseUrl=http://localhost:11434")
+        try {
+            LocalSmoke.runSmoke(client, model)
+        } finally {
+            if (ownsClient) runCatching { (client as? AutoCloseable)?.close() }
+        }
     }
 
     /**
@@ -581,8 +650,8 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
      * latency (скорость), keyword coverage + citation (качество), errors (стабильность).
      *
      * Источники клиентов:
-     *  - local: session.client если provider=OLLAMA, иначе временный OpenAiCompatibleClient на
-     *    http://localhost:11434/v1 с model=qwen3:14b (паттерн [runLocalSmoke]).
+     *  - local: session.client если provider=OLLAMA, иначе временный клиент через [LlmClientFactory.create]
+     *    с provider=ollama (день 31 → OllamaNativeClient на native base) с model=qwen3:14b (паттерн [runLocalSmoke]).
      *  - cloud: [savedCloudConfig] (cloud-config до `/local on`) если есть, иначе session.config
      *    если текущий провайдер — cloud; пытаемся [LlmClientFactory.create], при отсутствии API key
      *    → cloudClient=null (local-only режим).
@@ -622,13 +691,19 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             checker.close()
         }
 
-        // 3) localClient: session.client если уже local, иначе временный на localhost:11434/v1.
+        // 3) localClient: session.client если уже local, иначе временный через factory (день 31:
+        // provider=ollama → OllamaNativeClient). Временный закрывается в finally блока runCompare-call.
+        val ownsLocalClient = session.resolvedProvider != com.cliagent.llm.LlmProvider.OLLAMA
         val localClient = if (session.resolvedProvider == com.cliagent.llm.LlmProvider.OLLAMA) {
             session.client
         } else {
-            com.cliagent.llm.OpenAiCompatibleClient(
-                baseUrl = "http://localhost:11434/v1",
-                apiKey = "",
+            LlmClientFactory.create(
+                com.cliagent.config.AppConfig(
+                    provider = "ollama",
+                    baseUrl = "http://localhost:11434/v1",
+                    model = "qwen3:14b",
+                    apiKey = "",
+                )
             )
         }
         val localModel = if (session.resolvedProvider == com.cliagent.llm.LlmProvider.OLLAMA) {
@@ -656,16 +731,31 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         }
         val cloudModel = cloudConfig?.model
 
-        // 5) Прогон через harness (печать per-question + сводной таблицы внутри runCompare).
-        AppTerminal.withSpinner("RAG compare-local…") {
-            LocalRagCompare.runCompare(
-                questions = questions,
-                retriever = session.ragRetriever,
-                localClient = localClient,
-                localModel = localModel,
-                cloudClient = cloudClient,
-                cloudModel = cloudModel,
-            )
+        // 5) День 31: OllamaBenchClient для метрик tokens/sec + VRAM (только OLLAMA — native base).
+        //    nativeBase уже вычислен выше (effectiveBase для health-check). Закрывается в finally.
+        val benchClient = if (session.resolvedProvider == com.cliagent.llm.LlmProvider.OLLAMA) {
+            com.cliagent.llm.OllamaBenchClient(baseUrl = effectiveBase)
+        } else {
+            null
+        }
+
+        // 6) Прогон через harness (печать per-question + сводной таблицы внутри runCompare).
+        // Закрываем временный localClient (если создавали) и benchClient в finally.
+        try {
+            AppTerminal.withSpinner("RAG compare-local…") {
+                LocalRagCompare.runCompare(
+                    questions = questions,
+                    retriever = session.ragRetriever,
+                    localClient = localClient,
+                    localModel = localModel,
+                    cloudClient = cloudClient,
+                    cloudModel = cloudModel,
+                    benchClient = benchClient,
+                )
+            }
+        } finally {
+            if (ownsLocalClient) runCatching { (localClient as? AutoCloseable)?.close() }
+            benchClient?.close()
         }
     }
 
@@ -780,7 +870,9 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             if (sawReasoning) {
                 AppTerminal.println()   // закрываем reasoning-блок перед финальным ответом
             }
-            AppTerminal.streamFinalize(fullContent)
+            // День 31: rawOnly при config.stream="raw" → streamFinalize без markdown-дублирования
+            // (progressive-токены уже напечатаны, финальный markdown-рендер пропускается).
+            AppTerminal.streamFinalize(fullContent, rawOnly = streamRawOnly)
             val elapsedMillis = (System.nanoTime() - start) / 1_000_000
             AppTerminal.printDuration(elapsedMillis)
             return fullContent

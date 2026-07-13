@@ -75,14 +75,28 @@ class LlmClientFactoryTest {
     // ── LlmClientFactory.create ───────────────────────────────────────────────
 
     @Test
-    fun `create with ollama provider does not require api key`() {
+    fun `create with ollama provider returns OllamaNativeClient without api key`() {
         val config = AppConfig(
             baseUrl = "http://localhost:11434/v1",
             provider = "ollama",
             apiKey = ""
         )
         val client = LlmClientFactory.create(config)
-        // День 25: все провайдеры пока → OpenAiCompatibleClient (Ollama говорит на OpenAI-compat).
+        // День 31: OLLAMA → OllamaNativeClient (native /api/chat, options/keep_alive/think).
+        assertInstanceOf(OllamaNativeClient::class.java, client)
+        // Native base (без /v1) — закрываем HttpClient после проверки.
+        (client as AutoCloseable).close()
+    }
+
+    @Test
+    fun `create with zai provider returns OpenAiCompatibleClient`() {
+        val config = AppConfig(
+            provider = "zai",
+            apiKey = "key",
+            baseUrl = "https://api.z.ai/api/coding/paas/v4"
+        )
+        val client = LlmClientFactory.create(config)
+        // День 31: ZAI/OPENAI_COMPATIBLE → OpenAiCompatibleClient (OpenAI-compat wire).
         assertInstanceOf(OpenAiCompatibleClient::class.java, client)
     }
 

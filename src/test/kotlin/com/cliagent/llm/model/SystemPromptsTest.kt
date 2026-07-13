@@ -57,4 +57,86 @@ class SystemPromptsTest {
         val content = SystemPrompts.default.content
         assertTrue(content.length < 100, "default system prompt must stay short")
     }
+
+    // ── День 31 (cleanup): localRagCompare — единый промпт для /rag compare-local ─
+
+    @Test
+    fun `localRagCompare prompt is non-blank`() {
+        val content = SystemPrompts.localRagCompare.content
+        assertTrue(content.isNotBlank(), "localRagCompare must be a non-empty prompt")
+    }
+
+    @Test
+    fun `localRagCompare enforces answer only from context and source naming`() {
+        // Объединённые требования из localRag: ONLY from context + source naming.
+        val content = SystemPrompts.localRagCompare.content.lowercase()
+        assertTrue(content.contains("retrieved context") || content.contains("context"),
+            "localRagCompare must reference context")
+        assertTrue(content.contains("only") || content.contains("do not invent"),
+            "localRagCompare must enforce answering only from context")
+        assertTrue(content.contains("source"), "localRagCompare must require naming source")
+    }
+
+    @Test
+    fun `localRagCompare includes format markers Answer Sources Citations`() {
+        // Из бывшего DEFAULT: формат ответа (Answer/Sources/Citations) — даёт CitationDetector шанс.
+        val content = SystemPrompts.localRagCompare.content
+        assertTrue(content.contains("Answer"), "localRagCompare must have Answer format marker")
+        assertTrue(content.contains("Sources"), "localRagCompare must have Sources format marker")
+        assertTrue(content.contains("Citations"), "localRagCompare must have Citations format marker")
+    }
+
+    @Test
+    fun `localRagCompare includes не знаю fallback and concise constraint`() {
+        // Из localRag: «не знаю» + concise (анти-галлюцинации + длина для 14B).
+        val content = SystemPrompts.localRagCompare.content.lowercase()
+        assertTrue(content.contains("не знаю") || content.contains("don't know"),
+            "localRagCompare must include не знаю fallback")
+        assertTrue(content.contains("concise") || content.contains("word"),
+            "localRagCompare must limit response length")
+    }
+
+    // ── День 30: motivator — веб-агент «Мотиватор» (локальная qwen2.5:7b) ─
+
+    @Test
+    fun `motivator prompt is non-blank and in russian`() {
+        val content = SystemPrompts.motivator.content
+        assertTrue(content.isNotBlank(), "motivator must be a non-empty prompt")
+        // Основной язык — русский: ключевые слова инструкции присутствуют.
+        assertTrue(content.contains("Мотиватор") || content.contains("мотив"),
+            "motivator must reference motivation in Russian")
+    }
+
+    @Test
+    fun `motivator acknowledges partial progress`() {
+        // Ключевая задача агента: признавать частично сделанное (прогресс важнее идеала).
+        val content = SystemPrompts.motivator.content.lowercase()
+        assertTrue(content.contains("част") || content.contains("прогресс"),
+            "motivator must acknowledge partial progress")
+    }
+
+    @Test
+    fun `motivator references user-specific facts not invented`() {
+        // Анти-галлюцинация: модель должна опираться на конкретику сообщения, не выдумывать.
+        val content = SystemPrompts.motivator.content.lowercase()
+        assertTrue(content.contains("конкрет") || content.contains("сообщения пользователя"),
+            "motivator must ground response in user's specifics")
+        assertTrue(content.contains("не выдумывай") || content.contains("do not invent"),
+            "motivator must prohibit inventing facts")
+    }
+
+    @Test
+    fun `motivator limits response length for 7b model`() {
+        // 7B многословна на CPU → явный лимит (2–5 предложений) помогает скорости и качеству.
+        val content = SystemPrompts.motivator.content.lowercase()
+        assertTrue(content.contains("2") && content.contains("5") && content.contains("предложени"),
+            "motivator must limit response to 2-5 sentences for the 7B model")
+    }
+
+    @Test
+    fun `motivator is concise for small context window`() {
+        // Окно контекста = 5 сообщений (SlidingWindowStrategy), промпт должен быть лаконичным.
+        val len = SystemPrompts.motivator.content.length
+        assertTrue(len < 1200, "motivator should be concise (< 1200 chars) for sliding-window 5, got $len")
+    }
 }

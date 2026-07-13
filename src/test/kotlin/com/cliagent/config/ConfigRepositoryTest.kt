@@ -3,6 +3,8 @@ package com.cliagent.config
 import com.cliagent.mcp.McpServerConfig
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotNull
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
@@ -329,5 +331,63 @@ class ConfigRepositoryTest {
         // CLI_AGENT_STREAM не тестируем здесь — env process-global, как для provider).
         val cfg = repo(configJson = """{"apiKey":"k","stream":"true"}""").load()
         assertEquals("true", cfg.stream)
+    }
+
+    @Test
+    fun `stream raw value round-trips and loads (день 31 raw-mode)`() {
+        // День 31: config.stream="raw" — streaming без markdown-дублирования. Проверяем schema
+        // evolution: значение принимается из config.json и round-trip'ит через save/load (как
+        // "true"/"false"). Поведенческий разбор (streamEnabled/streamRawOnly) — в ChatCommand.
+        val r = repo()
+        r.save(AppConfig(apiKey = "k", stream = "raw"))
+        assertEquals("raw", r.loadConfigFile().stream)
+        val cfg = repo(configJson = """{"apiKey":"k","stream":"raw"}""").load()
+        assertEquals("raw", cfg.stream)
+    }
+
+    // ── День 31: sampling/ollama blocks + schema evolution ──────────────────────
+
+    @Test
+    fun `sampling and ollama default to empty blocks when absent (schema evolution)`() {
+        // Старый config.json без sampling/ollama → default SamplingTunables()/OllamaTunables()
+        // (все поля null) — прежнее поведение дней 1–30, без ошибок парсинга (AGENTS.md).
+        val cfg = repo(configJson = """{"apiKey":"k"}""").load()
+        assertNotNull(cfg.sampling, "sampling block must default, not null")
+        assertNotNull(cfg.ollama, "ollama block must default, not null")
+        assertNull(cfg.sampling.temperature, "sampling.temperature default null")
+        assertNull(cfg.sampling.topK, "sampling.topK default null")
+        assertNull(cfg.ollama.keepAlive, "ollama.keepAlive default null")
+    }
+
+    @Test
+    fun `sampling values from config json load into AppConfig`() {
+        val json = """
+            {"apiKey":"k","sampling":{"temperature":0.5,"top_p":0.9,"top_k":40,"max_tokens":512,"seed":42}}
+        """.trimIndent()
+        val cfg = repo(configJson = json).load()
+        assertEquals(0.5, cfg.sampling.temperature)
+        assertEquals(0.9, cfg.sampling.topP)
+        assertEquals(40, cfg.sampling.topK)
+        assertEquals(512, cfg.sampling.maxTokens)
+        assertEquals(42L, cfg.sampling.seed)
+    }
+
+    @Test
+    fun `ollama values from config json load into AppConfig`() {
+        val json = """
+            {"apiKey":"k","ollama":{"keep_alive":"10m","think":true}}
+        """.trimIndent()
+        val cfg = repo(configJson = json).load()
+        assertEquals("10m", cfg.ollama.keepAlive)
+        assertEquals(true, cfg.ollama.think)
+    }
+
+    @Test
+    fun `sampling round-trips through save and load`() {
+        val r = repo()
+        r.save(AppConfig(apiKey = "k", sampling = SamplingTunables(temperature = 0.3, topK = 50)))
+        val loaded = r.loadConfigFile()
+        assertEquals(0.3, loaded.sampling.temperature)
+        assertEquals(50, loaded.sampling.topK)
     }
 }

@@ -1,6 +1,7 @@
 package com.cliagent.cli
 
 import com.cliagent.llm.LlmClient
+import com.cliagent.llm.OllamaBenchClient
 import com.cliagent.llm.model.StreamChunk
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
@@ -15,6 +16,13 @@ import com.cliagent.rag.RagChunk
 import com.cliagent.rag.RagIndex
 import com.cliagent.rag.RagRetriever
 import com.cliagent.rag.embedding.EmbeddingClient
+import io.ktor.client.HttpClient
+import io.ktor.client.engine.mock.MockEngine
+import io.ktor.client.engine.mock.respond
+import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.http.HttpHeaders
+import io.ktor.http.headersOf
+import io.ktor.serialization.kotlinx.json.json
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
@@ -241,6 +249,55 @@ class LocalRagCompareTest {
         assertTrue(results[0].local.sourcesPresent, "source basename must be detected")
     }
 
+    @Test
+    fun `runCompare with benchClient populates local tokensPerSec and vramMb, cloud stays null`() = runTest {
+        // День 31: benchClient-stub снимает VRAM (один раз) + tokens/sec (per local question).
+        val retriever = buildRetriever()
+        val local = ScriptedClient(listOf("32 batch", "FNV"))
+        val cloud = ScriptedClient(listOf("32", "FNV"))
+        val bench = benchClientStub()   // VRAM=2000MB, tps=50.0
+        val results = LocalRagCompare.runCompare(
+            questions = sampleQuestions,
+            retriever = retriever,
+            localClient = local,
+            localModel = "qwen3:14b",
+            cloudClient = cloud,
+            cloudModel = "glm-5.1",
+            benchClient = bench,
+        )
+        bench.close()
+        // LOCAL: оба вопроса имеют vramMb (snapshot) + tokensPerSec (per-question measure).
+        results.forEach { r ->
+            assertNotNull(r.local.vramMb, "local vramMb must be populated by benchClient snapshot")
+            assertEquals(2000L, r.local.vramMb)
+            assertNotNull(r.local.tokensPerSec, "local tokensPerSec must be populated by benchClient measure")
+            assertEquals(50.0, r.local.tokensPerSec!!, 0.001)
+            // CLOUD: VRAM/tps не применимы (черезput cloud зависит от сети) → null.
+            assertNull(r.cloud?.vramMb, "cloud vramMb must be null (not applicable)")
+            assertNull(r.cloud?.tokensPerSec, "cloud tokensPerSec must be null (not applicable)")
+        }
+    }
+
+    @Test
+    fun `runCompare without benchClient keeps tokensPerSec and vramMb null (backward-compat)`() = runTest {
+        // День 31: benchClient=null (default) → метрики отсутствуют, поведение дней 28–30 сохранено.
+        val retriever = buildRetriever()
+        val local = ScriptedClient(listOf("32 batch", "FNV"))
+        val results = LocalRagCompare.runCompare(
+            questions = sampleQuestions,
+            retriever = retriever,
+            localClient = local,
+            localModel = "qwen3:14b",
+            cloudClient = null,
+            cloudModel = null,
+            // benchClient default null.
+        )
+        results.forEach {
+            assertNull(it.local.tokensPerSec, "no benchClient → tokensPerSec null (backward-compat)")
+            assertNull(it.local.vramMb, "no benchClient → vramMb null (backward-compat)")
+        }
+    }
+
     // ── test fixtures ──────────────────────────────────────────────────────────
 
     /** RagRetriever с stub-embedder'ом (фиксированный вектор) и temp-индексом (2 чанка). */
@@ -343,5 +400,33 @@ class LocalRagCompareTest {
         override fun chatStream(request: ChatRequest): kotlinx.coroutines.flow.Flow<com.cliagent.llm.model.StreamChunk> = flow {
             throw kotlinx.coroutines.CancellationException("cancelled")
         }
+    }
+
+    /**
+     * День 31: OllamaBenchClient-stub через MockEngine. Различает запросы по URL: /api/ps → VRAM
+     * (2000MB), /api/chat → tokens/sec (eval_count=100, eval_duration=2s → 50 tok/s). Тесты без
+     * реальной Ollama; close() в caller'е освобождает HttpClient.
+     */
+    private fun benchClientStub(): OllamaBenchClient {
+        val mockEngine = MockEngine { requestData ->
+            val body = when {
+                requestData.url.encodedPath.contains("/api/ps") ->
+                    """{"models":[{"name":"qwen3:14b","size_vram":2097152000}]}"""
+                requestData.url.encodedPath.contains("/api/chat") ->
+                    """{"model":"qwen3:14b","eval_count":100,"eval_duration":2000000000,"done":true}"""
+                else -> """{}"""
+            }
+            respond(body, io.ktor.http.HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, "application/json"))
+        }
+        return OllamaBenchClient(
+            baseUrl = "http://localhost:11434",
+            http = HttpClient(mockEngine) {
+                install(ContentNegotiation) {
+                    json(kotlinx.serialization.json.Json {
+                        ignoreUnknownKeys = true; explicitNulls = false; coerceInputValues = true
+                    })
+                }
+            },
+        )
     }
 }

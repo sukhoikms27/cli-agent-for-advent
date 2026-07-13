@@ -2,8 +2,10 @@ package com.cliagent.cli
 
 import com.cliagent.llm.LlmClient
 import com.cliagent.llm.LlmResult
+import com.cliagent.llm.OllamaBenchClient
 import com.cliagent.llm.model.ChatMessage
 import com.cliagent.llm.model.ChatRequest
+import com.cliagent.llm.model.SystemPrompts
 import com.cliagent.rag.CitationDetector
 import com.cliagent.rag.RagRetriever
 import com.cliagent.rag.ScoredChunk
@@ -70,6 +72,18 @@ object LocalRagCompare {
         val length: Int,
         /** true если [answer] начинается с "ERROR" (LlmResult.Error или throwable). */
         val isError: Boolean,
+        /**
+         * День 31: tokens/sec (throughput generation). Снимается [OllamaBenchClient.measureTokensPerSec]
+         * только для local (через benchClient); cloud=null (черезput cloud-провайдеров зависит от сети,
+         * не сопоставим с локальной генерацией). null если benchClient=null или замер не удался.
+         */
+        val tokensPerSec: Double? = null,
+        /**
+         * День 31: VRAM-использование модели в MB. Снимается ОДИН раз перед циклом вопросов
+         * ([OllamaBenchClient.snapshotVram]); одинаковое для всех local-вопросов (модель загружена).
+         * null для cloud или если benchClient=null/замер не удался.
+         */
+        val vramMb: Long? = null,
     )
 
     /**
@@ -107,13 +121,32 @@ object LocalRagCompare {
         localModel: String,
         cloudClient: LlmClient?,
         cloudModel: String?,
-        systemPrompt: String = DEFAULT_RAG_SYSTEM_PROMPT,
+        systemPrompt: String = SystemPrompts.localRagCompare.content,
+        /**
+         * День 31: Ollama benchmarking-клиент для метрик tokens/sec и VRAM. null = backward-compat
+         * (без метрик; поведение дней 28–30). Передаётся из [com.cliagent.cli.ChatCommand.handleCompareLocal]
+         * только при resolvedProvider==OLLAMA (native base).
+         */
+        benchClient: OllamaBenchClient? = null,
     ): List<CompareResult> {
         if (cloudClient == null) {
             AppTerminal.warn("Cloud недоступен (нет API key) — compare в local-only режиме.")
         } else {
             AppTerminal.println("📊 Local vs Cloud RAG compare: ${questions.size} questions × 2 models")
             AppTerminal.println("   local: $localModel  |  cloud: $cloudModel")
+        }
+
+        // День 31: VRAM-снапшот ОДИН раз перед циклом (модель уже загружена; не меняется между вопросами).
+        // null если benchClient=null или замер не удался — метрика просто отсутствует в отчёте.
+        val vramMb = try {
+            benchClient?.snapshotVram()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            null
+        }
+        if (vramMb != null) {
+            AppTerminal.println("   local VRAM: ${vramMb}MB (snapshot /api/ps)")
         }
 
         val results = mutableListOf<CompareResult>()
@@ -139,16 +172,30 @@ object LocalRagCompare {
 
             // LOCAL: maxTokens=2048 — фикс дня 26 (qwen3 thinking-модель тратит токены на <think>
             // ДО ответа; без явного max_tokens Ollama обрывает рано → content пустой).
-            val localMetrics = measure(localClient, localModel, prompt, q, hits, maxTokens = 2048)
+            // День 31: tokens/sec замер через benchClient (если есть) — отдельный короткий запрос, чтобы
+            // не зависеть от streaming-латентности основного прогона (честная throughput-метрика).
+            val localTps = try {
+                benchClient?.measureTokensPerSec(localModel, systemPrompt, prompt)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                null
+            }
+            val localMetrics = measure(
+                localClient, localModel, prompt, q, hits, maxTokens = 2048,
+                tokensPerSec = localTps, vramMb = vramMb,
+            )
             AppTerminal.println(
                 "  local: ${fmtLatency(localMetrics)}  kw ${localMetrics.keywordHits}/${localMetrics.keywordTotal}  " +
                     "src ${fmtFlag(localMetrics.sourcesPresent)}  cite ${fmtFlag(localMetrics.citationsPresent)}  " +
-                    "len ${localMetrics.length}"
+                    "len ${localMetrics.length}" + (if (localTps != null) "  tps ${fmtTps(localTps)}" else "")
             )
 
             val cloudMetrics = if (cloudClient != null) {
-                // Cloud может позволить больше токенов (или null — provider default).
-                measure(cloudClient, cloudModel ?: "cloud", prompt, q, hits, maxTokens = null).also { cm ->
+                // Cloud может позволить больше токенов (или null — provider default). VRAM/tps не применимы
+                // к cloud (черезput зависит от сети, не сопоставим с локальной генерацией).
+                measure(cloudClient, cloudModel ?: "cloud", prompt, q, hits, maxTokens = null,
+                    tokensPerSec = null, vramMb = null).also { cm ->
                     AppTerminal.println(
                         "  cloud: ${fmtLatency(cm)}  kw ${cm.keywordHits}/${cm.keywordTotal}  " +
                             "src ${fmtFlag(cm.sourcesPresent)}  cite ${fmtFlag(cm.citationsPresent)}  " +
@@ -188,10 +235,13 @@ object LocalRagCompare {
         q: CompareQuestion,
         hits: List<ScoredChunk>?,
         maxTokens: Int?,
+        /** День 31: throughput/VRAM метрики (только для local через benchClient; null для cloud). */
+        tokensPerSec: Double? = null,
+        vramMb: Long? = null,
     ): SideMetrics {
         val request = ChatRequest(
             model = model,
-            messages = listOf(ChatMessage(role = "system", content = DEFAULT_RAG_SYSTEM_PROMPT),
+            messages = listOf(ChatMessage(role = "system", content = SystemPrompts.localRagCompare.content),
                 ChatMessage(role = "user", content = prompt)),
             temperature = 0.0,
             maxTokens = maxTokens,
@@ -226,14 +276,14 @@ object LocalRagCompare {
             throw e
         } catch (e: Throwable) {
             val elapsed = System.currentTimeMillis() - start
-            return errorMetrics("ERROR: ${e.message}", elapsed, q, hits)
+            return errorMetrics("ERROR: ${e.message}", elapsed, q, hits, tokensPerSec, vramMb)
         }
         val elapsed = System.currentTimeMillis() - start
         return if (errorMsg != null) {
-            errorMetrics("ERROR: $errorMsg", elapsed, q, hits)
+            errorMetrics("ERROR: $errorMsg", elapsed, q, hits, tokensPerSec, vramMb)
         } else {
             val text = fullContent.toString().ifBlank { "(empty)" }
-            successMetrics(text, elapsed, finalUsage?.promptTokens ?: 0, finalUsage?.completionTokens ?: 0, q, hits)
+            successMetrics(text, elapsed, finalUsage?.promptTokens ?: 0, finalUsage?.completionTokens ?: 0, q, hits, tokensPerSec, vramMb)
         }
     }
 
@@ -245,6 +295,8 @@ object LocalRagCompare {
         completionTokens: Int,
         q: CompareQuestion,
         hits: List<ScoredChunk>?,
+        tokensPerSec: Double? = null,
+        vramMb: Long? = null,
     ): SideMetrics {
         val kwTotal = q.expectedKeywords.size
         val kwHits = q.expectedKeywords.count { kw -> answer.contains(kw, ignoreCase = true) }
@@ -260,15 +312,20 @@ object LocalRagCompare {
             citationsPresent = cite.citationsPresent,
             length = answer.length,
             isError = false,
+            tokensPerSec = tokensPerSec,
+            vramMb = vramMb,
         )
     }
 
-    /** Метрики для ошибочного ответа (throwable / LlmResult.Error). */
+    /** Метрики для ошибочного ответа (throwable / LlmResult.Error). tokensPerSec/vramMb сохраняются
+     *  даже при ошибке генерации — они о модели/окружении, не о конкретном ответе (день 31). */
     private fun errorMetrics(
         answer: String,
         latencyMs: Long,
         q: CompareQuestion,
         hits: List<ScoredChunk>?,
+        tokensPerSec: Double? = null,
+        vramMb: Long? = null,
     ): SideMetrics = SideMetrics(
         answer = answer,
         latencyMs = latencyMs,
@@ -280,6 +337,8 @@ object LocalRagCompare {
         citationsPresent = false,
         length = answer.length,
         isError = true,
+        tokensPerSec = tokensPerSec,
+        vramMb = vramMb,
     )
 
     // ── prompt building (по образцу PromptBuilder.renderRetrievedBlock дня 22/24) ─
@@ -322,7 +381,8 @@ object LocalRagCompare {
             val tbl = table {
                 header {
                     style(bold = true)
-                    row("Q", "L ms", "L kw", "L src", "C ms", "C kw", "C src", "Δkw")
+                    // День 31: добавлены L tps / L vram (cloud-аналогов нет — черезput cloud зависит от сети).
+                    row("Q", "L ms", "L kw", "L src", "L tps", "C ms", "C kw", "C src", "Δkw")
                 }
                 body {
                     results.forEach { r ->
@@ -335,6 +395,7 @@ object LocalRagCompare {
                             "${l.latencyMs}",
                             "${l.keywordHits}/${l.keywordTotal}",
                             if (l.sourcesPresent) "✓" else "✗",
+                            l.tokensPerSec?.let { fmtTps(it) } ?: "-",
                             "${c.latencyMs}",
                             "${c.keywordHits}/${c.keywordTotal}",
                             if (c.sourcesPresent) "✓" else "✗",
@@ -348,7 +409,7 @@ object LocalRagCompare {
             val tbl = table {
                 header {
                     style(bold = true)
-                    row("Q", "L ms", "L kw", "L src", "L cite", "L len")
+                    row("Q", "L ms", "L kw", "L src", "L cite", "L len", "L tps")
                 }
                 body {
                     results.forEach { r ->
@@ -360,6 +421,7 @@ object LocalRagCompare {
                             if (l.sourcesPresent) "✓" else "✗",
                             if (l.citationsPresent) "✓" else "✗",
                             "${l.length}",
+                            l.tokensPerSec?.let { fmtTps(it) } ?: "-",
                         )
                     }
                 }
@@ -376,6 +438,13 @@ object LocalRagCompare {
         val localErrors = results.count { it.local.isError }
         val localSrc = results.count { it.local.sourcesPresent }
         AppTerminal.println("LOCAL avg latency: ${localAvgMs}ms  |  kw $localKwHits/$localKwTotal  |  src $localSrc/$n  |  errors $localErrors/$n")
+        // День 31: VRAM (одинаков для всех local-вопросов — снапшот до цикла) и avg tokens/sec.
+        val vram = results.firstOrNull()?.local?.vramMb
+        if (vram != null) AppTerminal.println("LOCAL VRAM: ${vram}MB (snapshot /api/ps)")
+        val tpsValues = results.mapNotNull { it.local.tokensPerSec }
+        if (tpsValues.isNotEmpty()) {
+            AppTerminal.println("LOCAL avg throughput: ${fmtTps(tpsValues.average())} tok/s (over ${tpsValues.size} measurement(s))")
+        }
         if (hasCloud) {
             val cloudAvgMs = results.sumOf { it.cloud?.latencyMs ?: 0 } / n
             val cloudKwTotal = results.sumOf { it.cloud?.keywordTotal ?: 0 }
@@ -397,13 +466,6 @@ object LocalRagCompare {
 
     private fun fmtFlag(b: Boolean): String = if (b) "✓" else "✗"
 
-    /**
-     * Базовый RAG-системпромпт (fair: обе модели получают идентичную инструкцию). Требует источники
-     * и цитаты (анти-галлюцинации, день 24) — чтобы CitationDetector имел шанс сработать на ответе.
-     */
-    private const val DEFAULT_RAG_SYSTEM_PROMPT =
-        "You are a helpful assistant answering strictly from the provided [Retrieved context]. " +
-            "Do not invent facts. Format: 1) Answer, 2) Sources (list each source › section), " +
-            "3) Citations (verbatim fragments in «...» quotes). " +
-            "If the context does not contain the answer, say «не знаю»."
+    /** День 31: tokens/sec в compact-формате (1 decimal). null → "-" (метрика отсутствует). */
+    private fun fmtTps(tps: Double): String = String.format("%.1f", tps)
 }

@@ -7,11 +7,19 @@ import com.cliagent.config.AppConfig
  * хардкод `OpenAiCompatibleClient(...)` в [com.cliagent.cli.ChatCommand.run].
  *
  * Резолв провайдера: явный [AppConfig.provider] (env `CLI_AGENT_PROVIDER` override) → иначе
- * [LlmProvider.autoDetect] по [AppConfig.baseUrl]. Пока все провайдеры → [OpenAiCompatibleClient]
- * (Ollama говорит на OpenAI-compat `/v1/chat/completions`). Seam для будущих нативных клиентов.
+ * [LlmProvider.autoDetect] по [AppConfig.baseUrl].
+ *
+ * День 31: dispatch по провайдеру. OLLAMA → [OllamaNativeClient] (native `/api/chat`, `options`
+ * escape-hatch, `keep_alive`, `think`). ZAI/OPENAI_COMPATIBLE → [OpenAiCompatibleClient] (OpenAI-
+ * compatible `/chat/completions`). Native client даёт Ollama-специфичные фичи (keep_alive/think/
+ * options), недоступные в OpenAI-compat endpoint. Это единственная точка выбора провайдера — вне
+ * factory инстанцировать LlmClient-реализации нельзя (архитектурный инвариант).
  *
  * Проверка apiKey: для провайдеров с [LlmProvider.requiresApiKey]==true apiKey не должен быть
  * пустым — иначе бросаем IllegalStateException с подсказкой. Ollama — без auth, пустой apiKey OK.
+ *
+ * **Базовый URL:** config хранит OpenAI-compat base (`http://localhost:11434/v1`). Для OllamaNativeClient
+ * конвертируем в native base через [nativeBaseFrom] (`http://localhost:11434`, без `/v1`).
  */
 object LlmClientFactory {
 
@@ -26,12 +34,17 @@ object LlmClientFactory {
             )
         }
 
-        // День 25: пока все провайдеры используют OpenAI-compatible wire-формат.
-        // Когда появится нативный Anthropic/Gemini — dispatch по provider здесь.
-        return OpenAiCompatibleClient(
-            baseUrl = config.baseUrl,
-            apiKey = config.apiKey
-        )
+        // День 31: dispatch по провайдеру. Ollama — native client (options/keep_alive/think),
+        // cloud/generic — OpenAI-compatible wire-формат.
+        return when (provider) {
+            LlmProvider.OLLAMA -> OllamaNativeClient(
+                baseUrl = nativeBaseFrom(config.baseUrl),
+            )
+            LlmProvider.ZAI, LlmProvider.OPENAI_COMPATIBLE -> OpenAiCompatibleClient(
+                baseUrl = config.baseUrl,
+                apiKey = config.apiKey,
+            )
+        }
     }
 
     /** Резолв провайдера для отображения в UI/баннере. */

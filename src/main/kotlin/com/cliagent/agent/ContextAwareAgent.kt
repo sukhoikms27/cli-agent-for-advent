@@ -55,6 +55,20 @@ class ContextAwareAgent(
      * CLI `--temperature` прокидывается сюда; классификаторы/экстракторы остаются на `0.0` (детерминизм).
      */
     private val temperature: Double? = null,
+    /**
+     * День 31: cross-provider sampling-параметры основного цикла. Все nullable, default `null`
+     * (провайдерский дефолт в wire) — backward-compat с днями 1–30 (агент не отправлял их). CLI-флаги
+     * (`--top-p`, `--top-k`, `--seed`, `--stop`, `--frequency-penalty`, `--presence-penalty`) прокидываются
+     * сюда из [ChatCommand.buildSession] с priority CLI > config.sampling > null. Пробрасываются в обе
+     * точки сборки [ChatRequest] ([chatStreamed], [runToolLoop]). Классификаторы/экстракторы остаются
+     * без них (детерминизм на их собственных вызовах через StageAgent/IntentClassifier).
+     */
+    private val topP: Double? = null,
+    private val topK: Int? = null,
+    private val seed: Long? = null,
+    private val stop: List<String>? = null,
+    private val frequencyPenalty: Double? = null,
+    private val presencePenalty: Double? = null,
     private val contextLimit: Int = 128000,
     private val historyCompressor: HistoryCompressor? = null,
     private val contextManager: ContextManager? = null,
@@ -328,6 +342,13 @@ class ContextAwareAgent(
             model = model,
             messages = messagesToSend,
             temperature = temperature,
+            // День 31: cross-provider sampling (CLI > config > null).
+            topP = topP,
+            topK = topK,
+            seed = seed,
+            stop = stop,
+            frequencyPenalty = frequencyPenalty,
+            presencePenalty = presencePenalty,
             maxTokens = OutputBudget.maxTokensFor(model, estimatedTokens),
             stream = true,
         )
@@ -393,6 +414,13 @@ class ContextAwareAgent(
                 model = model,
                 messages = scratch.toList(),
                 temperature = temperature,
+                // День 31: cross-provider sampling (CLI > config > null).
+                topP = topP,
+                topK = topK,
+                seed = seed,
+                stop = stop,
+                frequencyPenalty = frequencyPenalty,
+                presencePenalty = presencePenalty,
                 maxTokens = maxTokens,
                 tools = tools,
                 toolChoice = tools?.let { "auto" },

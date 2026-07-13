@@ -43,6 +43,22 @@ data class AppConfig(
      */
     val rag: RagConfig = RagConfig(),
     /**
+     * День 31: sampling-параметры LLM основного цикла (cross-provider: temperature, top_p, top_k,
+     * max_tokens, seed, stop, penalties, + Ollama escape-hatch ollamaOptions/keepAlive/think).
+     * Default `SamplingTunables()` → все поля null → прежнее поведение дней 1–30 (провайдерские
+     * дефолты wire). **Schema evolution**: старые config.json без поля `sampling` грузятся без
+     * ошибок (AGENTS.md — nullable + default). env override `CLI_AGENT_SAMPLING_*` в [ConfigRepository];
+     * per-invocation CLI-флаги (`--top-p`, `--top-k`, …) перекрывают в [ChatCommand.buildSession].
+     */
+    val sampling: SamplingTunables = SamplingTunables(),
+    /**
+     * День 31: Ollama-специфичные настройки (keep_alive, think, native options). Применяются только
+     * [com.cliagent.llm.OllamaNativeClient]; для cloud-провайдеров игнорируются. Default
+     * `OllamaTunables()` → все поля null → Ollama-дефолты wire. **Schema evolution**: старые
+     * config.json без поля `ollama` грузятся без ошибок.
+     */
+    val ollama: OllamaTunables = OllamaTunables(),
+    /**
      * День 30 (streaming SSE): режим серверного стриминга ответа. Решает проблему thinking-моделей
      * (qwen3:14b: 40-90с «пустоты» до первого токена) — токены идут по мере генерации, пользователь
      * видит контент сразу.

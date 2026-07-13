@@ -106,6 +106,19 @@ class ConfigRepository(
             )
         }
 
+        // 6. День 31: sampling env override (симметрично rag-блоку). config.json как base; env пере-
+        //    бивает одиночные скалярные поля (для CI/experiments без правки config.json). ollamaOptions
+        //    (Map) через env НЕ задаётся — только через config.json (как mcp/corpusRoots).
+        val sampling = fileConfig.sampling.let { base ->
+            base.copy(
+                temperature = System.getenv("CLI_AGENT_SAMPLING_TEMPERATURE")?.toDoubleOrNull() ?: base.temperature,
+                topP = System.getenv("CLI_AGENT_SAMPLING_TOP_P")?.toDoubleOrNull() ?: base.topP,
+                topK = System.getenv("CLI_AGENT_SAMPLING_TOP_K")?.toIntOrNull() ?: base.topK,
+                seed = System.getenv("CLI_AGENT_SAMPLING_SEED")?.toLongOrNull() ?: base.seed,
+                maxTokens = System.getenv("CLI_AGENT_SAMPLING_MAX_TOKENS")?.toIntOrNull() ?: base.maxTokens,
+            )
+        }
+
         return AppConfig(
             apiKey = apiKey,
             model = model,
@@ -114,6 +127,10 @@ class ConfigRepository(
             maxToolRounds = maxToolRounds,
             mcp = mcpServers,
             rag = rag,
+            // День 31: sampling (config.json base + env override выше) и ollama (config.json as-is;
+            // env override для native options не предусмотрен — Map через env не задать).
+            sampling = sampling,
+            ollama = fileConfig.ollama,
             // День 30 (streaming SSE): env CLI_AGENT_STREAM > config.json > default "auto".
             // Паттерн симметричен CLI_AGENT_PROVIDER (env override одиночного строкового поля).
             stream = System.getenv("CLI_AGENT_STREAM")
