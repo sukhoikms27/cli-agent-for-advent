@@ -224,6 +224,7 @@ Per-model лимиты (`ModelLimitsRegistry`) кормят `OutputBudget`: ло
 | Context strategies, HistoryCompressor | `plan/extensions/arch-issues.md`, `oop-issues.md` |
 | Любой bug / known issue | `plan/extensions/bugs.md`, `critical-issues.md` |
 | File operations / tools | `plan/extensions/file-operations-design.md` |
+| RAG retrieval (шум/коллизии/мультиязычность) | `plan/extensions/rag-noisy-corpus.md` |
 | Multi-provider LLM (`LlmClientFactory`) | раздел LLM API Details выше + `llm/ModelLimits.kt` |
 | Kotlin CLI-паттерны (JLine3/mordant/корутины/JSON/ошибки/clikt) | workspace-skill `.zcode/skills/kotlin-cli-patterns/` (+ `references/*.md`) |
 | Хронологию решений по дню N | `plan/finisheddays/day-N/README.md`, `swarm-report/day-N-*.md` |
