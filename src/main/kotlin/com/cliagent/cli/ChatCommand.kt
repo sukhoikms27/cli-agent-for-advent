@@ -144,6 +144,8 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         val ragEmbedder = com.cliagent.rag.embedding.OllamaEmbeddingClient(
             baseUrl = config.rag.embeddingBaseUrl,
             model = config.rag.embeddingModel,
+            bearerToken = config.rag.embeddingToken.ifBlank { null },
+            batchSize = config.rag.embeddingBatchSize,
         )
 
         // День 26: сессия собрана через buildSession (вынесено из run() для /local live-switch).

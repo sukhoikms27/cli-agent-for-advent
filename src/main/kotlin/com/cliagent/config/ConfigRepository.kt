@@ -95,6 +95,11 @@ class ConfigRepository(
                 embeddingProvider = System.getenv("CLI_AGENT_RAG_PROVIDER") ?: base.embeddingProvider,
                 embeddingModel = System.getenv("CLI_AGENT_RAG_EMBEDDING_MODEL") ?: base.embeddingModel,
                 embeddingBaseUrl = System.getenv("CLI_AGENT_RAG_EMBEDDING_URL") ?: base.embeddingBaseUrl,
+                // День 32: bearer-токен для remote embedding через Caddy reverse-proxy (CI RAG).
+                embeddingToken = System.getenv("CLI_AGENT_RAG_EMBEDDING_TOKEN") ?: base.embeddingToken,
+                // День 32: batch override для remote CPU-only embedding (меньше batch = быстрее запрос).
+                embeddingBatchSize = System.getenv("CLI_AGENT_RAG_EMBEDDING_BATCH")?.toIntOrNull()
+                    ?: base.embeddingBatchSize,
                 chunkSizeTokens = System.getenv("CLI_AGENT_RAG_CHUNK_SIZE")?.toIntOrNull() ?: base.chunkSizeTokens,
                 chunkOverlapTokens = System.getenv("CLI_AGENT_RAG_CHUNK_OVERLAP")?.toIntOrNull() ?: base.chunkOverlapTokens,
                 // День 24: порог анти-галлюцинации («не знаю» при слабом контексте). 0.0 = выключено.

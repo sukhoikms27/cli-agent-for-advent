@@ -127,6 +127,19 @@ data class RagConfig(
     val embeddingModel: String = "nomic-embed-text",
     val embeddingBaseUrl: String = "http://localhost:11434",
     /**
+     * День 32 (remote RAG для CI): bearer-токен для embedding endpoint через reverse-proxy (Caddy
+     * на VPS). null/blank = без auth (localhost). В CI GitHub — env `CLI_AGENT_RAG_EMBEDDING_TOKEN`.
+     * Schema evolution: default "" — старые config.json грузятся без правок.
+     */
+    val embeddingToken: String = "",
+    /**
+     * День 32: размер batch для OllamaEmbeddingClient. Default 32 (быстро на GPU/local). Для
+     * remote CPU-only embedding (CI → VPS Ollama) каждый запрос идёт долго (до 2 мин на batch=32
+     * на CPU), плюс Caddy/reverse-proxy timeout. Меньший batch (8-16) делает каждый запрос быстрее
+     * → меньше шансов на timeout. Env override: CLI_AGENT_RAG_EMBEDDING_BATCH.
+     */
+    val embeddingBatchSize: Int = 32,
+    /**
      * День 24: расширение корпуса. Раньше только `plan`/`docs`/`README.md` → `AGENTS.md` и исходный
      * код НЕ индексировались, но 7/10 eval-вопросов ссылались на `AGENTS.md` (невалидно). Добавлены
      * `AGENTS.md` и `src/main/kotlin` — теперь `.kt`-исходники и сводный контекстный документ попадают
