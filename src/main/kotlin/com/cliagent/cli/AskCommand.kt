@@ -7,9 +7,7 @@ import com.cliagent.llm.model.ChatMessage
 import com.cliagent.llm.model.ChatRequest
 import com.cliagent.llm.model.SystemPrompts
 import com.cliagent.rag.JsonRagStore
-import com.cliagent.rag.RagRetriever
 import com.cliagent.rag.embedding.OllamaEmbeddingClient
-import com.cliagent.rag.topK
 import com.github.ajalt.clikt.core.CliktCommand
 import com.github.ajalt.clikt.parameters.arguments.argument
 import com.github.ajalt.clikt.parameters.arguments.help
@@ -79,9 +77,10 @@ class AskCommand : CliktCommand(
         // 1. Git-контекст (read-only): текущая ветка + короткий status.
         val gitContext = buildGitContext(root)
 
-        // 2. RAG retrieval (мягкая деградация при ошибке).
+        // 2. RAG retrieval (мягкая деградация при ошибке). client нужен для DevAssistantQueryRewriter
+        //    (перевод запроса на английский для embedding-модели nomic-embed-text).
         val ragBlock = if (!noRag) {
-            retrieveRag(config, root, topK ?: config.rag.topK)
+            retrieveRag(config, client, model, root, topK ?: config.rag.topK)
         } else {
             null
         }
@@ -145,12 +144,19 @@ class AskCommand : CliktCommand(
     }
 
     /**
-     * RAG-retrieval: создаёт embedder (Ollama), достаёт top-K чанков для вопроса. Возвращает
-     * форматированный блок `[Retrieved context]` или null при ошибке (Ollama недоступна / пустой
-     * индекс / флаг [noRag]). Embedder закрывается в finally.
+     * RAG-retrieval: создаёт embedder (Ollama) + [RagRetriever] с [DevAssistantQueryRewriter],
+     * достаёт top-K чанков для вопроса. Возвращает форматированный блок `[Retrieved context]` или
+     * null при ошибке (Ollama недоступна / пустой индекс / флаг [noRag]). Embedder закрывается в finally.
+     *
+     * **Rewriter (день 31 fix):** [DevAssistantQueryRewriter] переводит запрос на английский перед
+     * эмбеддингом. Это критично: `nomic-embed-text` англоязычная, русский «технический стек» слабо
+     * матчит английскую таблицу `## Tech Stack`. Перевод поднимает полноту retrieval'а для
+     * мультиязычных запросов. LLM-клиент для перевода — тот же, что и для основного ответа.
      */
     private suspend fun retrieveRag(
         config: com.cliagent.config.AppConfig,
+        client: com.cliagent.llm.LlmClient,
+        model: String,
         root: File,
         topK: Int,
     ): String? {
@@ -170,14 +176,17 @@ class AskCommand : CliktCommand(
                 AppTerminal.warn("RAG-индекс пуст после индексации. Ответ без контекста документации.")
                 return null
             }
-            // Прямой topK без full RagRetriever (stateless one-shot, без rewriter/reranker).
-            val result = embedder.embed(listOf(question))
-            val qVec = when (result) {
-                is com.cliagent.llm.LlmResult.Error -> return null
-                is com.cliagent.llm.LlmResult.Success -> result.data.firstOrNull() ?: return null
-            }
-            val hits = topK(qVec, index.chunks, k = topK)
-            if (hits.isEmpty()) return null
+            // RagRetriever с DevAssistantQueryRewriter (перевод на английский для embedding).
+            // rewriter/reranker — мягкая деградация при внутренней ошибке (возвращают исходный запрос).
+            // RagRetriever с DevAssistantQueryRewriter (перевод на английский для embedding).
+            val retriever = com.cliagent.rag.RagRetriever(
+                embedder = embedder,
+                store = store,
+                topK = topK,
+                rewriter = com.cliagent.rag.rewrite.DevAssistantQueryRewriter(client, model),
+            )
+            val hits = retriever.retrieve(question)
+            if (hits.isNullOrEmpty()) return null
             formatRagBlock(hits)
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
