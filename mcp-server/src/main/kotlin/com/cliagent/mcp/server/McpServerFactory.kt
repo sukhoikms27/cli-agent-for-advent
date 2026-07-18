@@ -7,6 +7,7 @@ import io.modelcontextprotocol.kotlin.sdk.types.ServerCapabilities
 import com.cliagent.mcp.server.notes.NotesStore
 import com.cliagent.mcp.server.tools.registerGitHubTools
 import com.cliagent.mcp.server.tools.registerNotesTools
+import com.cliagent.mcp.server.tools.registerProjectTools
 import com.cliagent.mcp.server.tools.registerWeatherTools
 import com.cliagent.mcp.server.tools.registerWikipediaTools
 import com.cliagent.mcp.server.weather.WeatherClient
@@ -46,5 +47,7 @@ internal fun buildServer(
     registerWeatherTools(server, weatherClient, weatherStore, weatherScheduler)
     registerWikipediaTools(server, wikipediaClient)
     registerNotesTools(server, notesStore)
+    // День 31: read-only project/git tools (stateless — без новых зависимостей в сигнатуре).
+    registerProjectTools(server)
     return server
 }
