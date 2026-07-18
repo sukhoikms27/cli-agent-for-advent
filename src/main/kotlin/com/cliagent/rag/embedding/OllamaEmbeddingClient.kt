@@ -5,11 +5,13 @@ import io.ktor.client.HttpClient
 import io.ktor.client.engine.cio.CIO
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.client.request.header
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
 import io.ktor.http.contentType
+import io.ktor.http.HttpHeaders
 import io.ktor.serialization.kotlinx.json.json
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
@@ -33,8 +35,13 @@ import kotlin.math.min
  * DI-шов: [http] инжектируется (default — CIO + ContentNegotiation/json). В тестах подставляется
  * `HttpClient(MockEngine{…})` — без реальной Ollama.
  *
- * @param baseUrl  адрес Ollama ("http://localhost:11434"; на VPS заменить адрес)
+ * **День 32 (remote RAG для CI):** [baseUrl] + [bearerToken] позволяют ходить в удалённую Ollama
+ * через reverse-proxy с bearer-auth (Caddy на VPS: `/api/embed` только, `/api/chat` отшит). В CI
+ * GitHub передаётся через env `CLI_AGENT_RAG_EMBEDDING_URL` + `CLI_AGENT_RAG_EMBEDDING_TOKEN`.
+ *
+ * @param baseUrl  адрес Ollama ("http://localhost:11434"; для remote — URL Caddy `http://vps:11435")
  * @param model    имя модели ("nomic-embed-text", 768 dim)
+ * @param bearerToken опц. bearer для reverse-proxy с auth (null = без auth, для localhost)
  * @param http     injectable HttpClient (default CIO)
  * @param batchSize число текстов на один HTTP-запрос (Ollama batched; 32 — баланс скорости/памяти)
  * @param ownsClient закрывать ли [http] в [close] (true для default-клиента, false для injected)
@@ -42,6 +49,7 @@ import kotlin.math.min
 class OllamaEmbeddingClient(
     private val baseUrl: String = "http://localhost:11434",
     private val model: String = "nomic-embed-text",
+    private val bearerToken: String? = null,
     private val http: HttpClient = defaultClient(),
     private val batchSize: Int = 32,
     private val ownsClient: Boolean = true,
@@ -108,6 +116,10 @@ class OllamaEmbeddingClient(
         val response = try {
             http.post("$baseUrl/api/embed") {
                 contentType(ContentType.Application.Json)
+                // День 32: bearer-auth для remote Ollama через reverse-proxy (null = localhost без auth).
+                if (!bearerToken.isNullOrBlank()) {
+                    header(HttpHeaders.Authorization, "Bearer $bearerToken")
+                }
                 setBody(body)
             }
         } catch (e: CancellationException) {
