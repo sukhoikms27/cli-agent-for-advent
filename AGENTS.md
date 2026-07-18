@@ -2,388 +2,232 @@
 
 ## Project Overview
 
-Incremental CLI-agent for the AI Advent Challenge #8 course. Built with Kotlin, grows with each week's assignments.
+Incremental CLI-agent для **AI Advent Challenge #8**. Kotlin, растёт с каждой неделей курса.
 
-**Previous work (Android client):** [llm-chat-demo-app](https://github.com/sukhoikms27/llm-chat-demo-app) — репозиторий с предыдущими наработками курса на Android-клиенте. Используется как референс при миграции фич в CLI.
+**Previous work (Android client):** [llm-chat-demo-app](https://github.com/sukhoikms27/llm-chat-demo-app) —
+референс при миграции фич в CLI.
 
-**Current phase:** Phase 1 (Foundation — Days 1-6 MVP)
+**Текущая фаза:** **Неделя 6 (Days 26-30)** — локальные LLM: запуск (Ollama), интеграция в CLI,
+RAG поверх локальной модели, оптимизация (native client, model limits), приватный сервис на VPS
+(Ollama + Caddy reverse-proxy + TLS). Смержено через PR #18 (`task/day-30`) + `7 week prepare`
+(коммит-подготовка, **не** старт недели 7). Dev-дневник — до day-30 (`swarm-report/`).
+> Note: `README.md` в корне частично устарел (там «Неделя 3»); реальный прогресс см. в этом файле и в git-логе.
+> **Неделя 7 (Days 31-35)** — production AI-системы (dev-assistant, PR-review pipeline, support agent,
+> file agent, day-35 капстоун «ship a real app») — к ней ещё **не приступали**.
 
-**Detailed day-by-day plans:** `plan/days/day-01.md` — `plan/days/day-10.md` — инструкции для реализации каждого дня курса с учётом нарастающих изменений.
-**Global architecture:** `global-plan.md` — верхнеуровневый план архитектуры и фаз.
-**Android comparison:** `plan/changelog-android-diff.md` — что принято и отвергнуто из Android-реализации.
+## Plan & docs map
 
-## Kotlin CLI Development Meta-Prompt
-
-Правила и паттерны для разработки CLI-тулов на Kotlin. Применимы к этому проекту и любому будущему CLI.
-
-### REPL: JLine3, не readLine()
-
-Использовать [JLine3](https://github.com/jline/jline3) для REPL-цикла. Даёт из коробки:
-- История команд (персистентная между сессиями)
-- Tab-completion для slash-команд и аргументов
-- Корректная обработка Ctrl+C (`UserInterruptException`) и Ctrl+D (`EndOfFileException`)
-- Редактирование строки (стрелки, Ctrl+W, Ctrl+U и пр.)
-
-```kotlin
-val terminal = TerminalBuilder.builder().system(true).build()
-val reader = LineReaderBuilder.builder()
-    .terminal(terminal)
-    .completer(AggregateCompleter(/* command completers */))
-    .variable(LineReader.HISTORY_FILE, dataDir.resolve("repl-history").toString())
-    .build()
-
-while (true) {
-    try {
-        val line = reader.readLine("cli-agent> ")
-        // handle input
-    } catch (e: UserInterruptException) { /* Ctrl+C — cancel input, not REPL */ }
-      catch (e: EndOfFileException) { break } // Ctrl+D — exit
-}
-```
-
-### Цветной вывод: mordant
-
-[mordant](https://github.com/ajalt/mordant) — от того же автора, что clikt. Даёт:
-- ANSI-цвета с auto-ddoskey cli-agent="%CD%\build\install\cli-agent\bin\cli-agent.bat" $*etect и `--no-color` fallback
-- Таблицы для `/stats`
-- Спиннеры для загрузки
-
-```kotlin
-val t = Terminal()
-t.println("${red("Error:")} API key not found")
-t.println("${green("✓")} Configuration saved")
-```
-
-### Корутины в CLI
-
-| Паттерн | Правило |
+| Что | Где |
 |---|---|
-| Точка входа | `runBlocking` только в `main()` / clikt `run()` |
-| REPL-цикл | `SupervisorJob` — одна ошибка не крашит сессию |
-| IO-операции | `withContext(Dispatchers.IO)` — Ktor, файлы |
-| CPU-операции | `withContext(Dispatchers.Default)` — подсчёт токенов, компрессия |
-| CancellationException | **Никогда не глотать** — всегда re-throw |
-| Долгие запросы | `withTimeoutOrNull(30_000L)` — таймаут 30с на LLM-запрос |
-| Отмена по Ctrl+C | Отменять `currentJob?.cancel()`, не убивать процесс |
+| Глобальная архитектура и фазы | `plan/finisheddays/day-16/global-plan.md` |
+| Course assignments (day 12-35) | `plan/newdays/dayNN.md` |
+| Completed days 1-10 | `plan/finisheddays/day-01.md` … `day-10.md` (плоские) |
+| Completed days 11-25 | `plan/finisheddays/day-11/` … `day-25/` (папки с README + задачами) |
+| Архитектурные issues / bugs / OOP | `plan/extensions/` (`arch-issues.md`, `bugs.md`, `oop-issues.md`, `critical-issues.md`, `file-operations-design.md`, `05-…`-`08-…`) |
+| Dev-дневник (day-26..day-30, мотиватор, ollama, SSE) | `swarm-report/` |
+| Видео-саммари курса (RU) | `plan/videossummary/` |
+| Результаты прогона | `plan/results/console-result.md` |
 
-### Сериализация: единый Json-инстанс
-
-Один `Json` объект на всё приложение с правильными настройками:
-
-```kotlin
-val AppJson = Json {
-    ignoreUnknownKeys = true    // forward compat: новые поля не ломают старый код
-    encodeDefaults = true       // все поля всегда в JSON — явнее
-    explicitNulls = false       // null-поля не пишутся — компактнее
-    coerceInputValues = true    // неизвестные enum → default
-    prettyPrint = false         // компактный JSON для storage; prettyPrint для /export
-}
-```
-
-**Эволюция схемы** — добавлять поля только с дефолтами, никогда не удалять:
-```kotlin
-@Serializable
-data class ChatData(
-    val id: String,
-    val title: String = "New Chat",              // v1: default для новых чатов
-    val messages: List<ChatMessage> = emptyList(),
-    val summary: String? = null,                   // v2: nullable — старые чаты загружаются
-    val facts: Map<String, String> = emptyMap(),   // v3: default — бесшовная миграция
-)
-```
-
-### Файловая персистентность: JSON, не SQLite
-
-Для CLI-агента (1-5 чатов, 10-100 сообщений) JSON быстрее и проще SQLite:
-- Нет JDBC overhead (коннект, SQL-парсинг, ResultSet mapping)
-- Нет миграций — меняешь data class, всё работает через defaults
-- Нет зависимости sqlite-jdbc (~8MB)
-- Один файл на чат, человекочитаемый
-
-**Структура каталогов (XDG):**
-```
-$XDG_DATA_HOME/cli-agent/     (~/.local/share/cli-agent/ на Linux, ~/Library/Application Support/cli-agent/ на macOS)
-├── config.json                # AppConfig + настройки
-├── repl-history               # JLine3 история
-└── chats/
-    ├── {uuid}.json            # ChatData: messages, summary, facts, branches
-    └── {uuid}.json
-```
-
-**Атомарная запись** — всегда write-to-temp + rename:
-```kotlin
-fun atomicWrite(target: Path, content: String) {
-    val tmp = target.resolveSibling(".${target.fileName}.tmp")
-    tmp.writeText(content)
-    Files.move(tmp, target, ATOMIC_MOVE, REPLACE_EXISTING)
-}
-```
-
-**XDG-пути:**
-```kotlin
-object AppPaths {
-    val dataDir: Path = System.getenv("XDG_DATA_HOME")?.let { Path.of(it) }
-        ?: Path.of(System.getProperty("user.home"), ".local", "share", "cli-agent")
-    val configDir: Path = System.getenv("XDG_CONFIG_HOME")?.let { Path.of(it) }
-        ?: Path.of(System.getProperty("user.home"), ".config", "cli-agent")
-    val chatsDir: Path get() = dataDir.resolve("chats")
-}
-```
-
-### Обработка ошибок: sealed class + exit codes
-
-```kotlin
-sealed class AgentResult<out T> {
-    data class Success<out T>(val value: T) : AgentResult<T>()
-    data class LlmError(val code: Int?, val message: String, val retryable: Boolean) : AgentResult<Nothing>()
-    data class ConfigError(val message: String, val suggestion: String? = null) : AgentResult<Nothing>()
-    data class IoError(val path: String, val message: String) : AgentResult<Nothing>()
-}
-
-// Exit codes (POSIX sysexits)
-object ExitCodes {
-    const val SUCCESS = 0
-    const val USAGE = 2         // плохие аргументы
-    const val DATA_ERR = 65     // невалидные данные
-    const val NO_INPUT = 66     // файл не найден
-    const val UNAVAILABLE = 69  // сервис недоступен (LLM down, rate limit)
-    const val CONFIG = 78       // ошибка конфигурации (нет API key)
-}
-```
-
-**stderr vs stdout:** данные → stdout (можно пайпать), ошибки → stderr.
-
-### clikt: продвинутые паттерны
-
-- **Shell completions:** `.subcommands(CompletionCommand())` — автодополнение для bash/zsh/fish
-- **Валидация:** `.validate { require(it in 0f..2f) }` на опциях
-- **Кросс-опционная валидация:** в `run()` после парсинга всех опций
-- **Custom types:** `.convert { Url(it) }` для нетривиальных типов
-- **Env vars:** `option("--api-key", envvar = "CLI_AGENT_API_KEY")` — clikt автоматически читает из env
-
-### Тестирование CLI
-
-| Слой | Подход |
-|---|---|
-| clikt-команды | `cmd.parse(listOf("--model", "glm-5.1"))` + assert на свойствах |
-| Валидация | `assertFailsWith<UsageError> { cmd.parse(...) }` |
-| Агент (unit) | MockK + `runTest` + `coEvery`/`coVerify` |
-| REPL-команды | Тестировать `handleCommand()` изолированно |
-| Интеграция | `ProcessBuilder` — запуск JAR как subprocess |
-| Персистентность | Temp-файл + `@BeforeEach`/`@AfterEach` |
-
-### Дистрибуция
-
-1. **Shadow JAR** — fat JAR, работает везде где есть Java: `java -jar cli-agent.jar chat`
-2. **GraalVM native-image** — нативный бинарник без JVM, быстрый старт (Phase 2)
-3. **Homebrew** — формула в tap-репозитории
-
----
+> Старые пути `plan/days/`, корневой `global-plan.md`, `plan/changelog-android-diff.md` — **не существуют** (удалены/перемещены).
 
 ## Tech Stack
 
 | Component | Choice |
 |---|---|
-| Language | Kotlin |
-| Build | Gradle + Kotlin DSL (`build.gradle.kts`) |
-| CLI framework | clikt |
-| REPL engine | JLine3 |
-| Terminal output | mordant (ANSI colors, tables, spinners) |
-| HTTP client | Ktor Client |
-| Serialization | kotlinx.serialization |
-| Persistence | JSON files (one per chat) |
-| LLM provider | z.ai (GLM-5.1) — OpenAI-compatible API |
-| API format | OpenAI Chat Completions (`/v4/chat/completions`) |
-| Streaming | Phase 2 (SSE via Ktor) |
-| Testing | JUnit 5 + MockK + kotlinx-coroutines-test |
+| Language / JVM | Kotlin, JVM 21 |
+| Build | Gradle + Kotlin DSL, **multi-module** (`settings.gradle.kts`: root + `:mcp-server` + `:web-app`) |
+| CLI framework | clikt 4.4.0 |
+| REPL engine | JLine3 3.29.0 |
+| Terminal output | mordant 2.5.0 (ANSI, таблицы, спиннеры) |
+| HTTP client | Ktor Client 3.4.3 (core + cio + content-negotiation + json) |
+| Serialization | kotlinx.serialization 1.11.0 |
+| Coroutines | kotlinx-coroutines 1.11.0 |
+| MCP SDK | `io.modelcontextprotocol:kotlin-sdk-{client,server}:0.13.0` |
+| Persistence | JSON files (one per chat), atomic write |
+| LLM providers | z.ai (GLM-5.1, default) · Ollama (qwen2.5, local/VPS) · generic OpenAI-compatible |
+| Streaming | SSE via Ktor (**выполнено**, не «Phase 2 placeholder») |
+| Logging | slf4j-simple 2.0.18 (runtime) |
+| Testing | JUnit 5.12.2 + MockK 1.13.16 + kotlinx-coroutines-test + ktor-client-mock |
+| Distribution | Shadow JAR (fat-jar в `mcp-server`) |
+
+## Build & test commands
+
+Gradle wrapper (`./gradlew`), Kotlin DSL, **3 модуля** (`:cli-agent` root + `:mcp-server` + `:web-app`).
+
+| Что | Команда |
+|---|---|
+| Run CLI-agent (REPL chat) | `./gradlew run --args="chat"` (stdin проброшен через `tasks.withType<JavaExec>`) |
+| Compile all modules | `./gradlew build -x test` |
+| Unit tests (root) | `./gradlew test` |
+| Тест одного класса | `./gradlew test --tests "com.cliagent.rag.RagRetrieverTest"` |
+| Тесты всех модулей | `./gradlew :test :mcp-server:test :web-app:test` |
+| Run mcp-server | `./gradlew :mcp-server:run` |
+| Run web-app (Ktor) | `./gradlew :web-app:run` |
+| Fat-jar mcp-server | `./gradlew :mcp-server:shadowJar` → `mcp-server/build/libs/mcp-server-*-all.jar` |
+
+**E2E-тесты gated** (`McpClientHttpE2ETest`, интеграционный stdio-тест MCP) — по умолчанию **skipped**,
+не запускаются обычным `./gradlew test`. Чтобы включить, пробросить флаг в test-JVM:
+`./gradlew test -Dcli-agent.e2e.http=true -Dcli-agent.mcp.jar=<path>` (или env `CLI_AGENT_MCP_INTEGRATION`).
+Без флага — тихо skip, это не ошибка.
+
+## Modules
+
+- **root** (`src/main/kotlin/com/cliagent/`) — сам CLI-агент (entry: `com.cliagent.MainKt`).
+- **`:mcp-server`** (`mcp-server/src/main/kotlin/com/cliagent/mcp/server/`) — standalone MCP-сервер с
+  multi-tool: GitHub, Weather (scheduler + store), Wikipedia, Notes. Fat-jar via Shadow.
+- **`:web-app`** (`web-app/src/main/kotlin/com/cliagent/web/`) — motivator: `MotivatorApp` +
+  `SessionManager` + статический фронтенд (`web-app/src/main/resources/static/`).
 
 ## Architecture
 
 ```
-CLI Layer (clikt + JLine3 REPL + mordant output)
+CLI Layer (clikt + JLine3 REPL + mordant)
         ↓
-Agent Layer (orchestration: request → response)
+Agent Layer (SimpleAgent / ContextAwareAgent / StatefulAgent / StageAgent / SwarmStageAgent)
         ↓
-┌──────────┬───────────┬───────────────────┐
-│ LLM Layer│ Context   │ Memory + State    │
-│ (llm/)   │ (context/)│ (memory/ + state/)│
-└──────────┴───────────┴───────────────────┘
+┌────────────┬─────────────┬──────────────┬─────────┬─────────┐
+│ LLM Layer  │ Context     │ Memory+State │ RAG     │ MCP     │
+│ (llm/)     │ (context/)  │ (memory/     │ (rag/)  │ (mcp/)  │
+│ + Factory  │ + strategy  │  +state/)    │         │         │
+└────────────┴─────────────┴──────────────┴─────────┴─────────┘
         ↓
-Infrastructure (JSON files, Ktor, Config)
+Infrastructure (JSON files, Ktor, Config, XDG paths)
 ```
 
 ### Key Interfaces
-
-- `LlmClient` — abstract LLM communication (current impl: OpenAiCompatibleClient via Ktor, returns `LlmResult<ChatResponse>`)
-- `ContextStrategy` — pluggable context management (SlidingWindow, StickyFacts, Summary, Branching — 4 стратегии)
-- `MemoryStore` — persistence abstraction (current impl: JsonChatStore — one JSON file per chat)
-- `Agent` — agent entity with chat(), getHistory(), reset()
+- `LlmClient` → `LlmResult<ChatResponse>`. Реализации: `OpenAiCompatibleClient` (zai/openai/ollama-via-v1),
+  `OllamaNativeClient` (`/api/chat`). Dispatch через `LlmClientFactory` + `LlmProvider` enum.
+- `ContextStrategy` — SlidingWindow / StickyFacts / Summary / Branching (4 стратегии в `context/strategy/`).
+- `MemoryStore` (JsonChatStore, JsonLongTermStore) + `MemoryLayer` (short/working/long-term).
+- `Agent` — `chat()` / `getHistory()` / `reset()`. Stage-варианты: `ClarifyStageAgent`,
+  `PlanningStageAgent`, `ExecutionStageAgent`, `ValidationStageAgent`, `DoneStageAgent`;
+  swarm-вариант: `SwarmStageAgent` (lead + workers + integrate).
+- `McpToolExecutor` / `CompositeMcpToolExecutor` — вызов внешних MCP-тулов как agent tools.
 
 ## Project Structure
 
 ```
 src/main/kotlin/com/cliagent/
-├── Main.kt                     # entry point (clikt delegation)
-├── cli/                        # CLI layer (clikt commands)
-│   ├── CliAgentCommand.kt      # root command
-│   ├── ChatCommand.kt          # REPL chat mode (JLine3)
-│   ├── ConfigCommand.kt        # config management
-│   └── ReplEngine.kt           # JLine3 REPL loop + completion
-├── agent/                      # Agent core
-│   ├── Agent.kt                # agent interface
-│   ├── SimpleAgent.kt          # basic agent (day 6)
-│   ├── ContextAwareAgent.kt    # agent with context persistence (day 7)
-│   └── StatefulAgent.kt        # stateful agent (week 3)
-├── llm/                        # LLM integration
-│   ├── LlmClient.kt            # LLM client interface (chat + chatStream placeholder)
-│   ├── OpenAiCompatibleClient.kt
-│   ├── model/                  # ChatMessage, ChatRequest, ChatResponse, GenerationPresets
-│   ├── token/                  # TokenCounter (~4 chars/token)
-│   └── pricing/                # Pricing (calculateCost per model)
-├── context/                    # Context management
-│   ├── ContextManager.kt       # strategy switcher
-│   ├── strategy/               # ContextStrategy + 4 impls + ContextStrategyType enum
-│   └── HistoryCompressor.kt    # incremental summarization (previous summary + new)
-├── memory/                     # Memory & persistence
-│   ├── MemoryStore.kt          # storage interface
-│   ├── JsonChatStore.kt        # JSON file implementation (one file per chat)
-│   ├── ChatData.kt             # aggregate model (messages + summary + facts + branches)
-│   ├── Profile.kt              # user profile model
-│   └── Facts.kt                # key-value facts from dialog
-├── state/                      # Task state machine (week 3)
-│   ├── TaskState.kt            # task states enum
-│   ├── StateMachine.kt         # state machine with transitions
-│   └── InvariantChecker.kt     # invariant validation
-├── rag/                        # RAG indexing pipeline (day 21)
-│   ├── RagModels.kt            # RagDocument, RagChunk, RagIndex, ScoredChunk, RagConfig
-│   ├── DocumentLoader.kt       # corpus scan (.md/.kt → RagDocument)
-│   ├── chunk/                  # ChunkingStrategy + FixedSizeChunker + StructuralChunker
-│   ├── embedding/              # EmbeddingClient + OllamaEmbeddingClient (/api/embed)
-│   ├── VectorMath.kt           # cosine similarity + topK
-│   ├── JsonRagStore.kt         # JSON index persistence (atomicWrite)
-│   ├── RagIndexer.kt           # chunk → embed → save orchestrator
-│   ├── RagRetriever.kt         # query → embed → topK retrieval (day 22, инъекция в промпт)
-│   └── ChunkingComparison.kt   # 2-strategy stats + probe retrieval
-└── config/                     # Configuration
-    ├── AppConfig.kt            # config data class (+rag: RagConfig)
-    ├── ConfigRepository.kt     # config load/save (env + JSON)
-    └── AppPaths.kt             # XDG-compliant paths (+ragDir)
+├── Main.kt                          # entry (clikt delegation)
+├── cli/                             # CliAgentCommand, ChatCommand, ReplEngine, AgentSession,
+│                                    #   AppTerminal, RagCommands, LocalRagCompare, LocalSmoke
+├── agent/                           # Agent, SimpleAgent, ContextAwareAgent, StatefulAgent,
+│   ├── stage/                       #   InvariantGuard, ProfileExtractor, PromptBuilder, ToolExecutor
+│   │                                #   StageAgent + 5 stage-агентов + 5 классификаторов +
+│   │                                #   PlanParser, StageAnnouncer, TaskOrchestrator, StepAgent
+│   └── swarm/                       # SwarmMode, SwarmPrompts, SwarmStageAgent, SwarmStrategy
+├── config/                          # AppConfig, AppPaths, ConfigRepository, OllamaTunables, SamplingTunables
+├── context/
+│   ├── strategy/                    # ContextStrategy + 4 impls
+│   ├── ContextManager.kt            # strategy switcher
+│   └── HistoryCompressor.kt         # incremental summarization
+├── llm/
+│   ├── LlmClient.kt, LlmClientFactory.kt, LlmProvider.kt, LlmResult.kt, LlmCallException.kt
+│   ├── OpenAiCompatibleClient.kt, OllamaNativeClient.kt, OllamaBenchClient.kt, OllamaHealthChecker.kt
+│   ├── BenchmarkRunner.kt, ModelDefaults.kt, ModelLimits.kt
+│   ├── model/                       # ChatMessage, ChatRequest, ChatResponse, ModelInfo,
+│   │                                #   SystemPrompts, PromptTemplates, ReasoningStrategy,
+│   │                                #   StagePromptTemplates, StreamChunk, ToolDefinition, BenchmarkResult
+│   ├── token/                       # TokenCounter, OutputBudget
+│   └── pricing/                     # Pricing
+├── mcp/                             # McpClient, McpServerConfig, McpTransportConfig, McpTool,
+│                                    #   McpToolExecutor, CompositeMcpToolExecutor, McpToolResult, McpException
+├── memory/                          # MemoryLayer, MemoryStore, ChatData, JsonChatStore, JsonLongTermStore
+├── rag/
+│   ├── RagModels, RagFactories, RagIndexer, RagRetriever, JsonRagStore,
+│   │   DocumentLoader, VectorMath, CitationDetector, ChunkingComparison, CannedResponses
+│   ├── chunk/                       # ChunkingStrategy, FixedSizeChunker, StructuralChunker
+│   ├── embedding/                   # EmbeddingClient, OllamaEmbeddingClient (/api/embed)
+│   ├── rerank/                      # Reranker, HeuristicReranker, LlmReranker, ThresholdReranker
+│   └── rewrite/                     # QueryRewriter, HeuristicQueryRewriter, LlmQueryRewriter
+├── state/
+│   ├── TaskStage, TaskState, TaskStateMachine, TaskKind, TaskComplexity,
+│   │   InteractionMode, TransitionGuard, TransitionOutcome
+│   └── invariant/                   # Invariant, InvariantResult, InvariantChecker, LlmInvariantChecker
+└── (tests mirror packages under src/test/kotlin/com/cliagent/)
 ```
 
-## Implementation Phases
+`mcp-server/` и `web-app/` — отдельные деревья, см. раздел Modules.
 
-### Phase 1: Foundation (Days 1-6) — MVP ← CURRENT
-- Gradle project setup, dependencies, package structure
-- LlmClient interface + OpenAiCompatibleClient (Ktor, z.ai endpoint)
-- Data models: ChatMessage, ChatRequest, ChatResponse, LlmParameters
-- REPL mode via clikt
-- AppConfig: API key, model, baseUrl from env/config
-- Response format control (system prompt with constraints)
+## Implementation Phases (статус)
 
-### Phase 2: Context & Parameters (Days 3-5, 7-8)
-- ChatRequest: temperature, top_p, max_tokens with CLI flags (flat fields, no GenerationConfig)
-- Prompting strategies (step-by-step, expert group) + GenerationPresets
-- JSON file storage + context restoration on restart
-- TokenCounter: token counting for request, history, response (~4 chars/token estimate)
-- CLI commands: /context list, /context clear, /stats, /cost
-- Streaming (SSE via Ktor)
+| Фаза | Дни | Статус |
+|---|---|---|
+| Phase 1: Foundation | Days 1-6 (LlmClient, модели, REPL, config) | ✅ |
+| Phase 2: Context & Parameters | Days 3-5, 7-8 (temp/top_p/max_tokens, presets, JSON storage, TokenCounter, `/stats` `/cost`, **SSE streaming**) | ✅ |
+| Phase 3: Context Management | Days 9-10 (HistoryCompressor, 4 стратегии, `/strategy`) | ✅ |
+| Phase 4: Stateful Agent | Week 3 (Profile, TaskStateMachine, InvariantChecker, StatefulAgent, PromptBuilder) | ✅ |
+| Week 4: Tools + MCP | Days 16-20 (agent tools, MCP client+server, multi-tool server) | ✅ |
+| Week 5: RAG | Days 21-25 (chunking, embeddings, rerank, query rewrite, citations, `/rag`) | ✅ |
+| **Week 6: Local LLM** | **Days 26-30 (Ollama provider, native client, model limits, SSE, RAG-over-local, VPS-сервис) ← CURRENT** | 🚧 |
+| Week 7: Production agents | Days 31-35 (dev-assistant, PR-review pipeline, support agent, file agent, capstone «ship») | ⏳ не начата |
 
-### Phase 3: Context Management (Days 9-10)
-- HistoryCompressor: incremental summarization (previous summary + new messages)
-- SlidingWindowStrategy: keep last N messages
-- StickyFactsStrategy: key-value facts + last N messages
-- SummaryStrategy: auto-summarization + last N messages (4th strategy)
-- BranchingStrategy: dialog branches from checkpoints (persistent in JSON)
-- Strategy switcher via CLI: /strategy sliding/facts/summary/branch
+## LLM API Details (multi-provider)
 
-### Phase 4: Stateful Agent (Week 3)
-- Profile: personalization model (style, constraints, context)
-- TaskStateMachine: stages (clarify → plan → execute → validate → done)
-- InvariantChecker: programmatic constraint validation
-- StatefulAgent: full assembly (profile + state + invariants)
-- PromptBuilder: assemble context layers into final prompt
+| Provider | Endpoint | Auth | Когда |
+|---|---|---|---|
+| `zai` (default) | `https://api.z.ai/api/coding/paas/v4/chat/completions` | Bearer `CLI_AGENT_API_KEY` | Облако, GLM-5.1 |
+| `ollama` | `http://localhost:11434/v1/chat/completions` (OpenAI-compat) **или** `/api/chat` (native) | пустой apiKey | Локально / VPS, qwen2.5 |
+| `openai-compatible` | любой `$BASE_URL/chat/completions` | Bearer apiKey | Прочее |
 
-## LLM API Details
+**z.ai request/response** — стандартный OpenAI Chat Completions (`messages[]`, `model`, `temperature`, `max_tokens`),
+response содержит `choices[].message` и `usage.{prompt,completion,total}_tokens`.
 
-**Provider:** z.ai (Zhipu AI)
-**Endpoint:** `https://api.z.ai/api/coding/paas/v4/chat/completions`
-**Format:** OpenAI-compatible
-**Model:** `glm-5.1`
-**Auth:** Bearer token (API key in Authorization header)
+### Environment variables
+- `CLI_AGENT_API_KEY` — облако (zai/openai-compatible): required. Ollama: не нужен.
+- `CLI_AGENT_MODEL` — default `glm-5.1`. Для Ollama: `qwen2.5:32b-instruct-q5_K_M` (~20 ГБ RAM, 128K контекст) либо `qwen2.5:14b-instruct-q5_K_M` (fallback).
+- `CLI_AGENT_BASE_URL` — default z.ai; для Ollama `http://localhost:11434/v1`.
+- `CLI_AGENT_PROVIDER` — `zai` | `ollama` | `openai-compatible`. Пусто → auto-detect по `baseUrl`.
+- `XDG_DATA_HOME` / `XDG_CONFIG_HOME` — override директорий (default `~/.local/share`, `~/.config`).
 
-### Request format
-```json
-{
-  "model": "glm-5.1",
-  "messages": [
-    {"role": "system", "content": "..."},
-    {"role": "user", "content": "..."}
-  ],
-  "temperature": 0.7,
-  "max_tokens": 1024
-}
-```
-
-### Response format
-```json
-{
-  "id": "chatcmpl-...",
-  "choices": [{"index": 0, "message": {"role": "assistant", "content": "..."}, "finish_reason": "stop"}],
-  "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
-}
-```
-
-## Course Context
-
-This project fulfills the AI Advent Challenge #8 assignments. Each phase maps to course days/weeks:
-- Days 1-5: Basic LLM calls, response format, reasoning strategies, temperature, model comparison
-- Day 6: First agent (encapsulated entity)
-- Day 7: Context persistence (history in JSON, restore on restart)
-- Day 8: Token counting
-- Day 9: History compression (incremental summary)
-- Day 10: Context strategies (Sliding Window, Sticky Facts, Summary, Branching)
-- Week 3: Full stateful agent (profile, task state machine, invariants)
-
-## Development Conventions
-
-- **Naming:** Kotlin conventions (camelCase for functions/variables, PascalCase for classes)
-- **Packages:** lowercase, no underscores
-- **Error handling:** sealed class Result patterns (`AgentResult<T>`, `LlmResult<T>`), no exceptions for flow control
-- **Exit codes:** POSIX sysexits — `AgentResult.toExitCode()` for mapping
-- **Coroutines:** suspend for all IO, `SupervisorJob` for REPL fault isolation, never swallow `CancellationException`
-- **Serialization:** @Serializable on all data classes, single `AppJson` instance with `ignoreUnknownKeys = true`
-- **Persistence:** JSON files, atomic writes (temp + rename), XDG-compliant paths
-- **Schema evolution:** add fields with defaults, never remove — old JSON always loads
-- **Testing:** JUnit 5 + MockK for unit, `cmd.parse()` for clikt, `runTest` for coroutines
-- **Logging:** use kotlin.io or add kotlinx-logging if needed
-- **Git:** totally blocks git usage
-- **CLI output:** data → stdout, errors → stderr, colors via mordant
-
-## Environment Variables
-
-- `CLI_AGENT_API_KEY` — LLM API key. Required for cloud providers (z.ai, OpenAI-compatible); optional for local Ollama (`provider=ollama`, no auth).
-- `CLI_AGENT_MODEL` — model name (default: glm-5.1)
-- `CLI_AGENT_BASE_URL` — API base URL (default: https://api.z.ai/api/coding/paas/v4). For Ollama: `http://localhost:11434/v1`.
-- `CLI_AGENT_PROVIDER` — LLM backend discriminator (день 25: multi-provider support). Values: `zai` | `ollama` | `openai-compatible`. Default empty → auto-detect by `baseUrl` (`z.ai` → zai, `localhost:11434` → ollama, else generic).
-- `XDG_DATA_HOME` — data directory override (default: ~/.local/share)
-- `XDG_CONFIG_HOME` — config directory override (default: ~/.config)
-
-## Multi-LLM Provider Support (день 25)
-
-Архитектура поддерживает несколько LLM-провайдеров через `LlmClientFactory` (единая точка dispatch) + `LlmProvider` enum. Ollama говорит на OpenAI-compatible endpoint (`/v1/chat/completions`), поэтому все провайдеры пока используют `OpenAiCompatibleClient` (Ollama — с пустым apiKey, auth-header conditional). Factory — seam для будущих нативных клиентов (Anthropic messages, Gemini generateContent).
-
-**Локальная Ollama на M3 Pro / 36 ГБ** — рекомендованная модель: `qwen2.5:32b-instruct-q5_K_M` (~20 ГБ RAM, лучший в классе русский + function calling, 128K контекст). Fallback: `qwen2.5:14b-instruct-q5_K_M` для быстрых классификаторов. Подготовка: `ollama pull qwen2.5:32b-instruct-q5_K_M`.
-
-**Запуск с локальной моделью:**
+### Запуск с локальной моделью
 ```
 CLI_AGENT_PROVIDER=ollama \
 CLI_AGENT_BASE_URL=http://localhost:11434/v1 \
 CLI_AGENT_MODEL=qwen2.5:32b-instruct-q5_K_M \
 ./gradlew run --args="chat"
 ```
-Либо через REPL `/config set provider ollama` + `/config set baseUrl http://localhost:11434/v1` + `/config set model qwen2.5:32b-instruct-q5_K_M` (применяется после рестарта `chat`).
+Либо через REPL: `/config set provider ollama` + `set baseUrl …` + `set model …` (применяется после рестарта `chat`).
 
-**Per-model лимиты** (`ModelLimitsRegistry`) заменили хардкод GLM-констант в `OutputBudget`: локальные модели (qwen2.5: 128K контекст / 8K output) получают корректный бюджет `max_tokens`. Неизвестные модели → консервативный default (128K / 8K).
+Per-model лимиты (`ModelLimitsRegistry`) кормят `OutputBudget`: локальные модели получают корректный `max_tokens` (qwen2.5: 128K context / 8K output), неизвестные → консервативный default.
 
-### Agent info
-- use ast-index tool every time, when you need to find out anything in project
+## Подсистемы — кратко
+
+- **MCP** (`mcp/` + `:mcp-server`) — клиент подключается к stdio/HTTP MCP-серверам и экспонирует их туулы как agent tools; отдельный Gradle-модуль — собственный multi-tool сервер (GitHub/Weather/Wikipedia/Notes).
+- **RAG** (`rag/`) — индексация (.md/.kt → chunks → embeddings), retrieval с rerank + query rewrite, детекция цитат, `/rag` команды.
+- **Swarm** (`agent/swarm/`) — multi-agent режим: lead + workers + integrate на каждой стадии FSM.
+- **State** (`state/`) — FSM задач (clarify → planning → execution → validation → done) + invariant checker (programmatic + LLM).
+
+## Deployment (day 30, week 6 — приватный LLM-сервис)
+
+- `deploy/vps/` — `Caddyfile` (reverse-proxy + TLS), `Modelfile.qwen25-7b`, `deploy.sh`, `ollama.service.override.conf`, README.
+- `scripts/deploy/` — `install-mcp-server.sh`, `uninstall-mcp-server.sh`, `update-jar.sh`, `setup-nginx-tls.sh`, README.
+
+## Development Conventions
+
+- Kotlin naming (camelCase / PascalCase); пакеты lowercase без подчёркиваний.
+- Error handling: sealed `AgentResult<T>` / `LlmResult<T>`, без исключений для flow control.
+- Exit codes: POSIX sysexits (`ExitCodes`).
+- Coroutines: suspend для IO, `SupervisorJob` в REPL, **никогда не глотать** `CancellationException`.
+- Serialization: `@Serializable` везде, единый `AppJson` (`ignoreUnknownKeys=true`).
+- Persistence: JSON, atomic write (temp+rename), XDG-пути. Эволюция схемы: только add-with-default.
+- Testing: JUnit 5 + MockK (unit), `cmd.parse()` (clikt), `runTest` (coroutines).
+- CLI output: данные → stdout, ошибки → stderr, цвета через mordant.
+- **Git: totally blocks git usage** — все VCS-операции только через пользователя.
+- **Поиск по коду: use ast-index tool** каждый раз, когда нужно что-то найти в проекте.
+
+## Before editing sensitive areas, read
+
+| Меняешь… | Сначала прочитай |
+|---|---|
+| Архитектуру / слои / фазы | `plan/finisheddays/day-16/global-plan.md` |
+| Context strategies, HistoryCompressor | `plan/extensions/arch-issues.md`, `oop-issues.md` |
+| Любой bug / known issue | `plan/extensions/bugs.md`, `critical-issues.md` |
+| File operations / tools | `plan/extensions/file-operations-design.md` |
+| Multi-provider LLM (`LlmClientFactory`) | раздел LLM API Details выше + `llm/ModelLimits.kt` |
+| Kotlin CLI-паттерны (JLine3/mordant/корутины/JSON/ошибки/clikt) | workspace-skill `.zcode/skills/kotlin-cli-patterns/` (+ `references/*.md`) |
+| Хронологию решений по дню N | `plan/finisheddays/day-N/README.md`, `swarm-report/day-N-*.md` |
+
+> **Kotlin CLI паттерны** (JLine3 REPL, mordant, корутины, сериализация, JSON-персистентность,
+> error handling, clikt) — вынесены в workspace-skill **`kotlin-cli-patterns`**
+> (`.zcode/skills/kotlin-cli-patterns/`). Туда — за развёрнутыми примерами кода.
