@@ -211,11 +211,16 @@ class RagRetrieverDay23Test {
                     )
                 )
             )
+        // День 30: streaming не используется в RAG-reranker/rewriter тестах. Заглушка для контракта.
+        override fun chatStream(request: ChatRequest): kotlinx.coroutines.flow.Flow<com.cliagent.llm.model.StreamChunk> =
+            throw UnsupportedOperationException("streaming not supported in StubLlmClient")
     }
 
     /** LLM-клиент, всегда возвращающий Error (для теста мягкой деградации). */
     private class FailingLlmClient : LlmClient {
         override suspend fun chat(request: ChatRequest): LlmResult<ChatResponse> =
             LlmResult.Error(503, "LLM unavailable")
+        override fun chatStream(request: ChatRequest): kotlinx.coroutines.flow.Flow<com.cliagent.llm.model.StreamChunk> =
+            throw UnsupportedOperationException("streaming not supported in FailingLlmClient")
     }
 }

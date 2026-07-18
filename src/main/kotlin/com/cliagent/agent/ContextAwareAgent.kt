@@ -13,6 +13,7 @@ import com.cliagent.llm.model.ChatRequest
 import com.cliagent.llm.model.PromptTemplates
 import com.cliagent.llm.model.ReasoningStrategy
 import com.cliagent.llm.model.StagePromptTemplates
+import com.cliagent.llm.model.StreamChunk
 import com.cliagent.llm.model.SystemPrompts
 import com.cliagent.llm.model.ToolDefinition
 import com.cliagent.llm.token.ArtifactLimits
@@ -54,6 +55,20 @@ class ContextAwareAgent(
      * CLI `--temperature` прокидывается сюда; классификаторы/экстракторы остаются на `0.0` (детерминизм).
      */
     private val temperature: Double? = null,
+    /**
+     * День 31: cross-provider sampling-параметры основного цикла. Все nullable, default `null`
+     * (провайдерский дефолт в wire) — backward-compat с днями 1–30 (агент не отправлял их). CLI-флаги
+     * (`--top-p`, `--top-k`, `--seed`, `--stop`, `--frequency-penalty`, `--presence-penalty`) прокидываются
+     * сюда из [ChatCommand.buildSession] с priority CLI > config.sampling > null. Пробрасываются в обе
+     * точки сборки [ChatRequest] ([chatStreamed], [runToolLoop]). Классификаторы/экстракторы остаются
+     * без них (детерминизм на их собственных вызовах через StageAgent/IntentClassifier).
+     */
+    private val topP: Double? = null,
+    private val topK: Int? = null,
+    private val seed: Long? = null,
+    private val stop: List<String>? = null,
+    private val frequencyPenalty: Double? = null,
+    private val presencePenalty: Double? = null,
     private val contextLimit: Int = 128000,
     private val historyCompressor: HistoryCompressor? = null,
     private val contextManager: ContextManager? = null,
@@ -224,6 +239,162 @@ class ContextAwareAgent(
     }
 
     /**
+     * День 30 (streaming SSE): streaming-вариант [chat] для REPL обычного чата. Повторяет
+     * пред-обработку [chat] (ensureLoaded, userMsg+save, RAG retrieve, anti-hallucination,
+     * buildMessagesToSend, estimateTokens), но финальный LLM-вызов стримит токены через [onToken]
+     * по мере генерации — пользователь видит контент сразу (40-90с «пустоты» thinking-модели исчезают).
+     *
+     * **MVP-ограничение:** стримим ТОЛЬКО свободный чат (tools==null). Если tools подключены
+     * ([loadToolsOrNull] != null) — tool-итерации ([runToolLoop]) требуют полный response для
+     * парсинга tool_calls, стриминг tool-аргументов не реализован в этом scope. В этом случае
+     * делегируем в [runToolLoop] (batch-путь), но скармливаем финальный артефакт через [onToken]
+     * целиком (caller видит ответ одним блоком — как раньше, без progressive). Это осознанный
+     * компромисс: streaming нужен именно для долгих thinking-ответов свободного чата, tool-loops
+     * обычно быстрее (короткие structured-ответы).
+     *
+     * @param userMessage текст пользователя (как [chat])
+     * @param onToken suspend-колбэк на каждый [StreamChunk.Delta] (incremental content). Caller
+     *   (REPL) печатает через [com.cliagent.cli.AppTerminal.streamPrint] — progressive render.
+     * @return полный текст ответа (склеенный из всех Delta). Persist'ится в history (как [chat]).
+     *
+     * [CancellationException] НЕ глотается (AGENTS.md) — пробрасывается caller'у.
+     */
+    suspend fun chatStreamed(
+        userMessage: String,
+        onToken: suspend (String) -> Unit,
+        onReasoning: (suspend (String) -> Unit)? = null,
+    ): String {
+        ensureLoaded()
+
+        val lastMsgId = history.lastOrNull()?.id
+        val userMsg = ChatMessage(
+            role = "user",
+            content = userMessage,
+            parentId = lastMsgId
+        )
+        history.add(userMsg)
+        memoryStore.saveMessage(chatId, userMsg)
+
+        // Auto-compression — симметрично chat() (день 9).
+        if (contextManager == null && historyCompressor != null) {
+            val shouldCompress = history.size > historyCompressor.compressThreshold &&
+                history.size % historyCompressor.compressThreshold == 0
+            if (shouldCompress) {
+                logger("🔄 Compressing history...")
+                val existingSummary = memoryStore.loadSummary(chatId)
+                val result = historyCompressor.compress(history, existingSummary)
+                if (result.wasCompressed && result.summary != null) {
+                    memoryStore.saveSummary(chatId, result.summary)
+                    logger("✓ Compressed ${result.summarizedCount} messages (~${result.tokenEstimate} tokens in summary)")
+                }
+            }
+        }
+
+        // RAG-retrieval — симметрично chat() (день 22/25).
+        val ragContext = if (isRagEnabled()) {
+            val retrievalQuery = if (conversationalQuery) buildConversationQuery(userMessage) else userMessage
+            val hits = ragRetriever?.retrieve(retrievalQuery)
+            when {
+                hits == null -> logger("⚠️ RAG on, but retrieve() returned null (index empty or Ollama error) — answering without context")
+                hits.isEmpty() -> logger("📚 RAG: 0 chunks matched")
+                else -> {
+                    val best = hits.maxOfOrNull { it.score } ?: 0f
+                    logger("📚 RAG: ${hits.size} chunk(s), best similarity ${String.format("%.2f", best)}")
+                }
+            }
+            hits
+        } else null
+
+        // Anti-hallucination — симметрично chat() (день 24).
+        if (ragContext != null && dontKnowThreshold > 0.0f) {
+            val maxScore = ragContext.maxOfOrNull { it.score } ?: 0f
+            val weak = ragContext.isEmpty() || maxScore < dontKnowThreshold
+            if (weak) {
+                logger("🚫 Anti-hallucination: best similarity ${String.format("%.2f", maxScore)} < threshold ${String.format("%.2f", dontKnowThreshold)} → canned «не знаю» (LLM не вызывается)")
+                val canned = CannedResponses.weakContext(userMessage, maxScore, dontKnowThreshold)
+                val cannedMsg = ChatMessage(role = "assistant", content = canned, parentId = userMsg.id)
+                history.add(cannedMsg)
+                memoryStore.saveMessage(chatId, cannedMsg)
+                return canned
+            }
+        }
+        if (ragContext != null) logger("🤖 Generating answer via LLM…")
+
+        val messagesToSend = buildMessagesToSend(userMsg, ragContext)
+        val estimatedTokens = tokenCounter.estimateHistoryTokens(messagesToSend)
+        if (estimatedTokens > contextLimit) {
+            logger("⚠️ Warning: estimated $estimatedTokens tokens exceeds context limit ($contextLimit)")
+        }
+
+        // MVP: tools подключены → tool-loop (batch). Свободный чат → streaming. См. KDoc.
+        val tools = loadToolsOrNull()
+        ragContextAtLastTurn = ragContext
+        if (tools != null) {
+            // Tool-loop возвращает финальный артефакт; скармливаем целиком через onToken (caller
+            // видит одним блоком, без progressive — но persist/recordUsage корректны через runToolLoop).
+            val result = runToolLoop(messagesToSend, OutputBudget.maxTokensFor(model, estimatedTokens), tools, userMsg)
+            onToken(result)
+            return result
+        }
+
+        // Свободный чат: streaming.
+        val request = ChatRequest(
+            model = model,
+            messages = messagesToSend,
+            temperature = temperature,
+            // День 31: cross-provider sampling (CLI > config > null).
+            topP = topP,
+            topK = topK,
+            seed = seed,
+            stop = stop,
+            frequencyPenalty = frequencyPenalty,
+            presencePenalty = presencePenalty,
+            maxTokens = OutputBudget.maxTokensFor(model, estimatedTokens),
+            stream = true,
+        )
+        val fullContent = StringBuilder()
+        var finalUsage: com.cliagent.llm.model.Usage? = null
+        var finishReason: String? = null
+        try {
+            llmClient.chatStream(request).collect { chunk ->
+                when (chunk) {
+                    is StreamChunk.Delta -> {
+                        fullContent.append(chunk.content)
+                        onToken(chunk.content)
+                    }
+                    is StreamChunk.Reasoning -> {
+                        // Qwen3 thinking: reasoning идёт ДО content. Показываем progressive
+                        // «размышления» приглушённым цветом (caller решает как рендерить).
+                        onReasoning?.invoke(chunk.content)
+                    }
+                    is StreamChunk.Done -> {
+                        finalUsage = chunk.usage
+                        finishReason = chunk.finishReason
+                    }
+                    is StreamChunk.Error -> throw LlmCallException(
+                        chunk.code,
+                        if (chunk.message.isBlank()) "Streaming failed (code ${chunk.code})" else chunk.message
+                    )
+                }
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e   // AGENTS.md: не глотать
+        }
+
+        // Мера B: обрыв по длине (finish_reason=length) — сигналим типизированной ошибкой, как runToolLoop.
+        if (finishReason == "length") {
+            throw LlmCallException.truncated(fullContent.toString())
+        }
+
+        // Persist assistant message + post-processing — симметрично finalizeAssistant (день 17).
+        // Используем сам ChatMessage без tool_calls (свободный чат, tools=null).
+        val assistantMsg = ChatMessage(role = "assistant", content = fullContent.toString(), parentId = userMsg.id)
+        finalizeAssistant(assistantMsg, userMsg)
+        tokenCounter.recordUsage(chatId, finalUsage)
+        return fullContent.toString()
+    }
+
+    /**
      * День 17: tool-use loop. Отправляет запрос (с tools, если есть); если LLM просит tool_calls —
      * исполняет каждый через [toolExecutor], дописывает assistant(c tool_calls) + tool-result
      * сообщения в in-memory scratch (БЕЗ persist в history — иначе ломаем сериализацию/контекст и
@@ -243,6 +414,13 @@ class ContextAwareAgent(
                 model = model,
                 messages = scratch.toList(),
                 temperature = temperature,
+                // День 31: cross-provider sampling (CLI > config > null).
+                topP = topP,
+                topK = topK,
+                seed = seed,
+                stop = stop,
+                frequencyPenalty = frequencyPenalty,
+                presencePenalty = presencePenalty,
                 maxTokens = maxTokens,
                 tools = tools,
                 toolChoice = tools?.let { "auto" },

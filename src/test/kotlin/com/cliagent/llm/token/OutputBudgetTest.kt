@@ -69,4 +69,34 @@ class OutputBudgetTest {
         // 128000 - 200000 - 2000 < 0 → clamp снизу до MIN_RESERVED_OUTPUT
         assertEquals(OutputBudget.MIN_RESERVED_OUTPUT, OutputBudget.maxTokensFor("qwen2.5", 200_000))
     }
+
+    // ── День 29: qwen3:14b точная запись → реальный context 40960 (из Ollama /api/tags) ────
+
+    @Test
+    fun `qwen3 colon 14b exact match yields real context 40960 not generic 128K`() {
+        // День 29: "qwen3:14b" → точное совпадение (не prefix "qwen3") → contextWindow=40960.
+        // Раньше prefix-match давал 128K — 3x завышение реального Ollama context_length.
+        val limits = ModelLimitsRegistry.forModel("qwen3:14b")
+        assertEquals(40_960, limits.contextWindow)
+        assertEquals(8_192, limits.maxOutput)
+    }
+
+    @Test
+    fun `qwen3 14b small prompt yields maxOutput 8192`() {
+        // 40960 - 0 - 2000 = 38960 → capped до maxOutput 8192
+        assertEquals(8_192, OutputBudget.maxTokensFor("qwen3:14b", 0))
+    }
+
+    @Test
+    fun `qwen3 14b overflow prompt clamps to MIN_RESERVED_OUTPUT`() {
+        // 40960 - 50000 - 2000 < 0 → clamp снизу. Раньше (128K) промпт 50K не вызывал clamp.
+        assertEquals(OutputBudget.MIN_RESERVED_OUTPUT, OutputBudget.maxTokensFor("qwen3:14b", 50_000))
+    }
+
+    @Test
+    fun `qwen3 without size suffix still uses generic 128K entry (no regression)`() {
+        // "qwen3:7b" / "qwen3:32b" → prefix-match "qwen3" → 128K (не точная запись 14b).
+        assertEquals(128_000, ModelLimitsRegistry.forModel("qwen3:7b").contextWindow)
+        assertEquals(128_000, ModelLimitsRegistry.forModel("qwen3:32b").contextWindow)
+    }
 }

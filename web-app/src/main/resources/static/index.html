@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <meta name="theme-color" content="#1a1a2e">
+  <meta name="description" content="Мотиватор — ИИ-агент для персональной мотивации по итогам дня">
+  <title>🎯 Мотиватор</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎯</text></svg>">
+</head>
+<body>
+  <header class="header">
+    <h1 class="header__title">
+      <span class="header__title-emoji">🎯</span>
+      <span>Мотиватор</span>
+    </h1>
+    <span class="status" id="status">Запуск…</span>
+  </header>
+
+  <section class="controls">
+    <label class="controls__label" for="temperature">🌡️ Температура</label>
+    <input
+      type="range"
+      id="temperature"
+      class="controls__slider"
+      min="0"
+      max="1.5"
+      step="0.05"
+      value="0.7"
+    >
+    <span class="controls__value" id="temperature-value">0.70</span>
+  </section>
+
+  <main class="chat-window" id="chat-window">
+    <div class="empty-state" id="empty-state">
+      <span class="empty-state__emoji">📝</span>
+      <p class="empty-state__text">
+        Расскажи, что удалось сделать сегодня — полностью или отчасти.
+        Мотиватор подберёт персональный поддерживающий отклик.
+      </p>
+    </div>
+  </main>
+
+  <footer class="input-area">
+    <textarea
+      id="message-input"
+      class="input-area__textarea"
+      placeholder="Что удалось сделать сегодня?"
+      rows="1"
+      autocomplete="off"
+    ></textarea>
+    <button id="send-button" class="input-area__button" type="button">Отправить</button>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

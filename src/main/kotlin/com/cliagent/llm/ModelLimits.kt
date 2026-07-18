@@ -29,6 +29,11 @@ object ModelLimitsRegistry {
         "glm-4.5-air" to ModelLimits(contextWindow = 128_000, maxOutput = 8_192),
         // Ollama-локальные (Qwen2.5): 128K контекст, ~8K output на M3 Pro
         "qwen2.5"     to ModelLimits(contextWindow = 128_000, maxOutput = 8_192),
+        // День 29: qwen3:14b — точная запись с РЕАЛЬНЫМ context_length=40960 (из Ollama /api/tags),
+        // не 128K из generic qwen3. `forModel()` сначала проверяет точное совпадение → "qwen3:14b"
+        // резолвится сюда, а qwen3:7b/32b — в prefix-запись "qwen3" ниже. Предотвращает 3x-завышение
+        // contextLimit → корректный warning при overflow + точный OutputBudget.
+        "qwen3:14b"   to ModelLimits(contextWindow = 40_960, maxOutput = 8_192),
         "qwen3"       to ModelLimits(contextWindow = 128_000, maxOutput = 8_192),
         "llama3.1"    to ModelLimits(contextWindow = 128_000, maxOutput = 8_192),
         "mistral-nemo" to ModelLimits(contextWindow = 128_000, maxOutput = 8_192),

@@ -95,7 +95,7 @@ class ReplEngine {
         )
         val rag = ArgumentCompleter(
             StringsCompleter("/rag"),
-            StringsCompleter("index", "stats", "compare", "compare-modes", "search", "config", "on", "off", "eval", "rewrite", "rerank", "scenario"),
+            StringsCompleter("index", "stats", "compare", "compare-modes", "compare-local", "search", "config", "on", "off", "eval", "rewrite", "rerank", "scenario"),
             // День 23: подсказки значений для rewrite/rerank (3-й аргумент).
             StringsCompleter("identity", "heuristic", "llm", "none", "threshold", "fixed", "structural")
         )
@@ -103,6 +103,13 @@ class ReplEngine {
             StringsCompleter("/mcp"),
             StringsCompleter("add", "remove", "enable", "disable", "on", "off", "list-tools")
         )
-        return AggregateCompleter(top, strategy, branch, memory, profile, task, invariants, mode, rag, mcp)
+        // День 26: /local — live-switch cloud ↔ локальная Ollama без рестарта REPL.
+        // День 27: + mark on|off|status (маркировка ответов моделью-источником).
+        val local = ArgumentCompleter(
+            StringsCompleter("/local"),
+            StringsCompleter("on", "off", "status", "smoke", "mark"),
+            StringsCompleter("qwen3:14b", "on", "off", "status")
+        )
+        return AggregateCompleter(top, strategy, branch, memory, profile, task, invariants, mode, rag, mcp, local)
     }
 }
