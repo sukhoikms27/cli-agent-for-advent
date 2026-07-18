@@ -1,0 +1,108 @@
+# День 32 — AI Code Review pipeline.
+#
+# Триггер: открытие/обновление Pull Request. Workflow:
+#   1. Чекаут репозитория + JDK 21 + Kotlin.
+#   2. Сборка CLI fat-jar (root модуль) через shadowJar-эквивалент (installDist).
+#   3. Получение PR-diff через gh CLI (`gh pr diff`).
+#   4. Запуск `cli-agent review-pr` с diff на stdin (локальная Ollama для RAG — опциональна).
+#   5. Постинг результата как PR-комментарий через `gh pr comment`.
+#
+# Секреты (Settings → Secrets):
+#   CLI_AGENT_API_KEY  — LLM API key (z.ai или OpenAI-compatible). Без него ревью не запустится.
+#   CLI_AGENT_MODEL    — (опц.) модель; default берётся из config.json репозитория.
+#
+# Error handling (лекция нед.7): при падении LLM/sборки — комментарий с ошибкой, не silent fail.
+# RAG отключён по умолчанию (нет Ollama в CI) — флаг --no-rag. Включить можно self-hosted runner
+# с Ollama (убрать --no-rag + поднять Ollama на runner'е).
+
+name: AI Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to review'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write   # нужно для gh pr comment
+
+jobs:
+  ai-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Get PR number
+        id: pr
+        run: |
+          if [ -n "${{ inputs.pr_number }}" ]; then
+            echo "number=${{ inputs.pr_number }}" >> $GITHUB_OUTPUT
+          else
+            echo "number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build CLI
+        run: ./gradlew installDist -q
+
+      - name: Fetch PR diff
+        id: diff
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DIFF=$(gh pr diff ${{ steps.pr.outputs.number }})
+          # Сохраняем во временный файл (CLI принимает путь или stdin).
+          echo "$DIFF" > pr.diff
+          LINES=$(wc -l < pr.diff)
+          echo "lines=$LINES" >> $GITHUB_OUTPUT
+          echo "Fetched diff: $LINES lines"
+
+      - name: Run AI review
+        id: review
+        env:
+          CLI_AGENT_API_KEY: ${{ secrets.CLI_AGENT_API_KEY }}
+          CLI_AGENT_MODEL: ${{ vars.CLI_AGENT_MODEL }}
+        run: |
+          # --no-rag: без локальной Ollama в CI. --quiet: минимум вывода в лог.
+          # При ошибке (нет ключа / LLM упала) — сохраняем сообщение, не падаем (fail-soft).
+          set +e
+          ./build/install/cli-agent/bin/cli-agent review-pr pr.diff --no-rag --quiet > review.md 2> review.err
+          EXIT=$?
+          if [ $EXIT -ne 0 ] || [ ! -s review.md ]; then
+            echo "⚠️ AI review failed (exit $EXIT)." > review.md
+            echo "" >> review.md
+            cat review.err >> review.md 2>/dev/null || true
+            echo "Убедитесь, что секрет CLI_AGENT_API_KEY настроен." >> review.md
+          fi
+          echo "exit=$EXIT" >> $GITHUB_OUTPUT
+
+      - name: Post review comment
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Формируем комментарий с заголовком и содержимым review.
+          {
+            echo "## 🤖 AI Code Review"
+            echo ""
+            echo "<sub>Автоматическое ревью через \`cli-agent review-pr\` (день 32). "
+            echo "Запуск: [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})</sub>"
+            echo ""
+            cat review.md
+          } | gh pr comment ${{ steps.pr.outputs.number }} --body-file -
