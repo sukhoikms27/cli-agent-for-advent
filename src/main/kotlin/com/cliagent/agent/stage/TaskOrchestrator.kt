@@ -77,11 +77,22 @@ class TaskOrchestrator(
      * поведение). Wiring (ChatCommand) подставляет StatefulAgent.chat → инварианты покрывают
      * stage-flow, а не только свободный чат.
      */
-    private val chat: suspend (String) -> String = { userMsg -> agent.chat(userMsg) }
+    private val chat: suspend (String) -> String = { userMsg -> agent.chat(userMsg) },
+    /**
+     * День 34 (stage/swarm интеграция): провайдер toolExecutor по taskKind.
+     *
+     * Вызывается в [startTask] после классификации kind, чтобы переключить executor на подходящий
+     * для задачи (FILE_OP → FileToolExecutor с gate; иначе → composite с MCP). Default null —
+     * ничего не делает (executor остаётся прежним, поведение дней 13-33).
+     *
+     * Контракт: должен возвращать либо новый executor, либо null (оставить прежний). Если
+     * функция бросает — ошибка логируется, executor не меняется (fail-safe).
+     */
+    private val toolExecutorProvider: (suspend (com.cliagent.state.TaskKind?) -> com.cliagent.agent.ToolExecutor?)? = null,
 ) {
     // effective swarm mode: swarmMode имеет приоритет; legacy swarm=true → ON только если swarmMode=OFF.
     private val effectiveSwarmMode: com.cliagent.agent.swarm.SwarmMode =
-        if (swarm && swarmMode == com.cliagent.agent.swarm.SwarmMode.OFF) com.cliagent.agent.swarm.SwarmMode.ON
+        if (swarm && swarmMode == com.cliagent.agent.swarm.SwarmMode.ON) com.cliagent.agent.swarm.SwarmMode.ON
         else swarmMode
     private val agentsExplicitlySet: Boolean = agents != null
     private var agents: Map<TaskStage, StageAgent> = agents ?: defaultAgents(effectiveSwarmMode)
@@ -114,8 +125,21 @@ class TaskOrchestrator(
         // День 21 (W2): сложность задачи → пересобираем реестр агентов (если AUTO и не задан явно).
         // TRIVIAL → все single-agent; MODERATE/COMPLEX → применяем AUTO-гейт. OFF/ON игнорируют complexity.
         val complexity = complexityClassifier.classify(taskDescription)
-        if (effectiveSwarmMode == com.cliagent.agent.swarm.SwarmMode.AUTO && !agentsExplicitlySet) {
-            agents = defaultAgents(effectiveSwarmMode, complexity)
+        // День 34: taskKind (FILE_OP/PR_REVIEW) → переопределяем stage-executor'ов (если реестр
+        // не задан явно через конструктор). FILE_OP → swarm на EXECUTION; PR_REVIEW → ReviewValidationAgent.
+        if (!agentsExplicitlySet) {
+            agents = defaultAgents(effectiveSwarmMode, complexity, kind)
+        }
+        // День 34: переключить toolExecutor по taskKind (FILE_OP → FileToolExecutor с gate,
+        // без MCP filesystem который обходит gate; иначе → composite с MCP). Provider из wiring'а.
+        if (toolExecutorProvider != null) {
+            val newExecutor = try {
+                toolExecutorProvider(kind)
+            } catch (e: Throwable) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                null   // fail-safe: ошибка provider'а — оставляем прежний executor
+            }
+            agent.setToolExecutor(newExecutor)
         }
         agent.setTaskState(
             TaskState(
@@ -422,10 +446,17 @@ class TaskOrchestrator(
          *
          * [complexity] (волна W2): при TRIVIAL — простые агенты на ВСЕХ стадиях (рой не окупается);
          *   учитывается только в AUTO. null трактуется как MODERATE.
+         *
+         * День 34 (stage/swarm интеграция): [taskKind] переопределяет отдельных stage-executor'ов:
+         * - [TaskKind.PR_REVIEW] → VALIDATION = [ReviewValidationAgent] (markdown-отчёт вместо PASS/REWORK).
+         * - [TaskKind.FILE_OP] → EXECUTION = SwarmStageAgent (lead→workers→integrate, file-tools через composite).
+         *   Остальные kind сохраняют дефолтное поведение (simple/swarm по swarmMode/complexity).
+         *   null = неизвестен → универсальный реестр (как дней 13-33).
          */
         fun defaultAgents(
             swarmMode: com.cliagent.agent.swarm.SwarmMode,
             complexity: com.cliagent.state.TaskComplexity? = null,
+            taskKind: com.cliagent.state.TaskKind? = null,
         ): Map<TaskStage, StageAgent> {
             // Stage→swarm decision. ON = рой везде; OFF = нигде; AUTO = адаптивно.
             val swarmStages: Set<TaskStage> = when (swarmMode) {
@@ -442,7 +473,21 @@ class TaskOrchestrator(
                 }
             }
             return TaskStage.entries.associateWith { stage ->
-                if (stage in swarmStages) SwarmStageAgent(stage) else simpleAgent(stage)
+                // День 34: taskKind-specific overrides имеют приоритет над swarm-логикой.
+                when {
+                    // PR_REVIEW на VALIDATION → ReviewValidationAgent (single-pass анализ diff).
+                    taskKind == com.cliagent.state.TaskKind.PR_REVIEW && stage == TaskStage.VALIDATION ->
+                        ReviewValidationAgent()
+                    // FILE_OP на EXECUTION → swarm с PARTITION по независимым файлам/директориям.
+                    // Lead изучает структуру (shared-research), декомпозирует на независимые подзадачи,
+                    // workers параллельно работают каждый со своим набором файлов.
+                    // specFor(EXECUTION, FILE_OP) = PARTITION/5 + workerTimeoutMs=240с (для tool-loop'а).
+                    taskKind == com.cliagent.state.TaskKind.FILE_OP && stage == TaskStage.EXECUTION ->
+                        com.cliagent.agent.swarm.SwarmStageAgent(stage)
+                    // Дефолт: swarm по swarmMode + complexity.
+                    stage in swarmStages -> com.cliagent.agent.swarm.SwarmStageAgent(stage)
+                    else -> simpleAgent(stage)
+                }
             }
         }
 

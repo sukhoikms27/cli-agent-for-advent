@@ -25,5 +25,25 @@ enum class TaskKind {
     WRITING,
 
     /** Объяснение концепции/теории; код не нужен. */
-    EXPLANATION
+    EXPLANATION,
+
+    /**
+     * День 34 (stage/swarm интеграция): операции с файлами проекта.
+     *
+     * Агент работает через file-tools (read_file/find_in_files/list_project_files/write_file)
+     * на стадии EXECUTION. На swarm'ится (lead→workers→integrate): lead декомпозирует цель на
+     * file-операции, workers параллельно читают/ищут, integrate собирает отчёт/предложения.
+     * Routing: taskKindClassifier распознаёт по формулировкам «обнови README», «найди все TODO»,
+     * «проверь соответствие файлов», и т.п.
+     */
+    FILE_OP,
+
+    /**
+     * День 34 (stage/swarm интеграция): ревью изменений (diff/git).
+     *
+     * На VALIDATION запускается [com.cliagent.agent.stage.ReviewValidationAgent] — single-pass
+     * анализ diff'а против стандартов проекта (RAG + SystemPrompts.codeReviewer). Артефакт verdict
+     * = markdown-отчёт. Routing: «проанализируй diff», «отревьюй PR», «проверь изменения».
+     */
+    PR_REVIEW,
 }

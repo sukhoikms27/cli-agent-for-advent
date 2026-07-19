@@ -1,0 +1,140 @@
+# День 32 — AI Code Review pipeline.
+#
+# Триггер: открытие/обновление Pull Request. Workflow:
+#   1. Чекаут репозитория + JDK 21 + Kotlin.
+#   2. Сборка CLI (root модуль) через installDist.
+#   3. Скачать пред-built RAG-индекс с VPS (13MB, 496 чанков, ~1 сек).
+#   4. Получение PR-diff через gh CLI (`gh pr diff`).
+#   5. Запуск `cli-agent review-pr` с diff + RAG (query embedding через VPS Ollama).
+#   6. Постинг результата как PR-комментарий через `gh pr comment`.
+#
+# RAG architecture (pred-built index + remote query embedding):
+#   - Индекс построен ОДИН раз локально (локальная Ollama ~10 сек) и хранится на VPS.
+#     CI скачивает его (~1 сек) вместо медленной индексации на CPU (~22 мин).
+#   - Query embedding (1 запрос на ревью) идёт через VPS Ollama /api/embed (~22 сек).
+#   - Полное время RAG в CI: ~25 сек (скачать + embed query), без cloud billing.
+#
+# Секреты (Settings → Secrets):
+#   CLI_AGENT_API_KEY              — LLM API key (z.ai или OpenAI-compatible). Обязательный.
+#   CLI_AGENT_RAG_EMBEDDING_TOKEN  — bearer для embedding/index endpoint на VPS (Caddy).
+#
+# Переменные (Settings → Variables, не секреты):
+#   CLI_AGENT_MODEL                — (опц.) модель LLM; default берётся из config.json репозитория.
+#
+# Error handling (лекция нед.7): при падении LLM/sборки — комментарий с ошибкой, не silent fail.
+
+name: AI Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to review'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write   # нужно для gh pr comment
+
+jobs:
+  ai-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Get PR number
+        id: pr
+        run: |
+          if [ -n "${{ inputs.pr_number }}" ]; then
+            echo "number=${{ inputs.pr_number }}" >> $GITHUB_OUTPUT
+          else
+            echo "number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build CLI
+        run: ./gradlew installDist -q
+
+      - name: Download pre-built RAG index from VPS
+        env:
+          RAG_TOKEN: ${{ secrets.CLI_AGENT_RAG_EMBEDDING_TOKEN }}
+        run: |
+          # Индекс кладётся в XDG_DATA_HOME, где его ищет JsonRagStore (AppPaths.ragIndexFile).
+          mkdir -p ~/.local/share/cli-agent/rag
+          echo "Downloading pre-built RAG index from VPS (~13MB)…"
+          HTTP_CODE=$(curl -s -w "%{http_code}" -o ~/.local/share/cli-agent/rag/index.json \
+            -H "Authorization: Bearer $RAG_TOKEN" \
+            http://77.91.94.114:11435/rag/index.json)
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "⚠️ Failed to download RAG index (HTTP $HTTP_CODE). Review will run without RAG."
+          else
+            SIZE=$(wc -c < ~/.local/share/cli-agent/rag/index.json)
+            echo "✓ Downloaded RAG index: $SIZE bytes"
+          fi
+
+      - name: Fetch PR diff
+        id: diff
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DIFF=$(gh pr diff ${{ steps.pr.outputs.number }})
+          # Сохраняем во временный файл (CLI принимает путь или stdin).
+          echo "$DIFF" > pr.diff
+          LINES=$(wc -l < pr.diff)
+          echo "lines=$LINES" >> $GITHUB_OUTPUT
+          echo "Fetched diff: $LINES lines"
+
+      - name: Run AI review
+        id: review
+        env:
+          # LLM для генерации ревью.
+          CLI_AGENT_API_KEY: ${{ secrets.CLI_AGENT_API_KEY }}
+          CLI_AGENT_MODEL: ${{ vars.CLI_AGENT_MODEL }}
+          # День 32: query embedding через VPS Ollama (Caddy + bearer, только /api/embed).
+          # Индекс уже скачан предыдущим шагом — embedding нужен только для самого запроса ревью.
+          CLI_AGENT_RAG_EMBEDDING_URL: http://77.91.94.114:11435
+          CLI_AGENT_RAG_EMBEDDING_TOKEN: ${{ secrets.CLI_AGENT_RAG_EMBEDDING_TOKEN }}
+          # Query — один запрос (не batch), batch=1 оптимален для одного embedding.
+          CLI_AGENT_RAG_EMBEDDING_BATCH: "1"
+        run: |
+          # RAG включён (default): индекс пред-built (скачан), query embedding через VPS.
+          # --quiet: минимум вывода в лог. При ошибке (нет ключа / LLM упала) — fail-soft.
+          set +e
+          ./build/install/cli-agent/bin/cli-agent review-pr pr.diff --quiet > review.md 2> review.err
+          EXIT=$?
+          if [ $EXIT -ne 0 ] || [ ! -s review.md ]; then
+            echo "⚠️ AI review failed (exit $EXIT)." > review.md
+            echo "" >> review.md
+            cat review.err >> review.md 2>/dev/null || true
+            echo "Убедитесь, что секреты CLI_AGENT_API_KEY и CLI_AGENT_RAG_EMBEDDING_TOKEN настроены." >> review.md
+          fi
+          echo "exit=$EXIT" >> $GITHUB_OUTPUT
+
+      - name: Post review comment
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Формируем комментарий с заголовком и содержимым review.
+          {
+            echo "## 🤖 AI Code Review"
+            echo ""
+            echo "<sub>Автоматическое ревью через \`cli-agent review-pr\` (день 32, RAG: pred-built index + VPS query embedding). "
+            echo "Запуск: [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})</sub>"
+            echo ""
+            cat review.md
+          } | gh pr comment ${{ steps.pr.outputs.number }} --body-file -

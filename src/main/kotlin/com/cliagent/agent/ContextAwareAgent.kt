@@ -74,13 +74,30 @@ class ContextAwareAgent(
     private val contextManager: ContextManager? = null,
     private val profileExtractor: ProfileExtractor? = null,
     private val autoProfileEvery: Int = 0,   // 0 = авто-извлечение профиля выключено
-    private val toolExecutor: ToolExecutor? = null,   // день 17: null = tools отключены (поведение дней 1–16)
+    /**
+     * День 17: null = tools отключены (поведение дней 1–16).
+     *
+     * День 34 (stage/swarm интеграция): `var` для динамического переключения по taskKind.
+     * TaskOrchestrator при старте задачи определяет FILE_OP/PR_REVIEW и меняет executor:
+     *  - FILE_OP → FileToolExecutor с DangerousOpGate (без MCP filesystem — он обходит gate).
+     *  - иначе → CompositeToolExecutor с MCP (включая filesystem) + опционально read-only file-tools.
+     */
+    private var toolExecutor: ToolExecutor? = null,
     /**
      * День 20: лимит раундов tool-use loop. Default **8** (вместо прежнего `const 4`) — для
      * «длинного флоу» оркестрации нескольких MCP-серверов (search→read→format→save + повторы).
      * Конфигурируется через [com.cliagent.config.AppConfig.maxToolRounds] (config.json / env).
      */
     private val maxToolRounds: Int = 8,
+    /**
+     * День 33 (support-app refinement): override инструкции retrieved-context блока.
+     *
+     * Default null → стандартный формат PromptBuilder («1) Ответ / 2) Источники / 3) Цитаты»),
+     * нужный dev-assistant'у для прозрачности источников. Support-агент передаёт непустую
+     * строку, чтобы убрать обязательные citations-секции (конечный пользователь их не видит).
+     * См. [com.cliagent.agent.PromptBuilder].
+     */
+    private val retrievedInstructionOverride: String? = null,
     /**
      * День 19: sink для статусного вывода (compress-warnings, tool-call-лог). **Default `::println`**
      * сохраняет поведение вне REPL (тесты, batch). В REPL подключается к [com.cliagent.cli.AppTerminal.println] —
@@ -119,6 +136,13 @@ class ContextAwareAgent(
      * `/rag scenario` мог форсировать режим в рантайме и восстанавливать в finally.
      */
     private var conversationalQuery: Boolean = false,
+    /**
+     * День 34 (refinement): минимальная длина сообщения для RAG-retrieval. Короткие сообщения
+     * («да», «переходим») не триггерят retrieval — это устраняет загрязнение контекста и лишние
+     * embedding-вызовы. Default 0 (backward-compat: всегда retrieve, как дней 22-33).
+     * В продакшн-wiring (ChatCommand.buildSession) передаётся 20 — отсеивать подтверждения.
+     */
+    private val ragMinQueryChars: Int = 0,
     /**
      * День 24: sink для результата пост-чека цитирования ([CitationDetector.detect]). **Default
      * noop** — сам чек идёт через [logger] (warning поверх спиннера). Этот колбэк — для `/rag eval`
@@ -190,7 +214,12 @@ class ContextAwareAgent(
         // Мягкая деградация: ошибка эмбеддинга/пустой индекс → ragContext=null → агент отвечает без RAG.
         // День 25: conversation-aware retrieval — запрос обогащается целью диалога + последними
         // репликами, чтобы follow-up находили контекст. conversationalQuery=false → только userMessage.
-        val ragContext = if (isRagEnabled()) {
+        //
+        // День 34 (refinement): heuristic pre-filter — пропускаем retrieval для коротких команд
+        // и подтверждений перехода стадии («да», «переходим», «нет», «y»). Они не являются
+        // семантическими запросами к базе знаний, retrieval только загрязняет контекст + тратит
+        // embedding-вызовы. Фильтр: <20 символов И не содержит вопросительных слов/файловых путей.
+        val ragContext = if (isRagEnabled() && shouldRetrieve(userMessage)) {
             val retrievalQuery = if (conversationalQuery) buildConversationQuery(userMessage) else userMessage
             val hits = ragRetriever?.retrieve(retrievalQuery)
             when {
@@ -290,8 +319,8 @@ class ContextAwareAgent(
             }
         }
 
-        // RAG-retrieval — симметрично chat() (день 22/25).
-        val ragContext = if (isRagEnabled()) {
+        // RAG-retrieval — симметрично chat() (день 22/25). День 34: тот же heuristic pre-filter.
+        val ragContext = if (isRagEnabled() && shouldRetrieve(userMessage)) {
             val retrievalQuery = if (conversationalQuery) buildConversationQuery(userMessage) else userMessage
             val hits = ragRetriever?.retrieve(retrievalQuery)
             when {
@@ -445,6 +474,10 @@ class ContextAwareAgent(
                         val args = parseToolArgs(tc.function.arguments)
                         logger("🔧 Tool call: ${tc.function.name}${formatToolArgs(args)}")
                         val toolResult = execTool(tc.function.name, args)
+                        // День 34: логируем результат tool-call — критично для отладки.
+                        // LLM может вызывать tool без path (пустые args) → результат подскажет почему.
+                        val preview = toolResult.take(120).replace("\n", " ")
+                        logger("   → $preview")
                         scratch.add(ChatMessage(role = "tool", content = toolResult, toolCallId = tc.id))
                     }
                     rounds++
@@ -571,7 +604,7 @@ class ContextAwareAgent(
      * payload (например, содержимое отчёта в format_report/save_to_file). Null/пустые args → пустая строка.
      */
     private fun formatToolArgs(args: Map<String, Any?>): String {
-        if (args.isEmpty()) return ""
+        if (args.isEmpty()) return "(no args)"   // День 34: явный маркер пустых args для отладки
         return args.entries.joinToString(
             separator = ", ",
             prefix = "(",
@@ -594,6 +627,13 @@ class ContextAwareAgent(
         val TOOL_SCOPED_STAGES: Set<com.cliagent.state.TaskStage> = setOf(
             com.cliagent.state.TaskStage.EXECUTION,
             com.cliagent.state.TaskStage.VALIDATION,
+        )
+        // День 34 (refinement): heuristic pre-filter для RAG-retrieval.
+        const val RAG_MIN_QUERY_CHARS = 20
+        val STAGE_TRANSITION_PHRASES = setOf(
+            "да", "нет", "y", "n", "yes", "no", "ок", "ok", "хорошо", "понятно",
+            "переходим", "продолжай", "выполняй", "согласен", "подтверждаю", "утверждаю",
+            "следующая", "дальше", "вперед", "next", "continue", "go", "done",
         )
     }
 
@@ -644,7 +684,10 @@ class ContextAwareAgent(
             else -> systemPrompt
         }
         // Слоёный system prompt: base + [long-term] + [working] + [retrieved]; пустые слои элизируются
-        val system = PromptBuilder(baseSystem, longTermMemory, workingMemory, ragContext).build()
+        val system = PromptBuilder(
+            baseSystem, longTermMemory, workingMemory, ragContext,
+            retrievedInstructionOverride = retrievedInstructionOverride,
+        ).build()
 
         // If contextManager is set, delegate to strategy
         if (contextManager != null) {
@@ -722,6 +765,32 @@ class ContextAwareAgent(
 
     /** Активен ли RAG-режим агента (инъекция retrieved-чанков). null retriever → всегда false. */
     fun isRagEnabled(): Boolean = ragEnabled && ragRetriever != null
+
+    /**
+     * День 34 (refinement): heuristic pre-filter для RAG-retrieval.
+     *
+     * Пропускает retrieval для сообщений, которые **не являются** семантическими запросами к
+     * базе знаний: короткие подтверждения, команды перехода стадии, свободный чат вне контекста.
+     * Это устраняет загрязнение контекста и лишние embedding-вызовы (каждый retrieval = embed
+     * + topK + rerank = 1-3 сек на cloud, 30+ сек на локальной Ollama).
+     *
+     * Эвристика (детерминированная, без LLM):
+     *  1. Короткие команды перехода стадии («да», «переходим», «выполняй») → skip.
+     *  2. Сообщения <20 символов → skip (типичные подтверждения).
+     *  3. Длинные сообщения (≥20 символов) → retrieve (считаем их потенциально релевантными).
+     *
+     * Граничный случай: «как вернуть деньги за премиум?» (30 символов) — проходит фильтр,
+     * т.к. длина ≥20. Короткое «да» (2 символа) — не проходит (команда перехода + короткое).
+     */
+    private fun shouldRetrieve(userMessage: String): Boolean {
+        val msg = userMessage.trim()
+        // 1. Явные команды перехода стадии — skip независимо от длины.
+        if (msg.lowercase() in STAGE_TRANSITION_PHRASES) return false
+        // 2. Короткие сообщения (<ragMinQueryChars) — skip.
+        if (msg.length < ragMinQueryChars) return false
+        // 3. Остальные — retrieve.
+        return true
+    }
 
     /** Включить/выключить RAG-режим в рантайме (`/rag on|off`). Нет retriever'а — noop. */
     fun setRagEnabled(enabled: Boolean) {
@@ -812,6 +881,22 @@ class ContextAwareAgent(
         val w = getWorkingMemory() ?: WorkingMemory()
         setWorkingMemory(w.copy(taskState = state))
     }
+
+    /**
+     * День 34 (stage/swarm интеграция): переключить toolExecutor по taskKind.
+     *
+     * TaskOrchestrator при старте задачи вызывает это после определения kind.
+     *  - FILE_OP: заменяет на FileToolExecutor (с gate), без MCP filesystem.
+     *  - null/другой: возвращает предыдущий executor (с MCP), либо null если был null.
+     *
+     * Безопасно: меняется только в начале задачи (до первого LLM-вызова на EXECUTION).
+     */
+    fun setToolExecutor(executor: ToolExecutor?) {
+        toolExecutor = executor
+    }
+
+    /** Текущий toolExecutor (для диагностики и /mcp в REPL). */
+    fun currentToolExecutor(): ToolExecutor? = toolExecutor
 
     /**
      * Канонический переход вперёд ([TaskStateMachine.next]); null если некуда/нет задачи.
