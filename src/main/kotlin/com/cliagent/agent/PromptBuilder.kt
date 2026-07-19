@@ -29,12 +29,26 @@ class PromptBuilder(
     private val longTerm: LongTermMemory?,
     private val working: WorkingMemory?,
     private val retrievedContext: List<ScoredChunk>? = null,
+    /**
+     * День 33 (support-app refinement): переопределить шаблон инструкции retrieved-блока.
+     *
+     * По умолчанию (null) используется [renderRetrievedBlock] с жёстким форматом
+     * «1) Ответ / 2) Источники / 3) Цитаты» — это нужно dev-assistant'у (день 24) для
+     * прозрачности источников. Support-агенту (день 33) этот формат **не нужен** — конечный
+     * пользователь не должен видеть формальные citations-секции.
+     *
+     * При передаче непустой строки — она замещает стандартный заголовок-инструкцию (строки
+     * «1) Ответ… 2) Источники… 3) Цитаты…»), но чанки рендерятся как и раньше (для обоснования).
+     */
+    private val retrievedInstructionOverride: String? = null,
 ) {
     fun build(): ChatMessage {
         val parts = mutableListOf(baseSystem.content)
         longTerm?.takeIf { !it.isEmpty() }?.let { parts.add(it.renderBlock()) }
         working?.takeIf { !it.isEmpty() }?.let { parts.add(it.renderBlock()) }
-        retrievedContext?.takeIf { it.isNotEmpty() }?.let { parts.add(it.renderRetrievedBlock()) } // день 22
+        retrievedContext?.takeIf { it.isNotEmpty() }?.let {
+            parts.add(it.renderRetrievedBlock(retrievedInstructionOverride))
+        }
         longTerm?.renderInvariantsBlock()?.let { parts.add(it) }   // день 14: блок инвариантов
         // Все слои пусты  parts == [baseSystem.content]  контент неизменен
         return baseSystem.copy(content = parts.joinToString("\n\n"))
@@ -124,13 +138,20 @@ internal fun UserProfile.renderBlock(): String {
  * Пост-чек выполнения инструкции — в [com.cliagent.agent.ContextAwareAgent.finalizeAssistant]
  * через [com.cliagent.rag.CitationDetector] (warning only, не re-prompt).
  */
-internal fun List<ScoredChunk>.renderRetrievedBlock(): String {
+internal fun List<ScoredChunk>.renderRetrievedBlock(
+    instructionOverride: String? = null,
+): String {
     val lines = mutableListOf<String>()
-    lines.add("[Retrieved context — ответь СТРОГО по этим источникам, не выдумывай. Формат ответа:]")
-    lines.add("  1) Ответ: суть по чанкам своими словами")
-    lines.add("  2) Источники: перечисли каждый использованный source › section (chunk_id)")
-    lines.add("  3) Цитаты: дословные фрагменты из чанков в кавычках «...» с указанием источника")
-    lines.add("  Если чанки не содержат ответа на вопрос — так и скажи: «не знаю, уточните вопрос».")
+    if (instructionOverride != null) {
+        lines.add("[Retrieved context]")
+        lines.add(instructionOverride)
+    } else {
+        lines.add("[Retrieved context — ответь СТРОГО по этим источникам, не выдумывай. Формат ответа:]")
+        lines.add("  1) Ответ: суть по чанкам своими словами")
+        lines.add("  2) Источники: перечисли каждый использованный source › section (chunk_id)")
+        lines.add("  3) Цитаты: дословные фрагменты из чанков в кавычках «...» с указанием источника")
+        lines.add("  Если чанки не содержат ответа на вопрос — так и скажи: «не знаю, уточните вопрос».")
+    }
     lines.add("Найденные чанки:")
     forEachIndexed { i, sc ->
         val chunk = sc.chunk

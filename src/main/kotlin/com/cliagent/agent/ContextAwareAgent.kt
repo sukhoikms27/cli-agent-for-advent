@@ -82,6 +82,15 @@ class ContextAwareAgent(
      */
     private val maxToolRounds: Int = 8,
     /**
+     * День 33 (support-app refinement): override инструкции retrieved-context блока.
+     *
+     * Default null → стандартный формат PromptBuilder («1) Ответ / 2) Источники / 3) Цитаты»),
+     * нужный dev-assistant'у для прозрачности источников. Support-агент передаёт непустую
+     * строку, чтобы убрать обязательные citations-секции (конечный пользователь их не видит).
+     * См. [com.cliagent.agent.PromptBuilder].
+     */
+    private val retrievedInstructionOverride: String? = null,
+    /**
      * День 19: sink для статусного вывода (compress-warnings, tool-call-лог). **Default `::println`**
      * сохраняет поведение вне REPL (тесты, batch). В REPL подключается к [com.cliagent.cli.AppTerminal.println] —
      * критично: спиннер крутится **во время** chat(), и сырой `println` (stdout) затирается анимацией
@@ -644,7 +653,10 @@ class ContextAwareAgent(
             else -> systemPrompt
         }
         // Слоёный system prompt: base + [long-term] + [working] + [retrieved]; пустые слои элизируются
-        val system = PromptBuilder(baseSystem, longTermMemory, workingMemory, ragContext).build()
+        val system = PromptBuilder(
+            baseSystem, longTermMemory, workingMemory, ragContext,
+            retrievedInstructionOverride = retrievedInstructionOverride,
+        ).build()
 
         // If contextManager is set, delegate to strategy
         if (contextManager != null) {
