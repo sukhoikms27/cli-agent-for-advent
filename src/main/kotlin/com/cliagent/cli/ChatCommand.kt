@@ -286,13 +286,52 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
         val profileExtractor = if (autoProfile) ProfileExtractor(client, model) else null
 
         val mcpServers = config.mcp.filter { it.enabled }
+        // День 34: composite toolExecutor — собираем все доступные исполнители в один.
+        // 1. In-process FileToolExecutor — всегда доступен на EXECUTION/VALIDATION (TOOL_SCOPED_STAGES).
+        //    Gate: TtyGate в REPL (y/N prompt), RejectAllGate в batch. Существующий confirmWritePrompt
+        //    адаптируется через TtyGate.
+        val projectRoot = java.io.File(System.getProperty("user.dir"))
+        // День 34: универсальный gate для всех опасных операций (write_file, delete_file, ...).
+        // confirmDangerousOp рендерит preview по op+args и спрашивает y/N — не нужно перечислять
+        // каждую операцию в when. Добавляя новый op в executor, НЕ нужно править этот gate.
+        val fileGate = com.cliagent.agent.TtyGate { op, args -> confirmDangerousOp(op, args) }
+        val fileExecutor = com.cliagent.agent.FileToolExecutor(root = projectRoot, gate = fileGate)
+
+        // 2. MCP-executor'ы из config.json (как дней 20).
+        // День 34: ИСКЛЮЧАЕМ MCP filesystem — он дублирует наш FileToolExecutor, но обходит
+        // DangerousOpGate (write_file/delete_file через MCP срабатывают без y/N подтверждения).
+        // Наш FileToolExecutor покрывает read/find/list/write/delete с gate — безопаснее.
+        // Если пользователь хочет MCP filesystem — он может убрать эту фильтрацию, но тогда
+        // опасные операции НЕ будут проходить через подтверждение.
+        val mcpExecutors = mcpServers
+            .filter { it.name.lowercase() != "filesystem" }
+            .map { server ->
+                com.cliagent.agent.NamedToolExecutor(
+                    name = server.name,
+                    delegate = com.cliagent.mcp.McpToolExecutor(server.toTransport()),
+                )
+            }
+        // Предупредить пользователя если filesystem MCP был исключён.
+        if (mcpServers.any { it.name.lowercase() == "filesystem" }) {
+            AppTerminal.println(com.github.ajalt.mordant.rendering.TextColors.yellow(
+                "ℹ️  MCP 'filesystem' исключён — file-операции через встроенный FileToolExecutor " +
+                    "с подтверждением опасных действий. (День 34: MCP filesystem обходит gate.)"
+            ))
+        }
+
+        // 3. Initial composite для free-chat (до /task): MCP + read-only file-tools.
+        // Write через file-tools отключён (RejectAllGate) — write в free-chat не нужен.
+        // При /task start с FILE_OP — provider переключит на fileExecutor с TtyGate (write разрешён).
+        val readOnlyFileExecutor = com.cliagent.agent.FileToolExecutor(
+            root = projectRoot,
+            gate = com.cliagent.agent.RejectAllGate(),
+        )
         val toolExecutor: com.cliagent.agent.ToolExecutor? = when {
-            mcpServers.size >= 2 -> com.cliagent.mcp.CompositeMcpToolExecutor(
-                servers = mcpServers,
+            mcpExecutors.isNotEmpty() -> com.cliagent.agent.CompositeToolExecutor(
+                executors = listOf(com.cliagent.agent.NamedToolExecutor("file-ro", readOnlyFileExecutor)) + mcpExecutors,
                 logger = AppTerminal::println,
             )
-            mcpServers.size == 1 -> com.cliagent.mcp.McpToolExecutor(mcpServers.first().toTransport())
-            else -> null
+            else -> readOnlyFileExecutor   // только read-only file-tools, без MCP
         }
         val mcpServerCount = mcpServers.size
 
@@ -350,14 +389,64 @@ class ChatCommand : CliktCommand(name = "chat", help = "Start interactive chat w
             ragEnabled = config.rag.enabled,
             dontKnowThreshold = config.rag.dontKnowThreshold,
             conversationalQuery = config.rag.conversationalQuery,
+            ragMinQueryChars = 20,   // День 34: отсеивать короткие подтверждения от RAG
         )
 
         val checker = if (invariantsEnabled) LlmInvariantChecker(client, model) else null
         val statefulAgent = StatefulAgent(agent, checker) { agent.getInvariants() }
+
+        // День 34: провайдер toolExecutor по taskKind.
+        // FILE_OP → только FileToolExecutor с gate (без MCP filesystem, который обходит gate).
+        // Иначе → composite с MCP (включая filesystem) + read-only file-tools.
+        // Замыкание над mcpExecutors (построены выше в buildSession).
+        val toolExecutorProvider: suspend (com.cliagent.state.TaskKind?) -> com.cliagent.agent.ToolExecutor? = { kind ->
+            when (kind) {
+                com.cliagent.state.TaskKind.FILE_OP -> {
+                    // Только FileToolExecutor с gate — без MCP filesystem (он обходит gate).
+                    // read/find/write через наши инструменты, write требует y/N подтверждения.
+                    fileExecutor
+                }
+                com.cliagent.state.TaskKind.PR_REVIEW -> {
+                    // Для review нужен git-diff. Оставляем composite с MCP (git-тулы могут быть там)
+                    // + read-only file-tools для контекста. Без write — review не должен писать.
+                    val readOnlyFile = com.cliagent.agent.FileToolExecutor(
+                        root = projectRoot,
+                        gate = com.cliagent.agent.RejectAllGate(),   // read-only, write запрещён
+                    )
+                    if (mcpExecutors.isNotEmpty()) {
+                        com.cliagent.agent.CompositeToolExecutor(
+                            executors = listOf(com.cliagent.agent.NamedToolExecutor("file-ro", readOnlyFile)) + mcpExecutors,
+                            logger = AppTerminal::println,
+                        )
+                    } else {
+                        readOnlyFile
+                    }
+                }
+                else -> {
+                    // CODE/REASONING/...: composite с MCP (включая filesystem) + read-only file-tools
+                    // (для ad-hoc /task без FILE_OP — file-tools доступны, но write отключён).
+                    // Если хочется write в не-FILE_OP задачах — нужен явный флаг (пока fail-safe).
+                    val readOnlyFile = com.cliagent.agent.FileToolExecutor(
+                        root = projectRoot,
+                        gate = com.cliagent.agent.RejectAllGate(),
+                    )
+                    if (mcpExecutors.isNotEmpty()) {
+                        com.cliagent.agent.CompositeToolExecutor(
+                            executors = listOf(com.cliagent.agent.NamedToolExecutor("file-ro", readOnlyFile)) + mcpExecutors,
+                            logger = AppTerminal::println,
+                        )
+                    } else {
+                        readOnlyFile
+                    }
+                }
+            }
+        }
+
         val orchestrator = TaskOrchestrator(
             agent, client, model,
             swarmMode = if (noSwarm) com.cliagent.agent.swarm.SwarmMode.OFF else swarmMode,
-            chat = { msg -> AppTerminal.withSpinner({ spinnerLabel() }) { statefulAgent.chat(msg) } }
+            chat = { msg -> AppTerminal.withSpinner({ spinnerLabel() }) { statefulAgent.chat(msg) } },
+            toolExecutorProvider = toolExecutorProvider,
         )
 
         val intentClassifier = IntentClassifier(client, model)

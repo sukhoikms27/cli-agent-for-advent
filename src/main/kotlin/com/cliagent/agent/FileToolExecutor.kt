@@ -3,11 +3,10 @@ package com.cliagent.agent
 import com.cliagent.llm.model.FunctionDef
 import com.cliagent.llm.model.ToolDefinition
 import kotlinx.coroutines.CancellationException
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
 import java.io.File
 
@@ -15,12 +14,12 @@ import java.io.File
  * День 34 — in-process ToolExecutor для file-agent'а.
  *
  * В отличие от [com.cliagent.mcp.McpToolExecutor] (subprocess MCP-сервер), этот executor вызывает
- * file-тулы **напрямую** в том же процессе. Причина: `write_file` требует [confirmWrite] callback
- * к пользователю (Human-in-the-Loop, лекция нед.7), что невозможно через subprocess-границу MCP.
+ * file-тулы **напрямую** в том же процессе. Причина: `write_file` требует подтверждения
+ * (Human-in-the-Loop, лекция нед.7) через [DangerousOpGate] — что невозможно через subprocess-границу MCP.
  *
  * Регистрирует 4 tool'а (зеркало mcp-server/tools/FileAgentTools.kt, но без MCP SDK):
  *  - read_file, find_in_files, list_project_files — read-only.
- *  - write_file — DANGEROUS, требует [confirmWrite]. null = read-only fail-safe.
+ *  - write_file — DANGEROUS, требует подтверждения через [gate]. [RejectAllGate] = read-only fail-safe.
  *
  * **Sandbox security:** все пути резолвятся в [root] через [resolveSafe] (path traversal guard).
  *
@@ -28,18 +27,37 @@ import java.io.File
  * самокорректируется. CancellationException пробрасывается (корутины, AGENTS.md).
  *
  * @param root sandbox-корень (default = CWD).
- * @param confirmWrite callback подтверждения write-операции: `(path, content) -> approved`.
- *        null = write блокирован (batch/CI read-only режим, fail-safe).
+ * @param gate gate подтверждения опасных операций (write_file). Default [RejectAllGate] = read-only.
+ *        В REPL передаётся [TtyGate] с y/N prompt; в stage/FSM — [PlanApprovedGate].
  */
 class FileToolExecutor(
     private val root: File = File(System.getProperty("user.dir")),
-    private val confirmWrite: (suspend (path: String, content: String) -> Boolean)? = null,
+    private val gate: DangerousOpGate = RejectAllGate(),
 ) : ToolExecutor {
 
-    private val json = Json { ignoreUnknownKeys = true }
+    /**
+     * Legacy-конструктор: backward-compat для существующих callers (FileAgentCommand,
+     * FileToolExecutorTest) с `confirmWrite: (suspend (path, content) -> Boolean)?`.
+     *
+     * `confirmWrite == null` → [RejectAllGate] (read-only). Иначе адаптируется в [TtyGate]:
+     * каждый write_file проходит через confirm-функцию, как прежде.
+     */
+    constructor(
+        root: File = File(System.getProperty("user.dir")),
+        confirmWrite: (suspend (path: String, content: String) -> Boolean)?,
+    ) : this(
+        root = root,
+        gate = confirmWrite?.let { callback ->
+            TtyGate { _, args ->
+                val path = args["path"] as? String ?: ""
+                val content = args["content"] as? String ?: ""
+                callback(path, content)
+            }
+        } ?: RejectAllGate(),
+    )
 
     override suspend fun definitions(): List<ToolDefinition> = listOf(
-        readDef(), findDef(), listDef(), writeDef(),
+        readDef(), findDef(), listDef(), writeDef(), deleteDef(),
     )
 
     override suspend fun call(name: String, args: Map<String, Any?>): String = when (name) {
@@ -47,6 +65,7 @@ class FileToolExecutor(
         "find_in_files" -> findInFiles(args)
         "list_project_files" -> listProjectFiles(args)
         "write_file" -> writeFile(args)
+        "delete_file" -> deleteFile(args)
         else -> "Unknown tool: $name"
     }
 
@@ -124,14 +143,19 @@ class FileToolExecutor(
         val content = args.strArg("content") ?: return errMissing("content")
         val file = resolveSafe(root, path) ?: return errPathEscape(path)
 
-        val confirm = confirmWrite ?: return "Error: write_file заблокирован (read-only режим — нет confirm-колбэка)."
+        // Gate решает, одобрить ли write (TtyGate → y/N prompt, PlanApprovedGate → по плану,
+        // RejectAllGate → fail-safe read-only, AutoApproveGate → CI). Документация в [DangerousOpGate].
         val approved = try {
-            confirm(path, content)
+            gate.approve("write_file", mapOf("path" to path, "content" to content))
         } catch (e: Exception) {
             if (e is CancellationException) throw e
-            return "Error: confirm-колбэк упал: ${e.message}"
+            return "Error: gate-проверка упала: ${e.message}"
         }
-        if (!approved) return "Операция отменена пользователем (write в '$path')."
+        if (!approved) {
+            // Различаем read-only режим (RejectAllGate) от отказа пользователя (TtyGate) для диагностики.
+            val reason = if (gate is RejectAllGate) "read-only режим (gate=RejectAllGate)" else "gate отклонил"
+            return "Операция отменена ($reason, write в '$path' заблокирован)."
+        }
 
         return try {
             file.parentFile?.mkdirs()
@@ -143,6 +167,36 @@ class FileToolExecutor(
         }
     }
 
+    private suspend fun deleteFile(args: Map<String, Any?>): String {
+        val path = args.strArg("path") ?: return errMissing("path")
+        val file = resolveSafe(root, path) ?: return errPathEscape(path)
+        if (!file.exists()) return "Error: файл не найден: $path"
+
+        // delete_file — опасная операция (необратимая), проходит через тот же gate.
+        val approved = try {
+            gate.approve("delete_file", mapOf("path" to path))
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            return "Error: gate-проверка упала: ${e.message}"
+        }
+        if (!approved) {
+            val reason = if (gate is RejectAllGate) "read-only режим (gate=RejectAllGate)" else "gate отклонил"
+            return "Операция отменена ($reason, delete '$path' заблокирован)."
+        }
+
+        return try {
+            if (file.isDirectory) {
+                file.deleteRecursively()
+            } else {
+                file.delete()
+            }
+            "✓ Удалён: $path"
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            "Error: не удалось удалить: ${e.message}"
+        }
+    }
+
     // ── ToolDefinition schemas ────────────────────────────────────────────────
 
     private fun readDef() = ToolDefinition(
@@ -150,8 +204,12 @@ class FileToolExecutor(
             name = "read_file",
             description = "Прочитать содержимое текстового файла (read-only). Для анализа кода/документации.",
             parameters = buildJsonObject {
-                putJsonObject("path") { put("type", "string"); put("description", "Путь к файлу") }
-            }.toSchema(),
+                put("type", "object")
+                putJsonObject("properties") {
+                    putJsonObject("path") { put("type", "string"); put("description", "Путь к файлу") }
+                }
+                putJsonArray("required") { add("path") }
+            },
         )
     )
 
@@ -160,10 +218,14 @@ class FileToolExecutor(
             name = "find_in_files",
             description = "Поиск текста по файлам (grep, case-insensitive). Найти все места использования.",
             parameters = buildJsonObject {
-                putJsonObject("dir") { put("type", "string"); put("description", "Каталог (default: корень)") }
-                putJsonObject("query") { put("type", "string"); put("description", "Искомый текст") }
-                putJsonObject("extension") { put("type", "string"); put("description", "Опц. фильтр по расширению") }
-            }.toSchema(),
+                put("type", "object")
+                putJsonObject("properties") {
+                    putJsonObject("dir") { put("type", "string"); put("description", "Каталог (default: корень)") }
+                    putJsonObject("query") { put("type", "string"); put("description", "Искомый текст") }
+                    putJsonObject("extension") { put("type", "string"); put("description", "Опц. фильтр по расширению") }
+                }
+                putJsonArray("required") { add("query") }
+            },
         )
     )
 
@@ -172,21 +234,45 @@ class FileToolExecutor(
             name = "list_project_files",
             description = "Список файлов проекта рекурсивно (read-only, с фильтром мусора).",
             parameters = buildJsonObject {
-                putJsonObject("dir") { put("type", "string"); put("description", "Каталог (default: корень)") }
-                putJsonObject("extension") { put("type", "string"); put("description", "Опц. фильтр по расширению") }
-            }.toSchema(),
+                put("type", "object")
+                putJsonObject("properties") {
+                    putJsonObject("dir") { put("type", "string"); put("description", "Каталог (default: корень)") }
+                    putJsonObject("extension") { put("type", "string"); put("description", "Опц. фильтр по расширению") }
+                }
+                // required пуст — все параметры опциональны
+            },
         )
     )
 
     private fun writeDef() = ToolDefinition(
         function = FunctionDef(
             name = "write_file",
-            description = "⚠️ DANGEROUS: записать/перезаписать файл. Требует подтверждения пользователя. " +
-                if (confirmWrite == null) "В read-only режиме ЗАПРЕЩЁН." else "",
+            description = "⚠️ DANGEROUS: записать/перезаписать файл. Требует подтверждения через gate. " +
+                if (gate is RejectAllGate) "В read-only режиме (RejectAllGate) ЗАПРЕЩЁН." else "",
             parameters = buildJsonObject {
-                putJsonObject("path") { put("type", "string"); put("description", "Путь к файлу") }
-                putJsonObject("content") { put("type", "string"); put("description", "Содержимое файла") }
-            }.toSchema(),
+                put("type", "object")
+                putJsonObject("properties") {
+                    putJsonObject("path") { put("type", "string"); put("description", "Путь к файлу") }
+                    putJsonObject("content") { put("type", "string"); put("description", "Содержимое файла") }
+                }
+                putJsonArray("required") { add("path"); add("content") }
+            },
+        )
+    )
+
+    private fun deleteDef() = ToolDefinition(
+        function = FunctionDef(
+            name = "delete_file",
+            description = "⚠️ DANGEROUS: удалить файл или каталог (необратимо). " +
+                "Требует подтверждения через gate. " +
+                if (gate is RejectAllGate) "В read-only режиме (RejectAllGate) ЗАПРЕЩЁН." else "",
+            parameters = buildJsonObject {
+                put("type", "object")
+                putJsonObject("properties") {
+                    putJsonObject("path") { put("type", "string"); put("description", "Путь к файлу или каталогу") }
+                }
+                putJsonArray("required") { add("path") }
+            },
         )
     )
 
@@ -195,8 +281,6 @@ class FileToolExecutor(
     /** Map<String,Any?> → String arg (null-safe, как stringArg в MCP utils). */
     private fun Map<String, Any?>.strArg(key: String): String? =
         (this[key] as? String)?.takeIf { it.isNotBlank() }?.trim()
-
-    private fun JsonObject.toSchema(): kotlinx.serialization.json.JsonElement = this
 
     private fun errMissing(param: String) = "Error: параметр '$param' обязателен."
     private fun errPathEscape(path: String) =

@@ -119,6 +119,14 @@ object SwarmPrompts {
                 append("Покрытие должно быть ПОЛНЫМ: сумма частей = вся задача, без пробелов и пересечений. ")
                 append("Если части взаимосвязаны (напр. модули кода), кратко опиши общие контракты/интерфейсы ")
                 append("между ними, чтобы workers не рассинхронизировались. ")
+                // День 34: для FILE_OP — декомпозиция по файлам/директориям (независимые единицы).
+                if (ctx.taskKind == com.cliagent.state.TaskKind.FILE_OP) {
+                    append("\n\nВАЖНО для file-задач: декомпозируй по **независимым файлам или директориям**. ")
+                    append("Каждый worker работает со своим набором файлов (через read_file/find_in_files/write_file). ")
+                    append("Например: «проанализируй все TODO в src/main/kotlin/» и «проанализируй все TODO в mcp-server/». ")
+                    append("НЕ раздавай последовательные шаги (read → write) разным workers — worker должен ")
+                    append("выполнить полную цепочку для своих файлов. Используй shared-research выше для структуры. ")
+                }
             }
             SwarmStrategy.SPECIALISTS -> {
                 append("Назначь ≤${spec.maxWorkers} ролей-специалистов по граням: ${decompositionSubject(stage)}. ")
@@ -150,6 +158,12 @@ object SwarmPrompts {
                 .append(truncateToTokens(subtask, ArtifactLimits.PLAN_IN_STEP_TOKENS))
                 .append(". Проанализируй задачу с этой стороны и дай находки по своей грани. ")
             SwarmStrategy.REDUNDANCY -> append("Независимо сгенерируй полный ${artifactName(stage)} (вариант $index). ")
+        }
+        // День 34: для FILE_OP — явная инструкция использовать file-tools (read/find/write).
+        if (ctx.taskKind == com.cliagent.state.TaskKind.FILE_OP) {
+            append("\n\nИспользуй доступные инструменты: read_file для чтения, find_in_files для поиска, ")
+            append("list_project_files для структуры, write_file для записи (требует подтверждения). ")
+            append("Опирайся на реально прочитанное содержимое, не выдумывай. ")
         }
         append("\n\n").append(workerContextFor(stage, ctx, sharedResearch))   // W3.1+W5.1: slim + shared research
         append("\n\nДай результат своей части.")
