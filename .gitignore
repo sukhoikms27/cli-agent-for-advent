@@ -26,6 +26,11 @@ local.properties
 swarm-report
 .zcode/
 
+# Personal / unrelated files (не относились к проекту, появились случайно)
+japan-3day-trip.md
+scenario_diag.txt
+root@*
+
 # Kotlin
 *.kotlin_module
 .kotlin

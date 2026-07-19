@@ -34,6 +34,7 @@ import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import org.slf4j.event.Level
 import java.nio.charset.StandardCharsets
+import java.nio.file.Path
 
 /**
  * День 33 — точка входа веб-приложения «AI Support Agent».
@@ -43,13 +44,29 @@ import java.nio.charset.StandardCharsets
  *  - `/api/chat` принимает опциональные `ticketId` / `customerEmail` → контекст тикета в промпте.
  *  - `/api/tickets` — список тикетов (CRUD-минимум: GET list, POST create, GET by id).
  *
+ * **Диспетчер режимов** (первый CLI-аргумент):
+ *  - `seed [--reset] [--docs-dir <path>]` — заполнить демо-данные (20 тикетов + 11 FAQ),
+ *    см. [seedAll]. Выход после завершения.
+ *  - `index` — индексировать FAQ-корпус в support-specific RAG-индекс (см. [indexRag]).
+ *    Требует локальную Ollama с `nomic-embed-text`. Выход после завершения.
+ *  - `server` или без аргументов — старт веб-сервера (по умолчанию).
+ *
  * env:
  *  - SUPPORT_PORT (default 8081) — порт (отличается от motivator 8080 для совместного деплоя)
  *  - SUPPORT_HOST (default 0.0.0.0)
  *  - SUPPORT_COOKIE_SECRET — HMAC-секрет (задать на VPS)
  *  - см. [SupportAgentFactory.fromEnv] для LLM/RAG env-vars
  */
-fun main() {
+fun main(args: Array<String>) {
+    when (args.firstOrNull()?.lowercase()) {
+        "seed" -> kotlinx.coroutines.runBlocking { seedAll(parseSeedArgs(args.drop(1).toTypedArray())) }
+        "index" -> kotlinx.coroutines.runBlocking { indexRag() }
+        else -> startServer() // `server` или без аргументов
+    }
+}
+
+/** Запуск Ktor-сервера (вынесено из [main] для читаемости). */
+private fun startServer() {
     val port = (System.getenv("SUPPORT_PORT") ?: "8081").toInt()
     val host = System.getenv("SUPPORT_HOST") ?: "0.0.0.0"
     val sessionManager = SessionManager()
@@ -116,13 +133,32 @@ fun Application.supportModule(
             }
 
             // Чат: POST {message, ticketId?, customerEmail?} → SSE-стрим токенов.
+            //
+            // День 33: ticketId/email могут быть переданы ЯВНО (в JSON-теле, для API-клиентов)
+            // либо извлечены из текста сообщения через TicketFieldExtractor (для UI-юзеров,
+            // которые пишут «что с моим тикетом 5?»). Явные поля в приоритете.
             post("/chat") {
                 val req = call.receive<SupportRequest>()
                 val sid = call.requireSession(sessionManager) ?: run {
                     call.respond(HttpStatusCode.Unauthorized, ApiError("No valid session"))
                     return@post
                 }
-                val agent = agentFactory.createFor(sid, req.ticketId, req.customerEmail)
+
+                // LLM-extraction: если явные поля не заданы — пробуем достать из текста.
+                // Soft-degradation: при ошибке/пустом результате → null, агент ответит без контекста.
+                val effectiveTicketId: Int?
+                val effectiveEmail: String?
+                if (req.ticketId != null || req.customerEmail != null) {
+                    // Явные поля в приоритете — extraction не нужен (экономим LLM-вызов).
+                    effectiveTicketId = req.ticketId
+                    effectiveEmail = req.customerEmail
+                } else {
+                    val extracted = agentFactory.extractor.extract(req.message)
+                    effectiveTicketId = extracted.ticketId
+                    effectiveEmail = extracted.customerEmail
+                }
+
+                val agent = agentFactory.createFor(sid, effectiveTicketId, effectiveEmail)
 
                 val tokens = Channel<String>(capacity = 128)
                 val generationJob = launch {
@@ -226,18 +262,14 @@ private fun supportIndexHtml(): String = """
             .bot { background: #f5f5f5; }
             input[type=text] { width: 70%; padding: 0.5rem; }
             button { padding: 0.5rem 1rem; cursor: pointer; }
-            .ticket-context { font-size: 0.85em; color: #666; margin-bottom: 1rem; }
         </style>
     </head>
     <body>
         <h1>🛟 AI Support Agent</h1>
-        <p>Задайте вопрос — агент ответит с учётом базы знаний (FAQ) и контекста тикета.</p>
-        <div class="ticket-context">
-            Ticket ID: <input type="number" id="ticketId" placeholder="опц." style="width:80px">
-            Email: <input type="text" id="customerEmail" placeholder="опц." style="width:180px">
-        </div>
+        <p>Задайте вопрос в свободной форме. Агент сам поймёт, если вы упомянете тикет или email,
+           и при необходимости заведёт новый тикет автоматически.</p>
         <div class="chat" id="chat"></div>
-        <input type="text" id="msg" placeholder="Ваш вопрос..." onkeydown="if(event.key==='Enter')send()">
+        <input type="text" id="msg" placeholder="Например: что с моим тикетом 5?" onkeydown="if(event.key==='Enter')send()">
         <button onclick="send()">Отправить</button>
 
         <script>
@@ -250,14 +282,10 @@ private fun supportIndexHtml(): String = """
             async function send() {
                 const msg = document.getElementById('msg').value.trim();
                 if (!msg) return;
-                const ticketId = document.getElementById('ticketId').value;
-                const customerEmail = document.getElementById('customerEmail').value;
                 document.getElementById('msg').value = '';
                 addMsg('user', msg);
                 const botDiv = addMsg('bot', '');
                 const body = { message: msg };
-                if (ticketId) body.ticketId = parseInt(ticketId);
-                if (customerEmail) body.customerEmail = customerEmail;
                 const resp = await fetch('/api/chat', {
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(body)

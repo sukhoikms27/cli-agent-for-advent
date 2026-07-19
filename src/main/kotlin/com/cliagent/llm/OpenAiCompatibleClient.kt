@@ -71,13 +71,20 @@ class OpenAiCompatibleClient(
                 throw e   // корутин-отмена — не retry, не глотать (AGENTS.md)
             } catch (e: Throwable) {
                 // Сетевой сбой (таймаут, обрыв соединения, DNS) — транзиентный, ретраим.
-                lastError = LlmResult.Error(0, "Request failed: ${e.message}")
+                // Классифицируем тип исключения — это критично для диагностики (code=0 без
+                // контекста бесполезен: ConnectException vs UnknownHostException vs SocketTimeout
+                // указывают на разные причины, caller должен их различать).
+                lastError = LlmResult.Error(0, classifyNetworkError(e))
             }
             // Последняя попытка — задержку не делаем, сразу вернём lastError ниже.
             if (attempt < MAX_ATTEMPTS - 1) {
                 val backoff = backoffDelay(attempt)
+                // Выводим code И message (раньше только code) — diagnosis-of-failure.
+                // Endpoint тоже важен: если ZAI_BASE_URL с опечаткой vs Ollama на 11434 упала —
+                // это разные проблемы, пользователь должен их различать по логу.
                 System.err.println("[retry] LLM call failed (attempt ${attempt + 1}/$MAX_ATTEMPTS, " +
-                    "code=${lastError.code}); retrying in ${backoff}ms…")
+                    "code=${lastError.code}, endpoint=$baseUrl); ${lastError.message}; " +
+                    "retrying in ${backoff}ms…")
                 delay(backoff)
             }
         }
@@ -231,18 +238,30 @@ class OpenAiCompatibleClient(
             contentType(ContentType.Application.Json)
             setBody(request)
         }
-        val bodyText = response.bodyAsText()
-        try {
-            LlmResult.Success(json.decodeFromString<ChatResponse>(bodyText))
-        } catch (e: Exception) {
-            LlmResult.Error(0, "Failed to parse response: ${e.message}")
+        // День 33 (багфикс): defaultHttpClient не выставляет expectSuccess, поэтому Ktor НЕ бросает
+        // ClientRequestException при 4xx/5xx — response возвращается как is. Если проигнорировать
+        // статус и сразу парсить body, 4xx-ответ с {"error":...} даст parse-ошибку → code=0 →
+        // бесконечный retry. Проверяем статус явно и возвращаем Error с правильным кодом.
+        if (!response.status.isSuccess()) {
+            httpStatusToError(response)
+        } else {
+            val bodyText = response.bodyAsText()
+            try {
+                LlmResult.Success(json.decodeFromString<ChatResponse>(bodyText))
+            } catch (e: Exception) {
+                // День 33 (багфикс): parse-ошибка — НЕ сетевая, не транзиентная. Раньше возвращали code=0
+                // → isRetryable(0)=true → 10 бессмысленных ретраев одинакового мусорного ответа.
+                // Теперь код 422 (Unprocessable Content) — non-retryable по isRetryable(), лог сразу
+                // покажет диагностику без бесконечного retry.
+                LlmResult.Error(422, "Failed to parse response: ${e.message}; body=${bodyText.take(200)}")
+            }
         }
     } catch (e: ClientRequestException) {
+        // Legacy: на случай если будущий конфиг HttpClient включит expectSuccess.
         val statusCode = e.response.status.value
         val errorBody = runCatching { e.response.bodyAsText() }.getOrDefault("")
         val message = when (statusCode) {
             401 -> if (apiKey.isBlank()) {
-                // День 25: локальный провайдер (Ollama) обычно без auth. 401 здесь — нетрадиционен.
                 "Server returned 401 Unauthorized. For local Ollama, ensure no reverse-proxy auth is in front; " +
                     "for cloud providers, set CLI_AGENT_API_KEY."
             } else {
@@ -253,10 +272,40 @@ class OpenAiCompatibleClient(
         }
         LlmResult.Error(statusCode, message)
     } catch (e: ServerResponseException) {
+        // Legacy (см. комментарий выше).
         LlmResult.Error(e.response.status.value, "Server error: ${e.response.bodyAsText()}")
     } catch (e: Exception) {
         // Сетевой сбой (таймаут, обрыв, DNS) — внешний retry-цикл решит, ретраить ли.
-        LlmResult.Error(0, "Request failed: ${e.message}")
+        // Классифицируем тип для диагноза (ConnectException/UnknownHostException/SocketTimeout
+        // указывают на разные причины — критично для понятности логов retry'я).
+        LlmResult.Error(0, classifyNetworkError(e))
+    }
+
+    /**
+     * HTTP-статус-неуспех → [LlmResult.Error] с правильным кодом и человекочитаемым сообщением.
+     *
+     * z.ai/OpenAI возвращают 4xx/5xx с JSON-телом `{"error":{"code":"401","message":"..."}}`.
+     * Раньше это маскировалось parse-ошибкой (т.к. тело не соответствует ChatResponse-схеме) и
+     * retry'илось 10 раз. Теперь мы явно различаем:
+     *  - 401 (auth) — ключ истёк/невалиден
+     *  - 429 (rate limit) — слишком много запросов
+     *  - 5xx (server fault) — проблема на стороне провайдера
+     *  - прочие 4xx (400 bad request и т.п.)
+     */
+    private suspend fun httpStatusToError(response: HttpResponse): LlmResult.Error {
+        val statusCode = response.status.value
+        val errorBody = runCatching { response.bodyAsText() }.getOrDefault("")
+        val message = when (statusCode) {
+            401 -> if (apiKey.isBlank()) {
+                "401 Unauthorized (no API key sent). Set CLI_AGENT_API_KEY or check SUPPORT_PROVIDER."
+            } else {
+                "401 Unauthorized — API key invalid or expired. Check CLI_AGENT_API_KEY. Server: $errorBody"
+            }
+            429 -> "429 Rate limit exceeded. Try again later. Server: $errorBody"
+            in 500..599 -> "$statusCode Server error. Server: $errorBody"
+            else -> "$statusCode Client error. Body: $errorBody"
+        }
+        return LlmResult.Error(statusCode, message)
     }
 
     /**

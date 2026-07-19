@@ -95,10 +95,17 @@ class OllamaNativeClient(
                 throw e   // AGENTS.md: не глотать
             } catch (e: Throwable) {
                 // Сетевой сбой (таймаут, обрыв, DNS) — транзиентный, ретраим.
-                lastError = LlmResult.Error(0, "Ollama request failed: ${e.message}")
+                // Классифицируем тип: ConnectException vs UnknownHostException vs SocketTimeout
+                // указывают на разные причины (см. classifyNetworkError).
+                lastError = LlmResult.Error(0, classifyNetworkError(e))
             }
             if (attempt < MAX_ATTEMPTS - 1) {
                 val backoff = backoffDelay(attempt)
+                // Логируем code + message + endpoint (раньше retry был silent — бесполезно для
+                // диагностики: code=0 без контекста не говорил, Ollama ли упала или URL кривой).
+                System.err.println("[retry] Ollama call failed (attempt ${attempt + 1}/$MAX_ATTEMPTS, " +
+                    "code=${lastError.code}, endpoint=$baseUrl); ${lastError.message}; " +
+                    "retrying in ${backoff}ms…")
                 delay(backoff)
             }
         }
@@ -124,7 +131,7 @@ class OllamaNativeClient(
     } catch (e: CancellationException) {
         throw e
     } catch (e: Throwable) {
-        LlmResult.Error(0, "Ollama request failed: ${e.message}")
+        LlmResult.Error(0, classifyNetworkError(e))
     }
 
     /**
@@ -196,7 +203,9 @@ class OllamaNativeClient(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Throwable) {
-            emit(StreamChunk.Error(0, "Ollama stream request failed: ${e.message}"))
+            // Streaming не retry'ится (повтор даст дубликат prefix в выводе caller'а). Эмитим
+            // Error с классификацией — caller видит причину, как в LlmResult.Error не-streaming пути.
+            emit(StreamChunk.Error(0, "Ollama stream ${classifyNetworkError(e)}"))
             null
         }
         // finalChunk != null только при graceful-fallback; в остальных путях Done/Error эмитнуты внутри.

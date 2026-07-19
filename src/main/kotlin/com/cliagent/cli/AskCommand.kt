@@ -163,6 +163,8 @@ class AskCommand : CliktCommand(
         val embedder = OllamaEmbeddingClient(
             baseUrl = config.rag.embeddingBaseUrl,
             model = config.rag.embeddingModel,
+            bearerToken = config.rag.embeddingToken.ifBlank { null },
+            batchSize = config.rag.embeddingBatchSize,
         )
         return try {
             val store = JsonRagStore()
@@ -207,6 +209,8 @@ class AskCommand : CliktCommand(
         val embedder = OllamaEmbeddingClient(
             baseUrl = config.rag.embeddingBaseUrl,
             model = config.rag.embeddingModel,
+            bearerToken = config.rag.embeddingToken.ifBlank { null },
+            batchSize = config.rag.embeddingBatchSize,
         )
         val docsRoots = config.rag.corpusRoots.map { File(root, it).absolutePath }
         val docs = com.cliagent.rag.DocumentLoader(docsRoots).load()

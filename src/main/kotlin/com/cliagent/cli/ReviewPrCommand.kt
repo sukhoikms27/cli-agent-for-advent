@@ -185,6 +185,8 @@ class ReviewPrCommand : CliktCommand(
         val embedder = OllamaEmbeddingClient(
             baseUrl = config.rag.embeddingBaseUrl,
             model = config.rag.embeddingModel,
+            bearerToken = config.rag.embeddingToken.ifBlank { null },
+            batchSize = config.rag.embeddingBatchSize,
         )
         return try {
             val store = JsonRagStore()
