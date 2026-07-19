@@ -11,8 +11,9 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withTimeoutOrNull
 
-/** W6.1: таймаут на один worker-вызов (90с). Зависший worker не вешает стадию. */
-private const val WORKER_TIMEOUT_MS = 90_000L
+/** W6.1: таймаут на один worker-вызов по умолчанию (90с). Зависший worker не вешает стадию.
+ *  День 34: для FILE_OP используется spec.workerTimeoutMs (240с) — worker с tool-loop'ом дольше. */
+private const val DEFAULT_WORKER_TIMEOUT_MS = 90_000L
 
 /**
  * Рой-агент стадии (V4: lead → ≤N workers → integrate), гибрид с V1/V2/V3 через [SwarmStrategy].
@@ -56,8 +57,11 @@ class SwarmStageAgent(
         // W5.1: shared pre-fetch — единый research-вызов собирает общие данные (через tools) перед
         // fan-out, чтобы workers не дублировали одни и те же tool-вызовы. Гейт: только EXECUTION+COMPLEX
         // (где tool-calls вероятны и overhead research окупается). MODERATE/TRIVIAL — пропускаем.
+        // День 34: для FILE_OP shared-research ВСЕГДА (независимо от complexity) — lead должен
+        // изучить структуру проекта через list_project_files до декомпозиции на независимые файлы.
         val sharedResearch: String? = if (stage == TaskStage.EXECUTION &&
-            ctx.complexity == com.cliagent.state.TaskComplexity.COMPLEX
+            (ctx.complexity == com.cliagent.state.TaskComplexity.COMPLEX ||
+                ctx.taskKind == com.cliagent.state.TaskKind.FILE_OP)
         ) {
             try {
                 val out = chat(SwarmPrompts.researchPrompt(ctx))
@@ -71,11 +75,12 @@ class SwarmStageAgent(
             subtasks.mapIndexed { idx, sub ->
                 async {
                     // W6.1: withTimeout на каждый worker — зависший worker не вешает стадию.
-                    // Таймаут → stub (как при LlmCallException); остальные workers продолжают.
+                    // День 34: таймаут из spec (240с для FILE_OP с tool-loop'ом, 90с default).
+                    val timeoutMs = effectiveSpec.workerTimeoutMs
                     try {
-                        withTimeoutOrNull(WORKER_TIMEOUT_MS) {
+                        withTimeoutOrNull(timeoutMs) {
                             chat(SwarmPrompts.workerPrompt(stage, effectiveSpec.strategy, ctx, sub, idx + 1, sharedResearch))
-                        } ?: "⚠️ Worker ${idx + 1} превысил таймаут (${WORKER_TIMEOUT_MS}мс)."
+                        } ?: "⚠️ Worker ${idx + 1} превысил таймаут (${timeoutMs}мс)."
                     } catch (e: LlmCallException) {
                         "⚠️ Worker ${idx + 1} не смог завершить: ${e.message}"
                     }

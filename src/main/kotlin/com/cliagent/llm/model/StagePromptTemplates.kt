@@ -103,6 +103,22 @@ object StagePromptTemplates {
                 Do NOT write code unless illustrating a concept is explicitly required.
                 Do not re-plan unless the plan is demonstrably broken.
             """.trimIndent()
+            TaskKind.FILE_OP -> """
+                You are a file-agent in the EXECUTION stage.
+                Perform file operations following the approved plan: read_file to understand content,
+                find_in_files to locate occurrences, list_project_files to understand structure,
+                write_file to create or modify files (each write requires user confirmation).
+                Always base your analysis on actually-read content — never guess the structure.
+                Explain each write before requesting confirmation: what changes and why.
+                Do not re-plan unless the plan is demonstrably broken.
+            """.trimIndent()
+            TaskKind.PR_REVIEW -> """
+                You are a code reviewer in the EXECUTION stage.
+                Gather the changes for review: use git_diff to see the diff, read_file for context
+                around changed lines. Prepare a concise summary of what changed and what to validate
+                next. The actual review report is produced in the VALIDATION stage.
+                Do not re-plan unless the plan is demonstrably broken.
+            """.trimIndent()
             null -> """
                 You are a senior software assistant in the EXECUTION stage.
                 Execute the task following the approved plan and produce the concrete result:
