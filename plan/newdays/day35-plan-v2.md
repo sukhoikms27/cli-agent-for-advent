@@ -1,13 +1,15 @@
 # День 35 (v2) — Review Bot: автоматизация ревью студенческих заданий
 
-> **Статус (обновлено 2026-07-20): ЧАСТИЧНО РЕАЛИЗОВАНО.**
-> **Demo-MVP готов и работает end-to-end** (см. §15): модуль `:review-bot`, pipeline `review --pr
-> <url> --sprint 7`, RAG над embedded чеклистом, LLM review с humanization + Java-поблажками,
-> pending review через `gh` CLI от юзера. Демо-прогоны на PR #1 (ACCEPT) и PR #2 (REJECT) успешны.
-> Полный Phase 1 (watcher/claim/CRM/Tracker) — отдельная задача.
+> **Статус (обновлено 2026-07-22): ЧАСТИЧНО РЕАЛИЗОВАНО.**
+> **Demo-MVP + Watcher готовы и работают end-to-end** (см. §15):
+>  - **Review pipeline** — модуль `:review-bot`, `review --pr <url> --sprint 7`, RAG над embedded
+>    чеклистом, LLM review с humanization + Java-поблажками, pending review через `gh` от юзера.
+>    Демо: PR #1 (ACCEPT), PR #2 (REJECT) — оба успешны.
+>  - **Watcher** — Tampermonkey userscript (MutationObserver на `.yamb-message-content`) →
+>    webhook receiver (`watch`) → Notifier с terminal preview + Enter/Esc. Smoke-test на
+>    синтетическом сообщении из реального образца пользователя успешен.
 >
-> Изначальный статус (2026-07-19): план/анализ design-only. Пересмотрено после уточнения
-> пользовательского флоу (реальная задача ревьюера Android-направления).
+> Полный Phase 1 (ClaimProvider + Collector + build-стадия + auto-claim) — следующий этап.
 >
 > План лежит рядом с `day35-plan.md` (Codebase Explorer) — это две **независимые** концепции;
 > текущая выбрана как основной капстоун дня 35 (реальная задача с живой болью), Codebase Explorer
@@ -1175,7 +1177,8 @@ Baseline замеряется на первых 10–20 реальных раб�
 - ✅ **Модуль `:review-bot`** — settings.gradle.kts, build.gradle.kts (mirror support-app),
   package `com.cliagent.review` (entry `ReviewBotAppKt`).
 - ✅ **CLI** (clikt): `review --pr <url> --sprint N --student "Name" [--publish] [--no-rag]`,
-  `index-kb [--reset]`.
+  `index-kb [--reset]`, `watch [--port] [--max-consecutive] [--sprints] [--auto-notify]`,
+  `install-userscript [--port]`.
 - ✅ **`ReviewBotFactory.fromEnv()`** — wiring по образцу `SupportAgentFactory`: z.ai (primary) /
   Ollama (fallback) через `REVIEW_PROVIDER`; embeddings всегда Ollama `nomic-embed-text`;
   изолированный RAG-индекс `~/.local/share/cli-agent/review-bot/rag/index.json`.
@@ -1196,13 +1199,13 @@ Baseline замеряется на первых 10–20 реальных раб�
 - ✅ **`ChecklistParser`** — embedded `checklist-sprint-7.md` → 11 пунктов.
 - ✅ **`ReviewPipeline`** — orchestration: parse URL → load diff → RAG → LLM → anchor → print
   CRM-репорт → post pending review. LLM retry на упрощённом промпте при ошибке.
-- ✅ **Тесты** (8 + 8 + 5 + 8 = 29 unit-тестов): PrUrlParser, DiffLineIndexer, ChecklistParser,
-  ResponseParser. Все зелёные.
+- ✅ **Тесты** (47 unit-тестов): PrUrlParser, DiffLineIndexer, ChecklistParser, ResponseParser,
+  MessageParser, WorkFilter. Все зелёные.
 - ✅ **Demo-репозиторий** `sukhoikms27/review-bot-demo` (private):
   - PR #1 `feature/clean-vizhian` → ACCEPT (11/11 ✅, soft-рекомендации)
   - PR #2 `feature/buggy-solution` → REJECT (6 ❌, 9 line-comments, ссылки kotlinlang.org)
 
-**Демо-прогоны (2026-07-20):**
+**Демо-прогоны review-pipeline (2026-07-20):**
 ```bash
 CLI_AGENT_API_KEY=... REVIEW_PROVIDER=zai REVIEW_MODEL=glm-5.1 \
   ./gradlew :review-bot:run --args="review --pr https://github.com/sukhoikms27/review-bot-demo/pull/2 --sprint 7 --student Ivanov"
@@ -1213,22 +1216,52 @@ CLI_AGENT_API_KEY=... REVIEW_PROVIDER=zai REVIEW_MODEL=glm-5.1 \
 # → verdict=ACCEPT, 11/11 ✅, 9 soft-рекомендаций, pending review создан
 ```
 
-**Известные ограничения demo-MVP:**
-- ⚠️ z.ai на больших diff (10+ файлов, 260+ added lines) может таймаутить на 120s — встроенный
-  retry `OpenAiCompatibleClient` справляется, но полный прогон занимает ~6 мин. Для демо лучше
-  использовать небольшие PR или предупреждать про время.
-- ⚠️ Build-стадия (`./gradlew build`) ещё не встроена в pipeline — пока только diff-based review.
+### ✅ Watcher (Userscript + Webhook receiver) — РЕАЛИЗОВАНО (2026-07-22)
 
-### Phase 1 (full MVP, не реализовано)
-- `UserscriptWatcher` (Tampermonkey + fetch/WS/XHR monkey-patch + MutationObserver fallback)
-- `MessageParser` (regex-слой; без LLM-парсинга в MVP)
-- `WorkFilter` с правилом `consecutiveWorks < 2` + дедупликация
-- `ClaimProvider` (Tracker + CRM HTTP, конфиг-привязка)
-- Notifier (terminal preview + Enter/Esc)
-- `Collector` (Tracker + CRM + Confluence + GitHub)
-- `Verifier` (gh + clone + assembleDebug — встроить в pipeline)
-- **Research-задача:** открыть F12 в Messenger, поймать реальный API-response, зафиксировать схему в
-  `parser-spec.md` (один из первых шагов Phase 1 — без этого MessageParser слеп)
+Источником заданий выбран DOM-перехват через Tampermonkey userscript (после F12-исследования
+пользователя: Яндекс.Мессенджер использует бинарный WebSocket — fetch/WS monkey-patch отпадают).
+
+- ✅ **Tampermonkey userscript** (`resources/yandex-messenger-watcher.user.js`):
+  `MutationObserver` на `.yamb-message-content`, regex по видимому тексту, `GM_xmlhttpRequest`
+  POST на `http://localhost:8082/messenger-event`. Извлекает trackerUrl (из `<a class="link_md">`),
+  sprint (`[N]`), studentName (ФИО после [N]).
+- ✅ **`WorkEvent` + `MessageParser`** — server-side парсинг JSON от userscript'а + дозаполнение
+  `trackerId` из `trackerUrl` (regex `/([A-Z]+-\d+)`).
+- ✅ **`WatchCommand` + Ktor Server** (CIO, порт 8082) — webhook receiver `/messenger-event`,
+  буферизация через `Channel<WorkEvent>` между HTTP и Notifier.
+- ✅ **`WorkFilter`** — дедупликация по trackerId + правило `consecutiveWorks < maxConsecutive`
+  (default 2 по пользовательскому правилу) + фильтр `--sprints`.
+- ✅ **`ClaimStateStore`** — persisted state (`~/.local/share/cli-agent/review-bot/claim-state.json`),
+  atomic write, auto-reset после 15 мин бездействия, дедупликация последних 100 trackerIds.
+- ✅ **`Notifier`** — ASCII-рамка preview (студент, спринт, tracker-link), ожидание Enter/Esc,
+  печать готовой команды `review-bot review --pr ... --sprint N --student "..."`.
+- ✅ **`InstallUserscriptCommand`** — распаковывает userscript в `~/review-bot-userscript/`,
+  печатает пошаговые инструкции по установке в Tampermonkey.
+- ✅ **Тесты** (18 unit-тестов): MessageParser (9), WorkFilter (9). Все зелёные.
+
+**Smoke-test (2026-07-22):** `watch` запущен на :8083, POST отправлен, Notifier отрисовал точный
+preview по синтетическому сообщению из реального образца пользователя:
+```
+║  Искандар Хамитов                                        ║
+║  sprint=5  •  tracker: PCR-1989840                       ║
+║  открыть: https://st.yandex-team.ru/PCR-1989840          ║
+```
+
+**Известные ограничения watcher'а:**
+- ⚠️ Notifier **не запускает** pipeline автоматически даже после Enter — он печатает готовую
+  команду, которую пользователь копирует. Причина: `review --pr <URL>` требует PR-ссылки,
+  которая лежит внутри tracker-issue (Collector Phase 1 не реализован). Когда Collector будет
+  готов, Enter сможет продолжить pipeline автоматически.
+- ⚠️ Single-pending-only: если уже ждём реакции на одно задание, новое дропается (MVP-упрощение).
+- ⚠️ Watcher не отменяет правила `consecutiveWorks < 2` — это notifier-only, не auto-claim.
+- ⚠️ Не реализован `--auto-claim` (требует рабочего `ClaimProvider`).
+
+### Phase 1 (full MVP, не реализовано — следующий этап)
+- `ClaimProvider` (Tracker + CRM HTTP reverse-engineering) — авто-клейм вместо ручного
+- `Collector` (Tracker API fetch issue → extract CRM link → extract PR link из CRM)
+- `Verifier` build-стадия (`gh pr checkout` + `./gradlew build`) — встроить в pipeline
+- `--auto-claim` opt-in (только после ClaimProvider)
+- Интеграция Watcher → pipeline: после Enter автоматически запускать `ReviewPipeline.run(prUrl, ...)`
 
 ### Phase 2 (резервный watcher + RAG)
 - `CdpWatcher` (Chrome DevTools Protocol, fallback при блокировке userscript)

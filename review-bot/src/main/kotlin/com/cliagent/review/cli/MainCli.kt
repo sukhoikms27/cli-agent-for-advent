@@ -13,16 +13,15 @@ import com.github.ajalt.clikt.core.subcommands
 class MainCli : NoOpCliktCommand(
     name = "review-bot",
     help = "Review Bot — AI-ревью студенческих заданий (Yandex Practicum, Android). " +
-        "Подкоманды: review, index-kb.",
+        "Подкоманды: review, index-kb, watch, install-userscript.",
 ) {
     init {
-        subcommands(ReviewCommand(), IndexKbCommand())
+        subcommands(ReviewCommand(), IndexKbCommand(), WatchCommand(), InstallUserscriptCommand())
     }
 
     override fun run() {
-        // invokeWithoutCommand не поддерживается в NoOpCliktCommand 4.4.0 — обрабатываем вручную.
         if (currentContext.invokedSubcommand == null) {
-            echo("Review Bot. Использование: review-bot <review|index-kb> [options]")
+            echo("Review Bot. Использование: review-bot <review|index-kb|watch|install-userscript> [options]")
             echo("Запустите `review-bot review --help` для деталей.")
         }
     }

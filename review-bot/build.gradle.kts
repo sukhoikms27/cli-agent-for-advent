@@ -30,7 +30,13 @@ dependencies {
     // mordant — терминальный вывод (цвета, спиннеры, таблицы).
     implementation("com.github.ajalt.mordant:mordant:2.5.0")
 
-    // kotlinx.serialization — JSON-договор с LLM и GitHub API.
+    // Ktor HTTP server — webhook receiver для приёма POST от Tampermonkey userscript.
+    implementation("io.ktor:ktor-server-core:$ktorVersion")
+    implementation("io.ktor:ktor-server-cio:$ktorVersion")
+    implementation("io.ktor:ktor-server-content-negotiation:$ktorVersion")
+    implementation("io.ktor:ktor-serialization-kotlinx-json:$ktorVersion")
+
+    // kotlinx.serialization — JSON-договор с LLM, GitHub API и userscript.
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:$kotlinxSerializationVersion")
 
     // kotlinx.coroutines — suspend pipeline.
