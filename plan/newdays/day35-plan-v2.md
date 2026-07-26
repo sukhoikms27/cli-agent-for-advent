@@ -1256,12 +1256,65 @@ preview по синтетическому сообщению из реально
 - ⚠️ Watcher не отменяет правила `consecutiveWorks < 2` — это notifier-only, не auto-claim.
 - ⚠️ Не реализован `--auto-claim` (требует рабочего `ClaimProvider`).
 
-### Phase 1 (full MVP, не реализовано — следующий этап)
-- `ClaimProvider` (Tracker + CRM HTTP reverse-engineering) — авто-клейм вместо ручного
-- `Collector` (Tracker API fetch issue → extract CRM link → extract PR link из CRM)
-- `Verifier` build-стадия (`gh pr checkout` + `./gradlew build`) — встроить в pipeline
-- `--auto-claim` opt-in (только после ClaimProvider)
-- Интеграция Watcher → pipeline: после Enter автоматически запускать `ReviewPipeline.run(prUrl, ...)`
+### Phase 1 (full MVP) — решения зафиксированы 2026-07-26
+
+> **Зафиксированные пользователем решения (2026-07-26):**
+> - **Перехват:** userscript (уже реализован). Никакого Tracker-poll, никакого CDP — только DOM-перехват.
+> - **Клейм:** **CRM HTTP** через F12 reverse-engineering (кнопка «Взять работу» → POST/PUT).
+>   Tracker API для клейма НЕ используем — только CRM, как в ручном flow.
+> - **Контракты:** пользователь готов зафиксировать CRM/Tracker API-контракты через F12.
+
+Phase 1 разбит на две части по признаку «зависит от F12 или нет»:
+
+#### Часть 1.A — неблокируемая (без F12, можно делать сразу)
+
+Это всё, что можно сделать на основе уже известного (`trackerId` от userscript есть,
+документированного Tracker API достаточно для fetch-one):
+
+- [ ] **`TrackerClient`** — Ktor-клиент к публичному Tracker REST API (`https://api.tracker.yandex.net/v2/`):
+  `GET /v2/issues/{id}` по trackerId. IAM-token из env `REVIEW_TRACKER_TOKEN`.
+  Цель: получить полное тело issue → извлечь CRM-link из description/comment.
+- [ ] **`CrmLinkExtractor`** — извлечение CRM-link из тела Tracker-issue
+  (regex `/https?://[^\s"']+crm[^\s"']+/` с fallback на более широкие URL-паттерны).
+- [ ] **`Collector.collectByTracker(trackerId)`** — композитор: `TrackerClient.fetch → CrmLinkExtractor.extract →
+  (placeholder для CrmAssignmentClient → PR-link)`. Пока CRM-контракт неизвестен — возвращает `prLink = null`.
+- [ ] **Wire-up Notifier → pipeline (частичный):** после Enter запускать `Collector.collectByTracker`.
+  Если PR-link найден в Tracker-issue напрямую (бывает) — авто-запуск `ReviewPipeline.run(prLink)`.
+  Если нет — печатать «открой CRM: <crmLink>, вставь PR-link» с готовой командой.
+- [ ] **Тесты** TrackerClient на Ktor MockEngine + CrmLinkExtractor на синтетических issue-телах.
+
+#### Часть 1.B — блокируется F12-сессией пользователя
+
+Это то, что требует reverse-engineering — без живой сессии в CRM F12 гадание, не делаем.
+
+- [ ] **CRM-контракт «claim»** (F12 → Network → кнопка «Взять работу»): URL, method, headers, body, auth.
+  Зафиксировать в `plan/extensions/review-bot-crm-spec.md`.
+- [ ] **CRM-контракт «fetch assignment»** (F12 → Network → открыть вкладку отчёта): URL, method, response-поля
+  с PR-link. Зафиксировать там же.
+- [ ] **`CrmAssignmentClient`** — по зафиксированному контракту (GET assignment → extract PR-link).
+- [ ] **`CrmHttpClaimProvider`** — POST/PUT claim по зафиксированному контракту.
+- [ ] **Wire-up Notifier → pipeline (полный):** после Enter → `Collector.collect(trackerId)` →
+  если PR-link найден → авто-запуск `ReviewPipeline.run(prLink, sprint, student)`.
+- [ ] **`--auto-claim` opt-in** — только после готового `CrmHttpClaimProvider`. Пропускает Enter,
+  сразу клейм + pipeline. HITL остаётся только на финальный verdict (в GitHub UI).
+
+#### Часть 1.C — независимая (можно делать параллельно)
+
+- [ ] **`Verifier`** — build-стадия в pipeline: `gh pr checkout` во временную директорию +
+  `./gradlew build` (JVM) или `assembleDebug` (Android, если SDK есть). Soft-fail: упало → warning,
+  продолжаем ревью без build-статуса.
+- [ ] **Parser-spec research:** F12 в Яндекс.Мессенджере — зафиксировать реальный API-response
+  (если userscript сломается, знать структуру для восстановления). В `parser-spec.md`. Не блокирует Phase 1.
+
+#### Порядок Phase 1
+
+```
+1.A (без F12):  TrackerClient → CrmLinkExtractor → Collector → wire-up → тесты
+                ↓ даст частичный auto-flow: Tracker-issue с PR-link → авто-ревью
+1.B (с F12):    CRM-контракты → CrmAssignmentClient → CrmHttpClaimProvider → full wire-up → --auto-claim
+                ↓ даст полный auto-flow: задание в чате → клейм → PR-link → ревью
+1.C (параллельно): Verifier build-стадия, parser-spec research
+```
 
 ### Phase 2 (резервный watcher + RAG)
 - `CdpWatcher` (Chrome DevTools Protocol, fallback при блокировке userscript)
